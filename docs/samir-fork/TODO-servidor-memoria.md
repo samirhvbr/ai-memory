@@ -17,6 +17,9 @@ com `akitaonrails/ai-memory` — nossos patches viraram PR upstream, não
 divergência local. Ou seja: **o wrapper oficial serve, não precisa instalar
 nada "do nosso fork"** (ver §2).
 
+> **Sync 11/08/2026:** `main` re-sincronizado com o upstream em `v1.25.0`
+> (rebase deste doc por cima — segue sem divergência de código).
+
 ---
 
 ## 0. O que mudou desde o passo a passo que eu te mandei
@@ -239,7 +242,7 @@ Feito:
 - [x] Servidor no ar com bearer, volume persistente e `--restart unless-stopped`
 - [x] Vhost dedicado + TLS (`https://mem.shvia.org`) no lugar de IP:porta
 - [x] Claude Code (MCP + 9 hooks) ligado na minha máquina
-- [x] Fork sincronizado com upstream em `v1.18.0`
+- [x] Fork sincronizado com upstream — última sync: `v1.25.0` (11/08/2026)
 
 A fazer:
 
