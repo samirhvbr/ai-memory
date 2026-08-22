@@ -45,3 +45,7 @@ evals/runs/
 *.bak-*
 evals/datasets/
 evals/models/
+
+# Python bytecode from fork-local tooling
+__pycache__/
+*.pyc
