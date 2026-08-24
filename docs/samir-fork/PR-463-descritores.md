@@ -151,11 +151,33 @@ passed, 0 failed.
   interessar: popular `summary` no frontmatter ao compilar página de sessão,
   no `ai-memory-consolidate`, com este patch virando o fallback para páginas
   sem summary.
-- **Fork desatualizado**: segue pendente e é o único item vivo. O `main` de
-  `samirhvbr/ai-memory` está em v1.25.0 contra v1.31.1 no upstream. Não afeta
-  nada deste PR, mas se este checkout é o que roda o `mem.shvia.org`, o
-  binário é de código de junho — e agora a correção que nós mesmos escrevemos
-  só existe no upstream.
+- **Fork desatualizado**: o `main` de `samirhvbr/ai-memory` está em v1.25.0
+  contra v1.31.1 no upstream. Fica só como checkout de trabalho: o
+  `mem.shvia.org` roda a imagem `akitaonrails/ai-memory:latest` via Compose,
+  não este clone. Produção subiu para v1.31.1 em 2026-08-24 (backup frio,
+  `no migrations to apply`, contagens idênticas ao baseline).
+
+## Medição pós-patch em produção (2026-08-24)
+
+Primeira medição do patch em corpus real, não simulada. Mesmas 100 páginas de
+`default/x`, mesmo `medir.py`:
+
+| | antes (22/08, v1.31.0) | depois (24/08, v1.31.1) |
+|---|---|---|
+| repete o título, todas | 74% | 0% |
+| repete o título, substantivas | 53% | 0% |
+| mediana de prosa, todas | 25 | 169 |
+| mediana de prosa, substantivas | 35 | 193 |
+
+O `descriptor_mirror` (simulação local que gerou os números do PR) previa média
+191; o servidor entregou 194 nas mesmas páginas. Convergiram dentro de 2%, o
+que valida o método: a simulação não era otimista. Busca segue 179 hits /
+100% FTS, pelo mesmo motivo já declarado no PR.
+
+**0 de 25 páginas substantivas têm `frontmatter.summary` preenchido.** Ou seja,
+o ramo preferido do próprio patch (`COALESCE(summary, ...)`) nunca dispara em
+produção: tudo vem da heurística de fallback. Isso é a evidência que faltava
+para o trabalho de escrita descrito acima.
 
 ## O que sobrevive deste trabalho
 
