@@ -1,12 +1,16 @@
 # PR akitaonrails/ai-memory#463 — descritor de hit não-FTS
 
-Estado em 2026-08-22. Documento de retomada: o que foi enviado, com que
-evidência, o que está pendente, e o que fazer conforme a resposta do Akita.
+**Fechado: mergeado em 2026-08-23 e lançado em v1.31.1 no mesmo dia.**
+Documento de registro: o que foi enviado, com que evidência, e como o
+mantenedor reagiu. As seções técnicas abaixo ficam como estão — descrevem o
+defeito e o método de medição, que seguem válidos.
 
 - PR: https://github.com/akitaonrails/ai-memory/pull/463
 - Branch: `fix/non-fts-hit-descriptors` no fork `samirhvbr/ai-memory`
 - Base: `upstream/main` em `b9b687b` (release v1.31.0)
 - Commits: `ad0a64d` (correção) + `3694d05` (fix vindo do review do Copilot)
+- Merge: `ce7202b` por Fabio Akita, 2026-08-23 17:40 -03
+- Release: `v1.31.1`, 2026-08-23 19:28 -03 (1h48 depois do merge)
 
 ## O defeito
 
@@ -106,35 +110,58 @@ backfill, cobre página escrita via `memory_write_page` que nunca terá summary,
 e não adiciona chamada de LLM na compilação. E foi oferecido mandar a versão de
 escrita se ele preferir.
 
-## Pendências
+## Como o Akita reagiu
 
-- **CI**: no último check, `rustfmt`, `changelog sections`, `native packaging
-  assets` e `gitleaks` deram SUCCESS; `test (windows-latest)` saiu SKIPPED
-  (motivo não investigado, não causado por nós); clippy, testes
-  linux/macos, cargo-deny, cargo-audit e os builds release ainda não tinham
-  reportado. **Conferir**: `gh pr checks 463 --repo akitaonrails/ai-memory`
-- **Atribuição**: o commit está como `Samir Hanna Verza <samirhv@me.com>`. O
-  `CONTRIBUTING.md` deles exige e-mail verificado na conta GitHub; se
-  `samirhv@me.com` não estiver verificado no `samirhvbr`, o commit aparece
-  desassociado. Corrigível antes do merge, não depois — eles não reescrevem
-  `main`.
-- **Fork desatualizado**: `samirhvbr/ai-memory` `main` está em v1.25.0, o
-  upstream em v1.31.0. Não afeta o PR (a branch saiu de `upstream/main`), mas
-  se este checkout roda o servidor, o binário é de código velho.
+Mergeou sem pedir alteração nenhuma, e comentou nomeando três coisas como
+"mais raras que o código" (comentário completo no PR):
 
-## Se o Akita responder
+> Merged, thank you — this is the most carefully evidenced contribution this
+> repo has had.
 
-- **Aceitar como está** → nada a fazer além de acompanhar o merge.
-- **Pedir a versão de escrita (summary no compilador)** → é o trabalho seguinte:
-  popular `summary` no frontmatter ao compilar página de sessão, no
-  `ai-memory-consolidate`. Este PR vira o fallback para páginas sem summary, ou
-  fecha.
-- **Pedir para mover `truncate_chars` para `ai-memory-core`** → já oferecido no
-  corpo do PR; hoje é local ao crate `store` porque `ai-memory-consolidate`
-  (que tem helpers privados parecidos) depende do `store`, e não o contrário.
-- **Questionar os números** → o corpus medido é atípico: 45% de stubs, zero
-  wikilinks, sem embeddings. Num corpus curado os números dele serão melhores
-  que os nossos, o que enfraquece o caso. Isso está declarado no PR; o script
-  `medir.py` roda contra qualquer instância para comparar.
-- **Pedir mais uma review do Copilot** → o bot deixa isso explícito no corpo da
-  review ("you can request another Copilot review").
+1. **Reportar o número que enfraquece o próprio caso** — a separação em 55
+   substantivas e 45 stubs, dizendo abertamente que os stubs inflam o
+   resultado. Ele chamou os 53% de "o número honesto", e disse que ainda assim
+   claramente vale corrigir.
+2. **Limitar a afirmação em vez de generalizar** — os 179 hits 100% FTS
+   poderiam virar "os outros streams são pouco usados"; dizer que *aquela
+   instância* não tem embedding provider nem wikilinks é, nas palavras dele,
+   "a diferença entre uma medição e uma conclusão".
+3. **"Duas regras aqui existem porque a medição rejeitou a versão mais
+   simples"** — manter o que o dado forçou em vez do que lê bonito.
+
+Ele foi conferir a alegação mecânica das seis ocorrências e o grep dele achou
+só duas, por ser literal demais e não pegar os quatro aliases de coluna
+(`body`, `pages.body`, `pg.body`, `tp.body`/`fp.body`). Chegou a suspeitar que
+a contagem estivesse inflada, verificou, e publicou o próprio erro: *"It was
+not; mine was."*
+
+Gate dele: fmt, clippy sob `-D warnings`, `cargo test --workspace` → 2532
+passed, 0 failed.
+
+## O que aconteceu com as pendências
+
+- **CI**: fechou verde, 15 checks pass — clippy, rustfmt, test ubuntu e macos,
+  cargo-deny, cargo-audit, os três builds release, docker smoke, gitleaks.
+  `test (windows-latest)` seguiu SKIPPED, e é comportamento do workflow deles
+  (job em run separado), não causado por nós.
+- **Atribuição**: não deu problema. Os dois commits aparecem creditados a
+  `samirhvbr` + `claude` no merge.
+- **A objeção antecipada** (popular `summary` na escrita) **não foi
+  levantada.** Continua sendo o trabalho seguinte natural se algum dia
+  interessar: popular `summary` no frontmatter ao compilar página de sessão,
+  no `ai-memory-consolidate`, com este patch virando o fallback para páginas
+  sem summary.
+- **Fork desatualizado**: segue pendente e é o único item vivo. O `main` de
+  `samirhvbr/ai-memory` está em v1.25.0 contra v1.31.1 no upstream. Não afeta
+  nada deste PR, mas se este checkout é o que roda o `mem.shvia.org`, o
+  binário é de código de junho — e agora a correção que nós mesmos escrevemos
+  só existe no upstream.
+
+## O que sobrevive deste trabalho
+
+O `medir.py` roda contra qualquer instância e não depende do patch: mede
+repetição de título e comprimento de prosa pela API MCP pública, sem build
+instrumentado nem acesso ao banco. Serve para conferir o efeito real depois de
+atualizar o `mem.shvia.org`, e o método (medir pela API pública, separar a
+população antes de reportar a média) vale para qualquer alegação de melhoria
+que a gente for levar para lá.
