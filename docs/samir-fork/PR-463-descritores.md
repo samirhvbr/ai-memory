@@ -179,6 +179,13 @@ o ramo preferido do próprio patch (`COALESCE(summary, ...)`) nunca dispara em
 produção: tudo vem da heurística de fallback. Isso é a evidência que faltava
 para o trabalho de escrita descrito acima.
 
+## Continuação
+
+O trabalho seguinte virou a issue #473 e o PR #477, mergeado em 24/08 como
+`488a0b6`: os três caminhos de escrita passaram a preencher
+`frontmatter.summary`, então o ramo preferido do `COALESCE` finalmente
+dispara. Registro em [PR-477-summaries.md](PR-477-summaries.md).
+
 ## O que sobrevive deste trabalho
 
 O `medir.py` roda contra qualquer instância e não depende do patch: mede
