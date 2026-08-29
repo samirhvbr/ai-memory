@@ -91,3 +91,38 @@ congelada nesse repo antes.
   no PR. O `usable_summary` limita o dano, não elimina o teste.
 - **43 páginas pré-#386** de lixo lifecycle-only na instância do `mem.shvia.org`
   (43% do projeto `x`). Sujam listagem por recência e qualquer medição futura.
+
+## Medição pós-release (27/08/2026, produção em v1.32.2)
+
+**O código está escrevendo.** Linha de base era `0 de 25` páginas com
+`frontmatter.summary` (v1.31.1). Agora:
+
+| | |
+|---|---|
+| com `frontmatter.summary` | **4 de 100** |
+| descritor: 1ª linha repete o título | 0% (todas e substantivas) |
+| prosa nos 240 chars, substantivas | mediana 185, média 187 |
+| hits de busca sem FTS | 0,0% de 219 hits em 22 queries |
+
+São 4 e não mais porque o PR é **new-writes-only**: só sessões encerradas
+depois do upgrade ganham o campo. As 4 são as das últimas ~12h. O número sobe
+sozinho conforme sessões novas fecham.
+
+Texto real gerado, exatamente a forma projetada:
+
+```
+8 prompts, 580 completed tool calls across tool non-file, tool unknown and tool file, over 19h 30m.
+2 prompts, 53 completed tool calls across tool non-file, tool file and tool unknown, over 5h 20m.
+```
+
+**Achado colateral, não reportado ainda:** `across tool non-file, tool unknown
+and tool file` são os literais compartilhados do `safe_tool_title`
+(`payload.rs`) vazando para dentro do resumo. Funciona, mas não informa nada —
+"580 chamadas entre *tool non-file* e *tool unknown*". É a mesma família do
+defeito de título da #484, agora do lado do resumo. Candidato a issue com
+medição, no molde que já rendeu três merges.
+
+**Sonda instalada** (`~/.local/state/ai-memory-watch/sonda-477.sh`, cron do
+sistema às 09:17): mede a cobertura todo dia e escreve em
+`477-cobertura.log` + `477-status.txt`. Se travar por dias com sessões
+acontecendo, aí sim é defeito.
