@@ -20,6 +20,57 @@ nada "do nosso fork"** (ver §2).
 > **Sync 11/08/2026:** `main` re-sincronizado com o upstream em `v1.25.0`
 > (rebase deste doc por cima — segue sem divergência de código).
 
+> **Sync 2026-09-02:** `main` fast-forwarded to upstream **`v2.0.0`**; this
+> branch rebased on top of it. Still zero code divergence — the fork carries
+> `docs/samir-fork/` and nothing else, so §2 stands: install the official
+> wrapper, not ours.
+
+## ⚠️ Upgrading a client to 2.0 (2026-09-02)
+
+Read this before running `ai-memory upgrade`. 2.0 is the first release that
+changes the **on-disk format**, and the change is a one-way door.
+
+**If you only use `mem.shvia.org`, this is a two-command upgrade.** Clients
+talk HTTP; they never open the data directory. The migration is the server's
+problem, and it has already been done for you.
+
+```bash
+ai-memory upgrade                                     # wrapper + image
+ai-memory install-hooks --agent claude-code --apply   # re-stage: hook scripts changed
+ai-memory --version                                   # expect 2.0.0
+```
+
+Nothing to change in `~/.claude/settings.json` or `~/.claude.json` — 2.0 does
+not move any endpoint. `AI_MEMORY_HOOK_URL` and the MCP `url` stay as they are.
+
+**If you run your own server** (the "everyone with their own" topology in §3),
+the one-way door is yours to handle:
+
+- The first 2.0 start migrates the wiki to Open Knowledge Format v0.2 **in
+  place**, gated on a full backup that is written *and re-read to verify*. If
+  that backup cannot be written, the server refuses to start and your data is
+  untouched. In a container the archive goes to `/data/backups/` — not `$HOME`,
+  which is destroyed on the next `docker compose up -d`.
+- Once migrated, **a pre-2.0 binary refuses the data directory.** Rolling back
+  means restoring the archive, not re-pulling the old image: 1.x can read the
+  new frontmatter but its writes will not carry the OKF keys, which mixes the
+  store.
+- **Pin the tag.** `:latest` means a future 2.x migration can run at a moment
+  you did not choose. Use `akitaonrails/ai-memory:2.0.0`.
+- **Local embeddings are on by default** — a ~87 MB model downloads in the
+  background on first start, existing pages get backfilled, and hybrid search
+  turns on at the *next* restart. Inference runs in-process, so budget CPU and
+  RAM on whatever else that box is serving. Opt out with
+  `embedding_provider = "none"`.
+
+Full checklist upstream: `docs/MIGRATION-2.0.md`.
+
+**What you actually get for it:** hybrid retrieval (LongMemEval-S hit@5 went
+0.617 → 0.823), `as_of` time-travel on `memory_query`, typed `causes` /
+`fixes` / `contradicts` edges that surface contradictions as lint findings,
+and a `status` command that finally reports embedding coverage, wiki format
+and write-queue backpressure instead of just claiming health.
+
 ---
 
 ## 0. O que mudou desde o passo a passo que eu te mandei
