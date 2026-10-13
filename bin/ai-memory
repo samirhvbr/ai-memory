@@ -15,6 +15,15 @@
 #   ai-memory workstreams   Use that client to inspect the host checkout identity.
 #   ai-memory rename-workstream
 #                           Same: the rename is keyed on host repo identity.
+#   ai-memory mcp-bridge ...  Run the session-aware MCP bridge through that
+#                           client: its --server-url loopback only resolves on
+#                           the host, never inside the helper container.
+#   ai-memory hook ...      Run lifecycle hooks (and the hidden hook-drain)
+#                           through that client: they target the host's
+#                           loopback server, read host markers and spool, and
+#                           must stay inside the hook time bound. If the
+#                           client is unavailable the event is dropped and
+#                           the hook still exits 0.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         container image (default: docker.io/akitaonrails/ai-memory:latest)
@@ -31,7 +40,7 @@
 #                           likewise
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
-#   AI_MEMORY_NATIVE_BIN    native binary used for managed host commands (optional)
+#   AI_MEMORY_NATIVE_BIN    native binary used for host commands and hooks (optional)
 #   AI_MEMORY_WRAPPER_URL   wrapper release asset override (optional; its
 #                           .sha256 companion is required)
 #   AI_MEMORY_WRAPPER_SHA256_URL  wrapper checksum URL override (optional)
@@ -359,6 +368,11 @@ cmd_upgrade() {
   echo "→ pulling ${IMAGE}"
   "${DOCKER}" pull "${IMAGE}"
   rm -f "${NATIVE_RUNNER_DIR}/last-check"
+  echo "→ refreshing checksum-verified native host client"
+  native_host_binary >/dev/null || {
+    echo "ai-memory: upgrade stopped before hook refresh because the native host client could not be updated" >&2
+    return 1
+  }
 
   local found_agents=()
   if [ -d "${HOOKS_STAGE_DIR}" ]; then
@@ -460,12 +474,22 @@ cmd_upgrade() {
 # Managed launch/discovery commands must execute on the host: checkouts, harnesses,
 # and native transcript stores are host resources, not contents of the helper
 # container. Keep a checksum-verified release client under NATIVE_RUNNER_DIR.
+# Print the native host client's path. `native_host_binary cached` (the hook
+# path) only reuses an installed client: no daily update check and no download,
+# since either can take seconds or hang on a bad network, and a hook must stay
+# within its time bound. install-hooks, mcp-bridge and run install and refresh
+# the client, so a wired setup always has one cached.
 native_host_binary() {
+  local mode="${1:-}"
   if [ -n "${AI_MEMORY_NATIVE_BIN:-}" ]; then
     [ -x "${AI_MEMORY_NATIVE_BIN}" ] || {
       echo "ai-memory: AI_MEMORY_NATIVE_BIN is not executable: ${AI_MEMORY_NATIVE_BIN}" >&2
       return 1
     }
+    if [ "${AI_MEMORY_NATIVE_BIN}" -ef "$0" ]; then
+      echo "ai-memory: AI_MEMORY_NATIVE_BIN points to the container wrapper itself; use the native release binary" >&2
+      return 1
+    fi
     printf '%s\n' "${AI_MEMORY_NATIVE_BIN}"
     return 0
   fi
@@ -475,8 +499,8 @@ native_host_binary() {
     Linux) os="linux" ;;
     Darwin) os="macos" ;;
     *)
-      echo "ai-memory: the container wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary to use ai-memory run/show/continue/resume/workstreams/rename-workstream" >&2
+      echo "ai-memory: the container wrapper cannot provide native host commands on this OS" >&2
+      echo "install the native release binary to use managed launches or native lifecycle hooks" >&2
       return 1
       ;;
   esac
@@ -494,6 +518,14 @@ native_host_binary() {
   binary="${native_dir}/ai-memory"
   archive="${native_dir}/${artifact}.tar.gz"
   check_file="${native_dir}/last-check"
+  if [ "${mode}" = "cached" ]; then
+    [ -x "${binary}" ] || {
+      echo "ai-memory: the native host client is not installed yet; run \`ai-memory install-hooks\` once to install it" >&2
+      return 1
+    }
+    printf '%s\n' "${binary}"
+    return 0
+  fi
   mkdir -p "${native_dir}"
 
   need_refresh=0
@@ -564,6 +596,44 @@ case "${1:-}" in
     NATIVE_HOST_BIN=$(native_host_binary)
     exec "${NATIVE_HOST_BIN}" "${NATIVE_HOST_COMMAND}" "$@"
     ;;
+  install-hooks)
+    # Capture exclusions and allowlist mode are client-side privacy controls.
+    # The wrapper's stable, checksum-verified host client can enforce them;
+    # the helper-container script bundle cannot. Keep explicit compatibility
+    # selections available, but never choose the weaker path by default.
+    case "${AI_MEMORY_HOOK_PLATFORM:-}" in
+      posix | windows) ;;
+      *)
+        NATIVE_HOST_BIN=$(native_host_binary)
+        exec "${NATIVE_HOST_BIN}" "$@"
+        ;;
+    esac
+    ;;
+  mcp-bridge)
+    # The session-aware MCP bridge dials the explicit --server-url it was
+    # registered with, typically the host's 127.0.0.1:49374. Inside the
+    # helper container that loopback is the container itself (Docker Desktop
+    # has no host networking), so the bridge must run on the host through
+    # the same checksum-verified native client install-hooks uses.
+    NATIVE_HOST_BIN=$(native_host_binary)
+    exec "${NATIVE_HOST_BIN}" "$@"
+    ;;
+  hook | hook-drain)
+    # Lifecycle hooks are client-side for the same reason as mcp-bridge: the
+    # default hook URL is the host's loopback server, and the cwd, marker
+    # files, capture exclusions and hook spool all live on the host. A helper
+    # container would also cost ~280 ms per event, past the hook time bound.
+    # Reuse the native client mcp-bridge installs (cached only: no update check
+    # or download on the hook path) and never fall back to the container. If
+    # that client is unavailable, native_host_binary has already said why on
+    # stderr; drop this one event and exit 0 so the agent is never blocked or
+    # shown a failing hook.
+    if NATIVE_HOST_BIN=$(native_host_binary cached) && [ -x "${NATIVE_HOST_BIN}" ]; then
+      exec "${NATIVE_HOST_BIN}" "$@"
+    fi
+    echo "ai-memory: native host client unavailable; lifecycle hook event not captured" >&2
+    exit 0
+    ;;
 esac
 
 # ---- normal pass-through to the binary inside a container ----------------
@@ -578,11 +648,10 @@ if [ -z "${AI_MEMORY_NO_TTY:-}" ] && [ -t 0 ] && [ -t 1 ]; then
   TTY_ARGS+=(-t)
 fi
 
-# The CLI runs INSIDE the container but renders hook config for the HOST, which
-# has no local ai-memory binary. Native installs default to `posix-native` (the
-# binary hook command); the wrapper must NOT inherit that or it would bake the
-# *container's* binary path into the host's hook config. Force the shell-script
-# platform (`posix`) unless the operator chose one explicitly.
+# Commands that still reach the helper container must never bake its binary
+# path into host config. Ordinary `install-hooks` was intercepted above and
+# uses the stable native host client; an explicit script compatibility choice
+# reaches here and remains script-based.
 export AI_MEMORY_HOOK_PLATFORM="${AI_MEMORY_HOOK_PLATFORM:-posix}"
 
 ENV_ARGS=()
@@ -619,6 +688,18 @@ for var in \
   RUST_LOG
 do
   if [ -n "${!var:-}" ]; then
+    ENV_ARGS+=(-e "${var}")
+  fi
+done
+
+# These two are presence-based, not non-empty-based like the loop above: an
+# operator sets one to the empty string to deliberately clear a
+# config.toml-configured prefix without editing the file (see
+# Config::load's figment overlay), and a present-but-empty value must reach
+# the container for that to work — `[ -n ]` above would drop it, making the
+# wrapper indistinguishable from the var never having been set at all.
+for var in AI_MEMORY_EMBEDDING_QUERY_PREFIX AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX; do
+  if [ -n "${!var+x}" ]; then
     ENV_ARGS+=(-e "${var}")
   fi
 done

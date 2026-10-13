@@ -10,18 +10,19 @@ first balanced JSON object in the reply content to be
 order).
 
 This adapter recognises exactly that request (by the system-prompt prefix),
-scores every candidate with one batched Jev `score` question whose rubric
-mirrors the reranker prompt's own 1.0 / 0.7 / 0.3 / 0.0 guidance, and returns
-the judgement as plain chat content. Everything else — consolidation, lint,
-bootstrap — is reverse-proxied unchanged to the configured upstream, so only
-reranking rides the Jev endpoint.
+asks Jev one batched `choice` question over all candidates, and returns each
+candidate's choice probability as its relevance, as plain chat content. A
+malformed Jev answer (missing or extra keys, non-numbers, values outside
+[0, 1], a distribution that does not sum to ~1) is an error, so ai-memory
+keeps its own order instead of ranking on fabricated scores. Everything else
+(consolidation, lint, bootstrap) is reverse-proxied unchanged to the
+configured upstream, so only reranking rides the Jev endpoint.
 
 Why: a hosted reranker model that answers in tens of seconds dwarfs the rest
-of a `memory_query`. A judge endpoint that scores a fixed rubric answers in
-well under a second, which keeps `AI_MEMORY_RERANKER=llm` usable in
-interactive sessions. On a 102-query golden set (see
-docs/jev-reranker-adapter.md) this adapter matched the hosted reranker's
-hit@1 / MRR / NDCG@10 while cutting mean rerank latency from ~20s to ~0.2s.
+of a `memory_query`, while a judge endpoint answers in well under a second,
+which keeps `AI_MEMORY_RERANKER=llm` usable in interactive sessions.
+docs/jev-reranker-adapter.md has the measurements, including how this choice
+variant compares with the earlier per-candidate rubric adapter.
 
 Env:
   JEV_URL     Jev systemone endpoint      (default http://127.0.0.1:18095/v1/systemone)
@@ -33,6 +34,7 @@ Stdlib only. No secrets are stored: Authorization headers are forwarded
 verbatim to the upstream.
 """
 import json
+import math
 import os
 import sys
 import time
@@ -63,41 +65,106 @@ def log(msg):
     sys.stderr.flush()
 
 
+def _reject_dupes(pairs):
+    """object_pairs_hook refusing duplicate keys in the Jev response JSON."""
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"duplicate key {k!r} in Jev response")
+        d[k] = v
+    return d
+
+
+def extract_choice_probs(out, cand_ids):
+    """Return one validated choice probability per candidate, in candidate order.
+
+    Raises ValueError on any malformed shape — missing/renamed keys, extra
+    candidates, non-numeric or boolean values, NaN/Inf, out-of-range numbers,
+    or a distribution whose mass is nowhere near 1 — so the caller answers
+    HTTP 500 and ai-memory keeps its original order, instead of silently
+    ranking on fabricated 0.0 scores.
+    """
+    if not cand_ids:
+        raise ValueError("no candidates")
+    if len(set(cand_ids)) != len(cand_ids):
+        raise ValueError("duplicate candidate indices in the rerank request")
+    if not isinstance(out, dict):
+        raise ValueError("Jev response is not a JSON object")
+    answers = out.get("answers")
+    if not isinstance(answers, dict):
+        raise ValueError("Jev response has no answers object")
+    best = answers.get("best")
+    if not isinstance(best, dict):
+        raise ValueError("Jev response has no answers.best object")
+    probs = best.get("probabilities")
+    if not isinstance(probs, dict):
+        raise ValueError("Jev response has no answers.best.probabilities object")
+    expected = {f"c{n}" for n in cand_ids}
+    missing = sorted(expected - probs.keys())
+    extra = sorted(probs.keys() - expected)
+    if missing or extra:
+        raise ValueError(
+            f"probability keys mismatch: missing={missing} extra={extra}")
+    vals = []
+    for n in cand_ids:
+        p = probs[f"c{n}"]
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise ValueError(f"probability c{n} is not a number: {p!r}")
+        p = float(p)
+        if not math.isfinite(p) or p < 0.0 or p > 1.0:
+            raise ValueError(f"probability c{n} outside [0, 1]: {p!r}")
+        vals.append(p)
+    total = math.fsum(vals)
+    # The choice distribution is normalised over the candidate set; allow
+    # generous rounding drift but reject degenerate shapes (all ~0 / all ~1).
+    if not 0.5 <= total <= 1.5:
+        raise ValueError(f"choice probabilities sum to {total:.4f}, not ~1.0")
+    return vals
+
+
 def jev_rerank(payload):
-    """Translate a reranker chat request into one batched Jev score call."""
+    """Translate a reranker chat request into ONE batched Jev choice call.
+
+    Choice-contrastive variant of the rubric adapter: a single `choice`
+    question over all candidates, ranked by probability. On the same
+    golden set and backend the rubric adapter answers from, comparative
+    ranking beat per-candidate rubric scoring by double-digit hit@1 on
+    both backends measured (see the comparison table in the docs), and it
+    is the only shape in which replay-trained small models hold their
+    quality. Relevance is the raw choice probability: monotonic in the
+    probability order, which is all the reranker sorts on.
+    """
     user = next((m.get("content", "") for m in payload.get("messages", [])
                  if m.get("role") == "user"), "")
     data = json.loads(user)
     query, cands = data["query"], data["candidates"]
+    ids = [c["candidate"] for c in cands]
     lines = [f"User query: {query}", "", "Candidate documents:"]
-    questions = {}
+    criteria = {}
     for c in cands:
         n = c["candidate"]
-        lines.append(f"{n}. {c['title']} — {c['text']}")
-        questions[f"c{n}"] = {
-            "type": "score",
-            "instructions": (
-                f"Apply the relevance rubric to candidate {n}: how well "
-                "does it answer the user query?"
-            ),
-            "criteria": RUBRIC,
-        }
+        desc = (c.get("title") or f"candidate {n}")[:120]
+        lines.append(f"{n}. {desc} — {c['text'][:160]}")
+        criteria[f"c{n}"] = desc
+    # Pool v3 on the 35B backend: this wording beat "most relevant" 0.828 -> 0.879
+    # hit@1 (5 fixed, 0 broken). Relevance stays the raw choice probability.
+    questions = {"best": {"type": "choice",
+                          "instructions": (
+                              "Which candidate directly answers the user query? "
+                              "Choose the specific page that contains the answer. "
+                              "Do not choose an index, catalog, or summary page if a more specific page answers the query."
+                          ),
+                          "criteria": criteria}}
     body = {"model": JEV_MODEL, "state": "\n".join(lines), "questions": questions}
     t0 = time.perf_counter()
     req = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=25) as resp:
-        out = json.loads(resp.read())
+        out = json.loads(resp.read(), object_pairs_hook=_reject_dupes)
     dt = time.perf_counter() - t0
-    scores = []
-    for c in cands:
-        ans = (out.get("answers") or {}).get(f"c{c['candidate']}") or {}
-        raw = ans.get("score")
-        # criteria index 0..3 -> relevance 0.0 / 0.3 / 0.7 / 1.0
-        relevance = max(0.0, min(1.0, raw / (len(RUBRIC) - 1))) \
-            if isinstance(raw, (int, float)) else 0.0
-        scores.append({"candidate": c["candidate"], "relevance": round(relevance, 4)})
-    log(f"jev {len(cands)} candidates in {dt:.3f}s query={query[:60]!r}")
+    vals = extract_choice_probs(out, ids)
+    scores = [{"candidate": n, "relevance": round(p, 4)} for n, p in zip(ids, vals)]
+    log(f"jev-choice {len(cands)} candidates in {dt:.3f}s query={query[:60]!r}")
     return {"scores": scores}
 
 
