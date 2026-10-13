@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.2.1`
+**Current version:** `0.2.2`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `d408450d` (`main`: the `v2.6.6` release plus nine commits)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,27 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.2.2 - mem.shvia.org runs 2.6.6, after a cold compressed backup and 38 minutes down
+
+The server moved from `2.1.2` to `2.6.6` on 13/10/2026, the release this
+fork's upstream point contains. This was the day's second attempt, and
+`docs/mem-shvia-org.md` now describes it as the procedure:
+
+1. Stop the container.
+2. Take a cold backup on the same disk with `tar` and `zstd --long=27`, and
+   verify it before going on. 45 GB became 751 MB in five minutes.
+3. Switch the pinned tag and start.
+4. Watch free space.
+
+The V62 backfill took 33 of the 38 minutes down. Every check matched before
+and after: the same workspaces and counts, and 200 with the bearer and 401
+without it, both directly and through Apache. Hook events were stored again
+within the first minutes.
+
+The page keeps the first attempt as what not to do. It also corrects 0.2.1 on
+one point. `update.sh`'s backup would fit, because the data compresses about
+60:1. What breaks that script is its 120 s health timeout.
 
 ## 0.2.1 - docs/mem-shvia-org.md says where the memory server runs and why it is still on 2.1.2
 
