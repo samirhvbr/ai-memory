@@ -71,11 +71,33 @@ Expected: 200, and 401 without the token. Then:
 
 - `docker exec ai-memory ai-memory status` shows FTS and embedding coverage, the
   write queue and the ingest counters.
-- `ai-memory-web` reads the file as `www-data` through the `aimemory-read` group:
-  `sudo -u www-data sqlite3 -readonly data/db/memory.sqlite 'SELECT COUNT(*) FROM pages WHERE is_latest=1'`.
+- `ai-memory-web` (`/srv/www/admin.shvia.org/ai-memory-web`) reads the file as
+  `www-data` through the `aimemory-read` group. Its schema canary needs
+  phpunit, which the production checkout does not have. The probe behind the
+  canary runs with a plain bootstrap, though, and repeats every read the panel
+  makes, read-only:
+
+  ```sh
+  cd /srv/www/admin.shvia.org/ai-memory-web
+  sudo -u www-data env HOME=/tmp php -r 'require "vendor/autoload.php"; $app = require "bootstrap/app.php";
+    $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+    require "tests/Support/AiMemorySchemaProbe.php";
+    var_export(Tests\Support\AiMemorySchemaProbe::failures());'
+  ```
+
+  `array ()` is the pass.
+- Apache keeps no log of its own for this vhost. Requests land in
+  `/var/log/apache2/other_vhosts_access.log` under `mem.shvia.org:443`.
 
 On 13/10/2026 every check matched before and after. The workspaces were default
-125 projects / 1,392 pages, samirhv-shvia 21 / 41 and shvia 1 / 4. In the first
-minutes after the restart, 104 hook events were accepted and stored, with none
-failed or unauthorized. 2.6.x logs one `WARN` at start about auth on a plain-HTTP
-bind. That is expected in this layout, where TLS ends at Apache.
+125 projects / 1,392 pages, samirhv-shvia 21 / 41 and shvia 1 / 4. The
+ai-memory-web probe found no failures against schema 76, in 17 s. In the first
+38 minutes after the restart:
+
+- Apache served 1,144 requests to the vhost, all 2xx apart from the checks' own
+  no-token probes.
+- The server accepted and stored 1,109 hook events, with none failed or
+  unauthorized.
+
+2.6.x logs one `WARN` at start about auth on a plain-HTTP bind. That is expected
+in this layout, where TLS ends at Apache.

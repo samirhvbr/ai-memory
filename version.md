@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.2.2`
+**Current version:** `0.2.3`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `d408450d` (`main`: the `v2.6.6` release plus nine commits)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,23 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.2.3 - the post-upgrade checks reach ai-memory-web through its schema probe
+
+The server was reviewed an hour after the 2.6.6 restart. Nothing in it needed
+a fix for the upgrade:
+
+- The server had stored 1,109 hook events, with none failed.
+- Every request to the vhost was 2xx, apart from the checks' own no-token
+  probes.
+- The Apache proxy errors in that hour all came from PHP-FPM on other vhosts.
+
+One check was missing from `docs/mem-shvia-org.md`, and it is the one that
+covers the other reader of this database. `ai-memory-web`'s schema canary needs
+phpunit, which its production checkout does not have. The probe behind the
+canary runs with a plain Laravel bootstrap, though, and it repeats every read
+the panel makes. Against schema 76 it found no failures. The page now carries
+that command, and it says where Apache logs this vhost.
 
 ## 0.2.2 - mem.shvia.org runs 2.6.6, after a cold compressed backup and 38 minutes down
 
