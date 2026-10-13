@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.1.0`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `8629adc6` (`main`)
+**Current version:** `0.2.0`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `d408450d` (`main`: the `v2.6.6` release plus nine commits)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,30 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.2.0 - the fork moves onto upstream main, the v2.6.6 release plus nine commits
+
+The fork had sat on `8629adc6` since 25/09/2026, an upstream `main` point
+between `v2.4.0` and `v2.4.1`. By 13/10/2026 that was **1,137 upstream commits
+and twelve releases behind** (`v2.4.1` through `v2.6.6`). This sync merges
+upstream `main` at `d408450d`: the `v2.6.6` release plus nine later commits
+(the wrapper no longer checks for updates on the hook path and runs lifecycle
+hooks through the native host client, a Windows relay retry, docs and tests).
+
+**It came in as a merge, not a rebase.** Upstream commits keep their own
+subjects and hashes, and nothing already published on `origin/main` was
+rewritten, so no force-push. It merged clean: our only files, this one and
+`docs/ci.md`, have no counterpart upstream. After the merge the tree differs
+from upstream `main` in those two files and nothing else. Not a line of our
+own code changed, and the bump is still owed (rule 4 of ADR-023).
+
+**This clone had no `upstream` remote**, which ADR-023 makes mandatory. A clone
+on the other machine needs the same line before its next sync:
+
+```sh
+git remote add upstream https://github.com/akitaonrails/ai-memory.git
+git fetch upstream && git merge upstream/main   # then bump the version here
+```
 
 ## 0.1.0 - docs/ci.md says where this fork's CI runs
 
