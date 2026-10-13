@@ -1,6 +1,6 @@
 # Version â€” samirhvbr fork of ai-memory
 
-**Current version:** `0.2.0`
+**Current version:** `0.2.1`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `d408450d` (`main`: the `v2.6.6` release plus nine commits)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -20,6 +20,7 @@ it bumps the version above and its entry names the upstream point we moved to â€
 even when not a line of our own code changed.
 
 Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
+Where the memory server runs and which upstream release it is on: [`docs/mem-shvia-org.md`](docs/mem-shvia-org.md).
 
 [adr]: https://github.com/samirhvbr/repodocs/blob/master/docs/decisions.md
 
@@ -29,6 +30,16 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.2.1 - docs/mem-shvia-org.md says where the memory server runs and why it is still on 2.1.2
+
+The fork is on `v2.6.6` and the server is not, and nothing in this repository
+said where the server is. The page names the machine, the deploy and the pinned
+image, and records the 13/10/2026 attempt. V62 rewrites every page version.
+After a reflink backup, each rewritten page costs new disk, and a reader left
+open pinned the WAL: free space fell from 31 GB to 8 GB in 14 minutes. The
+attempt was rolled back with no data lost, and the page lists what a retry needs.
+It is a file of our own, so it never conflicts on a sync.
 
 ## 0.2.0 - the fork moves onto upstream main, the v2.6.6 release plus nine commits
 
