@@ -1034,6 +1034,80 @@ fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
     );
 }
 
+/// Factory Droid (#1240): `install-mcp` and `install-hooks` merge into
+/// `~/.factory/mcp.json` and the bare `~/.factory/hooks.json` event map
+/// around the user's own entries, and `uninstall` removes only ai-memory's.
+#[test]
+fn droid_install_and_uninstall_round_trip_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let mcp = home.path().join(".factory/mcp.json");
+    let hooks = home.path().join(".factory/hooks.json");
+    write_file(
+        &mcp,
+        r#"{"mcpServers":{"other":{"type":"http","url":"https://other.example/mcp"}}}"#,
+    );
+    write_file(
+        &hooks,
+        r#"{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"/usr/local/bin/guard.sh"}]}]}"#,
+    );
+
+    for args in [
+        &["install-mcp", "--client", "droid", "--apply"][..],
+        &["install-hooks", "--agent", "droid", "--apply"][..],
+    ] {
+        let out = command_with_home(home.path()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let wired: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    let pre = wired["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{wired}");
+    assert!(
+        pre[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--agent droid"),
+        "{wired}"
+    );
+    assert!(wired["SessionEnd"].is_array(), "{wired}");
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcpServers"].get("ai-memory").is_none());
+    assert_eq!(
+        removed["mcpServers"]["other"]["url"],
+        "https://other.example/mcp"
+    );
+    let unwired = std::fs::read_to_string(&hooks).unwrap();
+    assert!(!unwired.contains("--agent droid"), "{unwired}");
+    let unwired: serde_json::Value = serde_json::from_str(&unwired).unwrap();
+    assert_eq!(
+        unwired["PreToolUse"][0]["hooks"][0]["command"],
+        "/usr/local/bin/guard.sh"
+    );
+}
+
 #[test]
 fn swival_mcp_install_and_uninstall_round_trip_from_nested_directory() {
     let _guard = cli_test_lock();
@@ -1259,6 +1333,88 @@ fn install_skills_then_uninstall_only_skills_round_trips() {
         !project.path().join(".agents/skills").exists(),
         "empty .agents skills root should be removed"
     );
+}
+
+/// `install-skills --scope global --agent antigravity` writes the managed
+/// skills into both roots Antigravity reads, `~/.gemini/config/skills` (App
+/// and IDE) and `~/.gemini/antigravity-cli/skills` (CLI), and not into
+/// `~/.agents/skills`. A re-run changes nothing, and `uninstall --only skills`
+/// takes the skills back out of both roots while the user's own skill and
+/// Antigravity's MCP config beside them stay.
+#[test]
+fn antigravity_global_skills_install_idempotently_and_uninstall_from_both_roots() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let roots = [
+        home.path().join(".gemini/config/skills"),
+        home.path().join(".gemini/antigravity-cli/skills"),
+    ];
+    let user_skill = roots[0].join("user-skill/SKILL.md");
+    write_file(&user_skill, "---\nname: user-skill\n---\nkeep me\n");
+    let mcp_config = home.path().join(".gemini/config/mcp_config.json");
+    write_file(&mcp_config, "{}\n");
+
+    let install = || {
+        command_with_home(home.path())
+            .args([
+                "install-skills",
+                "--scope",
+                "global",
+                "--agent",
+                "antigravity",
+            ])
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    let first = install();
+    assert!(
+        first.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(
+                root.join(skill.relative_path).is_file(),
+                "{}",
+                root.join(skill.relative_path).display()
+            );
+        }
+    }
+    assert!(!home.path().join(".agents/skills").exists());
+
+    let second = install();
+    assert!(
+        second.status.success(),
+        "re-run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert_eq!(
+        stdout.matches("already up to date").count(),
+        roots.len() * MANAGED_SKILLS.len(),
+        "{stdout}"
+    );
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    for root in &roots {
+        for skill in MANAGED_SKILLS {
+            assert!(!root.join(skill.relative_path).exists());
+        }
+    }
+    assert!(user_skill.exists(), "the user's own skill must survive");
+    assert!(mcp_config.exists(), "Antigravity's MCP config must survive");
 }
 
 #[test]
@@ -2236,4 +2392,224 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
             path.display()
         );
     }
+}
+
+/// `install-mcp --apply --auth-token` for Claude Code stores the key where the
+/// hooks keep theirs and writes the bridge entry without it, so the stored
+/// key is the bridge's too: `--only hooks` keeps it while that entry remains,
+/// and the full uninstall still removes it.
+#[test]
+fn an_explicit_bridge_key_is_stored_and_outlives_only_hooks_removal() {
+    const KEY: &str = "aim_bridge_key_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "install-mcp",
+        "--client",
+        "claude-code",
+        "--session-aware",
+        "--auth-token",
+        KEY,
+        "--apply",
+    ]);
+    run(&["install-hooks", "--agent", "claude-code", "--apply"]);
+    let claude = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+    assert!(
+        !claude.contains(KEY),
+        "the key stayed in ~/.claude.json: {claude}"
+    );
+    assert!(claude.contains("mcp-bridge"), "{claude}");
+    let stored = home.path().join(".ai-memory-data").join("auth-token");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap().trim(), KEY);
+
+    run(&["uninstall", "--only", "hooks", "--apply", "--yes"]);
+    assert!(
+        stored.exists(),
+        "--only hooks stranded the bridge without its key"
+    );
+
+    run(&["uninstall", "--apply", "--yes"]);
+    assert!(!stored.exists(), "the full uninstall must remove the key");
+}
+
+/// FreeBuff's entry is always the session-less `mcp-bridge`, so
+/// `install-mcp --client freebuff --apply --auth-token` stores the key where
+/// the hooks keep theirs and writes `~/.agents/mcp.json` without an `env`
+/// token, the same redirect Claude Code's and Muse's bridge entries get.
+#[test]
+fn an_explicit_freebuff_bridge_key_is_stored_outside_the_client_config() {
+    const KEY: &str = "aim_freebuff_key_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&[
+        "install-mcp",
+        "--client",
+        "freebuff",
+        "--auth-token",
+        KEY,
+        "--apply",
+    ]);
+    let config = home.path().join(".agents").join("mcp.json");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        !written.contains(KEY),
+        "the key stayed in ~/.agents/mcp.json: {written}"
+    );
+    assert!(written.contains("mcp-bridge"), "{written}");
+    let entry: serde_json::Value = serde_json::from_str(&written).unwrap();
+    let entry = &entry["mcpServers"]["ai-memory"];
+    assert_eq!(
+        entry["env"].get("AI_MEMORY_AUTH_TOKEN"),
+        None,
+        "the entry still carries an env token: {written}"
+    );
+    let data_dir = home.path().join(".ai-memory-data");
+    let stored = data_dir.join("auth-token");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap().trim(), KEY);
+    let args: Vec<&str> = entry["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    let canonical = std::fs::canonicalize(&data_dir).unwrap();
+    assert!(
+        args.windows(2).any(|pair| pair[0] == "--data-dir"
+            && std::fs::canonicalize(pair[1]).is_ok_and(|named| named == canonical)),
+        "the entry does not name the data dir the key went into: {args:?}"
+    );
+}
+
+/// Without `--apply` nothing is stored: a printed FreeBuff snippet is the
+/// operator's to place, so it still carries the key inline. This is the guard
+/// that keeps the redirect above from reaching the print path.
+#[test]
+fn a_printed_freebuff_snippet_keeps_the_key_inline() {
+    const KEY: &str = "aim_freebuff_printed_0123456789";
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let output = command_with_home(home.path())
+        .args(["install-mcp", "--client", "freebuff", "--auth-token", KEY])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snippet = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        snippet.contains(KEY),
+        "the printed snippet dropped the key the operator has to place: {snippet}"
+    );
+    assert!(
+        !home
+            .path()
+            .join(".ai-memory-data")
+            .join("auth-token")
+            .exists(),
+        "printing stored the key"
+    );
+    assert!(
+        !home.path().join(".agents").join("mcp.json").exists(),
+        "printing wrote the client config"
+    );
+}
+
+/// Meta Muse Code: `install-mcp` and `install-hooks` both merge into
+/// `$XDG_CONFIG_HOME/muse/settings.json` around the user's own server and
+/// hook, keeping `schema_version` and unknown keys, the MCP entry goes under
+/// the legacy `mcp_servers` map the file already uses (never a second map),
+/// and `uninstall` removes only ai-memory's entries.
+#[test]
+fn muse_install_and_uninstall_round_trip_preserves_user_entries() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".config/muse/settings.json");
+    write_file(
+        &settings,
+        r#"{"schema_version":1,"theme":"dark","mcp_servers":{"other":{"transport":"stdio","command":"other-mcp","mode":"optional"}},"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"/usr/local/bin/guard.sh","timeout":5}]}]}}"#,
+    );
+
+    for args in [
+        &["install-mcp", "--client", "muse", "--apply"][..],
+        &["install-hooks", "--agent", "muse", "--apply"][..],
+    ] {
+        let out = command_with_home(home.path()).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(installed["schema_version"], 1);
+    assert_eq!(installed["theme"], "dark");
+    assert!(installed.get("mcpServers").is_none(), "{installed}");
+    let ours = &installed["mcp_servers"]["ai-memory"];
+    assert_eq!(ours["transport"], "stdio", "{installed}");
+    assert_eq!(ours["mode"], "optional");
+    assert_eq!(ours["args"][1], "--agent");
+    assert_eq!(ours["args"][2], "muse");
+    assert_eq!(installed["mcp_servers"]["other"]["command"], "other-mcp");
+    let pre = installed["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 2, "{installed}");
+    assert!(
+        pre[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--agent muse"),
+        "{installed}"
+    );
+    assert!(installed["hooks"]["SessionEnd"].is_array(), "{installed}");
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let text = std::fs::read_to_string(&settings).unwrap();
+    assert!(!text.contains("--agent muse"), "{text}");
+    assert!(!text.contains("mcp-bridge"), "{text}");
+    let removed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(removed["schema_version"], 1);
+    assert_eq!(removed["theme"], "dark");
+    assert_eq!(removed["mcp_servers"]["other"]["command"], "other-mcp");
+    assert_eq!(
+        removed["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "/usr/local/bin/guard.sh"
+    );
 }

@@ -230,7 +230,20 @@ fn nonconformant_files(wiki_root: &Path) -> WikiResult<Vec<PathBuf>> {
                 stack.push(path);
             } else if ft.is_file()
                 && path.extension().is_some_and(|e| e == "md")
-                && path.file_name().is_none_or(|n| n != "index.md")
+                // Only the bundle root's `index.md` is reserved — it is the
+                // generated bundle index this migration writes, "the only place
+                // index.md may carry frontmatter". A nested `notes/index.md` is
+                // an ordinary page the watcher indexes like any other
+                // (`is_reserved_page_file` reserves only manifests,
+                // `bootstrap.md` and log ledgers), so skipping it by basename
+                // left the DB pass conforming its row while its file kept
+                // pre-OKF frontmatter — and markdown is the source of truth, so
+                // the next reindex de-conformed the page again. Same
+                // project-root-subtree test as the `_pending` skip above.
+                && !(path.file_name().is_some_and(|n| n == "index.md")
+                    && path
+                        .strip_prefix(wiki_root)
+                        .is_ok_and(|relative| relative.components().count() == 3))
                 && !is_ledger_file(&path)
             {
                 let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -374,10 +387,7 @@ fn ensure_bundle_indexes(git: &crate::git::GitAdapter) -> WikiResult<()> {
                 })
                 .unwrap_or_default();
             families.sort();
-            let listing = families
-                .iter()
-                .map(|f| format!("- [{f}/]({f}/)\n"))
-                .collect::<String>();
+            let listing = crate::okf_directory_listing(&families);
             let body =
                 format!("# Bundle index\n\nConcept files live in these directories:\n\n{listing}");
             let content = format!("---\nokf_version: \"0.2\"\n---\n\n{body}");
@@ -646,6 +656,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bundle_index_escapes_directory_links_and_preserves_existing_index() {
+        let tmp = TempDir::new().unwrap();
+        for family in ["notes", "team notes", "c# 50%"] {
+            std::fs::create_dir_all(tmp.path().join("w/p").join(family)).unwrap();
+        }
+        let git = crate::git::GitAdapter::open_or_init(tmp.path()).unwrap();
+        ensure_bundle_indexes(&git).unwrap();
+        let index = tmp.path().join("w/p/index.md");
+        let content = std::fs::read_to_string(&index).unwrap();
+        assert!(content.contains("- [notes/](notes/)\n"), "{content}");
+        assert!(
+            content.contains("(team%20notes/)"),
+            "migration directory destination must be URL encoded: {content}"
+        );
+        assert!(
+            content.contains("(c%23%2050%25/)"),
+            "literal URL delimiters must stay in the directory name: {content}"
+        );
+        git.write_atomic(&index, b"operator-owned index\n").unwrap();
+        ensure_bundle_indexes(&git).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(index).unwrap(),
+            "operator-owned index\n"
+        );
+    }
+
     // ---- #633: the safety archive must be taken BEFORE the DB migration ----
 
     /// The core assertion for #633: the pre-open snapshot captures the DB as it
@@ -871,6 +908,37 @@ mod tests {
             std::fs::read_dir(dest.path()).unwrap().count(),
             0,
             "the ledger caused a full data-dir archive"
+        );
+    }
+
+    /// Only `<ws>/<proj>/index.md` is the generated bundle index. A nested
+    /// `notes/index.md` is an ordinary page — the watcher reserves only
+    /// manifests, `bootstrap.md` and log ledgers — so skipping it by basename
+    /// left the DB pass conforming its row while the file kept pre-OKF
+    /// frontmatter, and markdown is the source of truth, so the next reindex
+    /// de-conformed the page the migration had just migrated.
+    #[test]
+    fn a_nested_index_page_is_still_migrated() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_root = tmp.path().join("wiki");
+
+        let nested = PathBuf::from("w/p/notes/index.md");
+        let nested_abs = wiki_root.join(&nested);
+        std::fs::create_dir_all(nested_abs.parent().unwrap()).unwrap();
+        std::fs::write(nested_abs, "# Ordinary old page\n").unwrap();
+
+        // The control: the bundle root's own index.md stays reserved.
+        let root_index = wiki_root.join("w/p/index.md");
+        std::fs::write(root_index, "# Bundle index\n").unwrap();
+
+        // A nested index.md is a legal page path, so the watcher indexes it
+        // like any other page (`is_reserved_page_file` reserves only manifests,
+        // `bootstrap.md` and log ledgers).
+        PagePath::new("notes/index.md").expect("a nested index.md is a legal page path");
+        assert_eq!(
+            nonconformant_files(&wiki_root).unwrap(),
+            vec![nested],
+            "the nested page is migrated and the bundle root's index.md is not"
         );
     }
 

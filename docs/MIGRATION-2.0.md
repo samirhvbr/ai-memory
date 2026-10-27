@@ -1,5 +1,7 @@
 # Upgrading to 2.0
 
+Upgrading a 2.x install to 3.0? See [Upgrading to 3.0](upgrading-to-3.0.md).
+
 2.0 changes the wiki's on-disk format to the [Open Knowledge Format
 v0.2](okf.md). The upgrade is automatic, runs only after a backup succeeds,
 and is reversible. This page describes what happens and how to go back.
@@ -25,7 +27,7 @@ one-shot wiki migration runs before the server accepts any traffic:
 
    Set `AI_MEMORY_BACKUP_DIR=/somewhere/else` before starting if your
    home is small; the destination must be outside the data directory.
-The archive is re-opened and verified after writing. **If the backup
+The archive is flushed and fsynced, then re-opened and verified. **If the backup
     cannot be written or verified, the migration aborts and the server
     refuses to start**. Your data is untouched and the error says why.
 

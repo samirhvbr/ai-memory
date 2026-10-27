@@ -3,8 +3,9 @@
 use std::str::FromStr as _;
 
 use ai_memory_core::{
-    AgentKind, ManagedRunId, NativeSessionIdentity, NewWorkstreamEvent, ProjectId, Sanitizer,
-    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, WorkstreamId, scrub_workstream_provenance,
+    AgentKind, ManagedNativeSessionReference, ManagedRunId, NativeSessionIdentity,
+    NewWorkstreamEvent, ProjectId, Sanitizer, WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
+    WorkstreamId, scrub_workstream_provenance,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -188,6 +189,9 @@ pub struct PreparedWorkstreamRun {
     pub native_session_id: Option<String>,
     /// Last adapter cursor for that native session.
     pub source_cursor: Option<String>,
+    /// Newest current session when this launch switches away from another
+    /// harness.
+    pub previous_native_session: Option<ManagedNativeSessionReference>,
     /// Last sequence already delivered to that native session.
     pub sync_after: i64,
     /// Workstream high-water mark assigned to the launch.
@@ -295,6 +299,9 @@ pub struct ManagedRunContext {
     pub agent: AgentKind,
     /// Linked native session when SessionStart has already reported it.
     pub native_session_id: Option<String>,
+    /// Newest current session from another harness when this run represents a
+    /// harness switch.
+    pub previous_native_session: Option<ManagedNativeSessionReference>,
     /// Lower delivery cursor.
     pub sync_after: i64,
     /// Assigned high-water mark.
@@ -340,6 +347,92 @@ pub struct StoredWorkstreamSummary {
     pub current: bool,
     /// Harnesses with a current native session, newest link first.
     pub linked_harnesses: Vec<AgentKind>,
+}
+
+/// Trusted lifecycle state shown by the operator workstream overview.
+///
+/// This deliberately does not infer intent from transcript text. In
+/// particular, "waiting for input" cannot be distinguished reliably from an
+/// assistant narrating a future step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkstreamOperationalStatus {
+    /// The newest managed run holds an unexpired lease.
+    Active,
+    /// The newest run expired, exited unsuccessfully, or ended by signal.
+    Interrupted,
+    /// The newest run completed successfully and portable evidence exists.
+    Completed,
+    /// No portable evidence has been imported yet.
+    Empty,
+}
+
+impl WorkstreamOperationalStatus {
+    /// Stable display/filter name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Interrupted => "interrupted",
+            Self::Completed => "completed",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+/// One bounded row in the root/operator managed-workstream overview.
+///
+/// Native session ids, checkout paths, repository fingerprints and lease
+/// owner strings are intentionally absent: operators need lifecycle state,
+/// not host-local or harness-local identifiers.
+#[derive(Debug, Clone)]
+pub struct OperationalWorkstreamSummary {
+    /// Stable workstream identifier.
+    pub workstream_id: WorkstreamId,
+    /// Workspace display name.
+    pub workspace_name: String,
+    /// Project display name.
+    pub project_name: String,
+    /// Human-readable workstream name.
+    pub name: String,
+    /// Derived only from trusted run columns and event count.
+    pub status: WorkstreamOperationalStatus,
+    /// Newest run identifier, when the workstream has been launched.
+    pub latest_run_id: Option<ManagedRunId>,
+    /// Harness used by the newest run.
+    pub latest_agent: Option<AgentKind>,
+    /// Portable events imported across every run.
+    pub event_count: u64,
+    /// Harnesses with a current native-session link, newest first.
+    pub linked_harnesses: Vec<AgentKind>,
+    /// Last selection or import timestamp in microseconds.
+    pub last_active_at: i64,
+    /// Newest run start timestamp in microseconds.
+    pub latest_started_at: Option<i64>,
+    /// Newest run end timestamp in microseconds.
+    pub latest_ended_at: Option<i64>,
+}
+
+fn operational_status(
+    run_state: Option<&str>,
+    lease_expires_at: Option<i64>,
+    exit_code: Option<i32>,
+    event_count: u64,
+    now_us: i64,
+) -> WorkstreamOperationalStatus {
+    if run_state == Some("active") && lease_expires_at.is_some_and(|lease| lease > now_us) {
+        return WorkstreamOperationalStatus::Active;
+    }
+    if run_state == Some("expired")
+        || (run_state == Some("active") && lease_expires_at.is_none_or(|lease| lease <= now_us))
+        || (run_state == Some("finished") && exit_code != Some(0))
+    {
+        return WorkstreamOperationalStatus::Interrupted;
+    }
+    if event_count == 0 {
+        WorkstreamOperationalStatus::Empty
+    } else {
+        WorkstreamOperationalStatus::Completed
+    }
 }
 
 /// How a rename addresses the workstream it retitles.
@@ -392,6 +485,7 @@ struct FinishRunRow {
     sync_after: i64,
     sync_through: i64,
     context_delivered: bool,
+    exit_code: Option<i32>,
 }
 
 struct LinkRunRow {
@@ -525,6 +619,22 @@ pub(crate) fn prepare_run(
         .map_or((None, None, 0), |(session, cursor, delivery)| {
             (Some(session), cursor, delivery)
         });
+    let previous_native_session = tx
+        .query_row(
+            "SELECT agent_kind, native_session_id FROM workstream_native_sessions \
+             WHERE workstream_id = ?1 AND is_current = 1 \
+             ORDER BY updated_at DESC, agent_kind ASC LIMIT 1",
+            params![workstream_id.as_bytes()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .and_then(|(previous_agent, previous_session)| {
+            let previous_agent = AgentKind::from_wire(&previous_agent);
+            (previous_agent != agent).then_some(ManagedNativeSessionReference {
+                agent: previous_agent,
+                native_session_id: previous_session,
+            })
+        });
     let established: i64 = tx.query_row(
         "SELECT CASE WHEN \
              EXISTS(SELECT 1 FROM workstream_native_sessions WHERE workstream_id = ?1) \
@@ -540,8 +650,9 @@ pub(crate) fn prepare_run(
     tx.execute(
         "INSERT INTO managed_runs( \
              id, workstream_id, agent_kind, lease_owner, native_session_id, owner_user, state, \
-             sync_after, sync_through, context_delivered, lease_expires_at, started_at \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10)",
+             sync_after, sync_through, context_delivered, lease_expires_at, started_at, \
+             previous_agent_kind, previous_native_session_id \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10, ?11, ?12)",
         params![
             run_id.as_bytes(),
             workstream_id.as_bytes(),
@@ -553,6 +664,12 @@ pub(crate) fn prepare_run(
             latest_sequence,
             now + LEASE_MICROS,
             now,
+            previous_native_session
+                .as_ref()
+                .map(|source| source.agent.as_str()),
+            previous_native_session
+                .as_ref()
+                .map(|source| source.native_session_id.as_str()),
         ],
     )?;
     tx.execute(
@@ -568,6 +685,7 @@ pub(crate) fn prepare_run(
         agent,
         native_session_id,
         source_cursor,
+        previous_native_session,
         sync_after,
         sync_through: latest_sequence,
         may_adopt_existing_session: established == 0,
@@ -1054,13 +1172,30 @@ pub(crate) fn finish_run(
     authority: &ManagedRunAuthority,
     input: &FinishWorkstreamRun,
 ) -> StoreResult<FinishedWorkstreamRun> {
+    finish_run_inner(conn, authority, input, false)
+}
+
+pub(crate) fn recover_run(
+    conn: &mut Connection,
+    authority: &ManagedRunAuthority,
+    input: &FinishWorkstreamRun,
+) -> StoreResult<FinishedWorkstreamRun> {
+    finish_run_inner(conn, authority, input, true)
+}
+
+fn finish_run_inner(
+    conn: &mut Connection,
+    authority: &ManagedRunAuthority,
+    input: &FinishWorkstreamRun,
+    recover_expired: bool,
+) -> StoreResult<FinishedWorkstreamRun> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     authorize_run_mutation(&tx, input.run_id, authority)?;
     let run: Option<FinishRunRow> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, state, \
-                    sync_after, sync_through, context_delivered \
+                    sync_after, sync_through, context_delivered, exit_code \
              FROM managed_runs WHERE id = ?1",
             params![input.run_id.as_bytes()],
             |row| {
@@ -1072,6 +1207,7 @@ pub(crate) fn finish_run(
                     sync_after: row.get(4)?,
                     sync_through: row.get(5)?,
                     context_delivered: row.get(6)?,
+                    exit_code: row.get(7)?,
                 })
             },
         )
@@ -1090,6 +1226,7 @@ pub(crate) fn finish_run(
         sync_after,
         sync_through,
         context_delivered,
+        exit_code,
     } = run;
     let latest_before: i64 = tx.query_row(
         "SELECT COALESCE(MAX(sequence), 0) FROM workstream_events WHERE workstream_id = ?1",
@@ -1097,12 +1234,44 @@ pub(crate) fn finish_run(
         |row| row.get(0),
     )?;
     if state == "finished" {
+        if recover_expired {
+            validate_finished_recovery(
+                &tx,
+                &workstream,
+                &agent_wire,
+                linked_session.as_deref(),
+                exit_code,
+                input,
+            )?;
+        }
+        tx.commit()?;
         return Ok(FinishedWorkstreamRun {
             imported_events: 0,
             latest_sequence: latest_before,
         });
     }
-    if state != "active" {
+    if state == "expired" && recover_expired {
+        let superseded: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_runs newer \
+             JOIN managed_runs current ON current.id = ?2 \
+             WHERE newer.workstream_id = ?1 AND \
+               (newer.started_at > current.started_at OR \
+                (newer.started_at = current.started_at AND newer.rowid > current.rowid)))",
+            params![workstream, input.run_id.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if superseded {
+            return Err(StoreError::InvalidState(format!(
+                "managed run {} was superseded and cannot be recovered",
+                input.run_id
+            )));
+        }
+        tx.execute(
+            "UPDATE managed_runs SET state = 'active', ended_at = NULL, lease_expires_at = ?1 \
+             WHERE id = ?2 AND state = 'expired'",
+            params![now + LEASE_MICROS, input.run_id.as_bytes()],
+        )?;
+    } else if state != "active" {
         return Err(StoreError::InvalidState(format!(
             "managed run {} is {state}",
             input.run_id
@@ -1276,6 +1445,108 @@ pub(crate) fn finish_run(
     })
 }
 
+fn validate_finished_recovery(
+    tx: &Transaction<'_>,
+    workstream: &[u8],
+    agent_wire: &str,
+    linked_session: Option<&str>,
+    exit_code: Option<i32>,
+    input: &FinishWorkstreamRun,
+) -> StoreResult<()> {
+    if input.native_session_id.as_deref() != linked_session
+        || (input.complete && input.exit_code != exit_code)
+        || (!input.complete && (input.source_cursor.is_some() || input.exit_code.is_some()))
+    {
+        return Err(StoreError::InvalidState(
+            "finished managed run recovery is not an exact replay".into(),
+        ));
+    }
+    for event in &input.events {
+        type StoredEvent = (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        );
+        let stored: Option<StoredEvent> = tx
+            .query_row(
+                "SELECT agent_kind, native_session_id, kind, source_record_id, role, content, \
+                        occurred_at, metadata_json FROM workstream_events \
+                 WHERE workstream_id = ?1 AND event_id = ?2",
+                params![workstream, event.event_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (source_record_id, metadata) = scrub_workstream_provenance(
+            &input.sanitizer,
+            event.source_record_id.as_deref(),
+            &event.metadata,
+        );
+        let expected = (
+            event.agent.as_str(),
+            event.native_session_id.as_str(),
+            event.kind.as_str(),
+            source_record_id.as_deref(),
+            event.role.as_deref(),
+            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES),
+            event.occurred_at.as_deref(),
+            serde_json::to_string(&metadata)?,
+        );
+        let exact = stored.as_ref().is_some_and(|stored| {
+            stored.0 == expected.0
+                && stored.1 == expected.1
+                && stored.2 == expected.2
+                && stored.3.as_deref() == expected.3
+                && stored.4.as_deref() == expected.4
+                && stored.5 == expected.5
+                && stored.6.as_deref() == expected.6
+                && stored.7 == expected.7
+        });
+        if !exact || event.agent.as_str() != agent_wire {
+            return Err(StoreError::InvalidState(
+                "finished managed run recovery contains uncommitted or changed events".into(),
+            ));
+        }
+    }
+    let stored_cursor = if let Some(native_session) = linked_session {
+        tx.query_row(
+            "SELECT source_cursor FROM workstream_native_sessions \
+             WHERE workstream_id = ?1 AND agent_kind = ?2 AND native_session_id = ?3",
+            params![workstream, agent_wire, native_session],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidState(
+                "finished managed run recovery has no durable native session".into(),
+            )
+        })?
+    } else {
+        None
+    };
+    if input.complete && stored_cursor != input.source_cursor {
+        return Err(StoreError::InvalidState(
+            "finished managed run recovery cannot advance its source cursor".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reader-side managed-run status.
 pub(crate) fn run_status(
     conn: &Connection,
@@ -1404,6 +1675,142 @@ pub(crate) fn list_recent(
     Ok(summaries)
 }
 
+/// List managed workstreams across every scope for the root/operator console.
+///
+/// The page is selected before current harness links are joined, so a
+/// workstream with several linked harnesses still consumes exactly one slot.
+/// Status ordering puts live and interrupted work ahead of completed and empty
+/// ledgers. The caller supplies `now_us` so stale-lease classification is
+/// deterministic in tests and does not mutate persisted run state.
+pub(crate) fn list_operational(
+    conn: &Connection,
+    limit: usize,
+    offset: usize,
+    now_us: i64,
+) -> StoreResult<Vec<OperationalWorkstreamSummary>> {
+    let limit = i64::try_from(limit.clamp(1, 101)).unwrap_or(101);
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare(
+        "WITH latest_runs AS ( \
+             SELECT id, workstream_id, agent_kind, state, lease_expires_at, \
+                    started_at, ended_at, exit_code, \
+                    ROW_NUMBER() OVER ( \
+                        PARTITION BY workstream_id ORDER BY started_at DESC, id DESC \
+                    ) AS row_num \
+             FROM managed_runs \
+         ), event_totals AS ( \
+             SELECT workstream_id, COUNT(*) AS event_count \
+             FROM workstream_events GROUP BY workstream_id \
+         ), selected AS ( \
+             SELECT w.id, ws.name AS workspace_name, p.name AS project_name, \
+                    w.name, w.updated_at, lr.id AS run_id, \
+                    lr.agent_kind, lr.state, lr.lease_expires_at, \
+                    lr.started_at, lr.ended_at, lr.exit_code, \
+                    COALESCE(events.event_count, 0) AS event_count, \
+                    CASE \
+                      WHEN lr.state = 'active' AND lr.lease_expires_at > ?1 THEN 0 \
+                      WHEN lr.state = 'expired' \
+                        OR (lr.state = 'active' AND lr.lease_expires_at <= ?1) \
+                        OR (lr.state = 'finished' AND lr.exit_code IS NOT 0) THEN 1 \
+                      WHEN COALESCE(events.event_count, 0) > 0 THEN 2 \
+                      ELSE 3 \
+                    END AS attention \
+             FROM workstreams w \
+             JOIN workspaces ws ON ws.id = w.workspace_id \
+             JOIN projects p ON p.id = w.project_id \
+             LEFT JOIN latest_runs lr \
+               ON lr.workstream_id = w.id AND lr.row_num = 1 \
+             LEFT JOIN event_totals events ON events.workstream_id = w.id \
+             ORDER BY attention ASC, w.updated_at DESC, w.id DESC \
+             LIMIT ?2 OFFSET ?3 \
+         ) \
+         SELECT selected.id, selected.workspace_name, selected.project_name, \
+                selected.name, selected.updated_at, selected.run_id, \
+                selected.agent_kind, selected.state, selected.lease_expires_at, \
+                selected.started_at, selected.ended_at, selected.exit_code, \
+                selected.event_count, native.agent_kind \
+         FROM selected \
+         LEFT JOIN workstream_native_sessions native \
+           ON native.workstream_id = selected.id AND native.is_current = 1 \
+         ORDER BY selected.attention ASC, selected.updated_at DESC, selected.id DESC, \
+                  native.updated_at DESC, native.agent_kind ASC",
+    )?;
+    let rows = statement.query_map(params![now_us, limit, offset], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<i32>>(11)?,
+            row.get::<_, u64>(12)?,
+            row.get::<_, Option<String>>(13)?,
+        ))
+    })?;
+
+    let mut summaries: Vec<OperationalWorkstreamSummary> = Vec::new();
+    for row in rows {
+        let (
+            raw_id,
+            workspace_name,
+            project_name,
+            name,
+            last_active_at,
+            raw_run_id,
+            latest_agent,
+            run_state,
+            lease_expires_at,
+            latest_started_at,
+            latest_ended_at,
+            exit_code,
+            event_count,
+            linked_agent,
+        ) = row?;
+        let workstream_id = WorkstreamId::from_slice(&raw_id)?;
+        if summaries
+            .last()
+            .is_none_or(|summary| summary.workstream_id != workstream_id)
+        {
+            let latest_run_id = raw_run_id
+                .as_deref()
+                .map(ManagedRunId::from_slice)
+                .transpose()?;
+            summaries.push(OperationalWorkstreamSummary {
+                workstream_id,
+                workspace_name,
+                project_name,
+                name,
+                status: operational_status(
+                    run_state.as_deref(),
+                    lease_expires_at,
+                    exit_code,
+                    event_count,
+                    now_us,
+                ),
+                latest_run_id,
+                latest_agent: latest_agent.as_deref().map(AgentKind::from_wire),
+                event_count,
+                linked_harnesses: Vec::new(),
+                last_active_at,
+                latest_started_at,
+                latest_ended_at,
+            });
+        }
+        if let Some(agent) = linked_agent
+            && let Some(summary) = summaries.last_mut()
+        {
+            summary.linked_harnesses.push(AgentKind::from_wire(&agent));
+        }
+    }
+    Ok(summaries)
+}
+
 /// Retitle one checkout-local workstream.
 ///
 /// Names are metadata: `workstream_events`, `managed_runs`, and
@@ -1514,7 +1921,8 @@ pub(crate) fn run_context(
     let row = conn
         .query_row(
             "SELECT mr.workstream_id, w.name, mr.agent_kind, mr.native_session_id, \
-                    mr.sync_after, mr.sync_through, mr.context_delivered \
+                    mr.sync_after, mr.sync_through, mr.context_delivered, \
+                    mr.previous_agent_kind, mr.previous_native_session_id \
              FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
              WHERE mr.id = ?1 AND mr.state = 'active'",
             params![run_id.as_bytes()],
@@ -1527,13 +1935,33 @@ pub(crate) fn run_context(
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((workstream, name, agent, native, after, through, delivered)) = row else {
+    let Some((
+        workstream,
+        name,
+        agent,
+        native,
+        after,
+        through,
+        delivered,
+        previous_agent,
+        previous_native,
+    )) = row
+    else {
         return Ok(None);
     };
+    let previous_native_session =
+        previous_agent
+            .zip(previous_native)
+            .map(|(agent, native_session_id)| ManagedNativeSessionReference {
+                agent: AgentKind::from_wire(&agent),
+                native_session_id,
+            });
     let workstream_id = WorkstreamId::from_slice(&workstream)?;
     let mut stmt = conn.prepare(
         "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at \
@@ -1584,6 +2012,7 @@ pub(crate) fn run_context(
         workstream_name: name,
         agent: AgentKind::from_wire(&agent),
         native_session_id: native,
+        previous_native_session,
         sync_after: after,
         sync_through: through,
         context_delivered: delivered,
@@ -1601,10 +2030,7 @@ pub(crate) fn search_events(
     sanitizer: &Sanitizer,
 ) -> StoreResult<Vec<WorkstreamEvent>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
-    let free_text = query
-        .replace("title:", "")
-        .replace("body:", "")
-        .replace("content:", "");
+    let free_text = strip_column_prefixes(query);
     let fts_query = crate::prepare_fts5_query(&free_text, stopwords);
     let sql = if fts_query.is_empty() {
         "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at, \
@@ -1635,6 +2061,29 @@ pub(crate) fn search_events(
         }
     }
     Ok(events)
+}
+
+/// Drop the `title:` / `body:` / `content:` column prefixes the search
+/// surface accepts: the ledger's FTS table has only a `content` column, so a
+/// kept `title:` would fail with "no such column". Only a prefix that starts
+/// a word is a column filter; `subtitle:` or `somebody:` keeps its text.
+fn strip_column_prefixes(query: &str) -> String {
+    const PREFIXES: [&str; 3] = ["title:", "body:", "content:"];
+    let mut out = String::with_capacity(query.len());
+    let mut rest = query;
+    let mut prev: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        let starts_word = prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_' || p == '/'));
+        if starts_word && let Some(prefix) = PREFIXES.iter().find(|p| rest.starts_with(**p)) {
+            rest = &rest[prefix.len()..];
+            prev = Some(':');
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 type EventRow = (
@@ -1698,4 +2147,62 @@ fn stored_event(row: EventRow, sanitizer: &Sanitizer) -> StoreResult<WorkstreamE
         content,
         occurred_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkstreamOperationalStatus, operational_status, strip_column_prefixes};
+
+    #[test]
+    fn column_prefixes_are_stripped_only_at_word_starts() {
+        assert_eq!(strip_column_prefixes("title:zebra"), "zebra");
+        assert_eq!(strip_column_prefixes("body:a content:b"), "a b");
+        assert_eq!(strip_column_prefixes("(title:a OR -body:b)"), "(a OR -b)");
+        assert_eq!(
+            strip_column_prefixes("subtitle:rendering"),
+            "subtitle:rendering"
+        );
+        assert_eq!(strip_column_prefixes("somebody: help"), "somebody: help");
+        assert_eq!(
+            strip_column_prefixes("café_title:x a/body:y"),
+            "café_title:x a/body:y"
+        );
+        assert_eq!(strip_column_prefixes("título:x"), "título:x");
+    }
+
+    #[test]
+    fn operational_status_uses_only_trusted_lifecycle_fields() {
+        use WorkstreamOperationalStatus::{Active, Completed, Empty, Interrupted};
+
+        assert_eq!(
+            operational_status(Some("active"), Some(11), None, 0, 10),
+            Active
+        );
+        assert_eq!(
+            operational_status(Some("active"), Some(10), None, 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("expired"), Some(99), Some(0), 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), None, 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), Some(2), 9, 10),
+            Interrupted
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), Some(0), 9, 10),
+            Completed
+        );
+        assert_eq!(
+            operational_status(Some("finished"), Some(0), Some(0), 0, 10),
+            Empty
+        );
+        assert_eq!(operational_status(None, None, None, 3, 10), Completed);
+        assert_eq!(operational_status(None, None, None, 0, 10), Empty);
+    }
 }

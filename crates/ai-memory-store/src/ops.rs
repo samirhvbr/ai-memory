@@ -4,7 +4,7 @@
 //! the writer thread would violate the single-writer invariant (see
 //! [`crate::writer`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
@@ -175,6 +175,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
+use crate::fts_query::cjk_index_terms;
 
 /// One embedding upsert requested by a backfill or embed command.
 #[derive(Debug)]
@@ -201,6 +202,155 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     let result_id = upsert_page_in_tx(&tx, page, now)?;
     tx.commit()?;
     Ok(result_id)
+}
+
+/// Reindex a disk page without reviving a purged session's summary.
+/// The tombstone and any surviving manual version are checked in the upsert
+/// transaction, so a directory walk's earlier snapshot cannot authorize a
+/// write after a session purge. Explicit page writes/restores use `upsert_page`.
+pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let session = page
+        .path
+        .as_str()
+        .strip_prefix("sessions/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .and_then(|id| id.parse::<SessionId>().ok());
+    if let Some(session) = session {
+        let session_text = session.to_string();
+        let owns_file = page
+            .frontmatter_json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            == Some(session_text.as_str());
+        // #866 keeps manual versions at this path. They may keep changing,
+        // but absence of `session_id` alone is not permission to recreate a
+        // deleted page: legacy summaries can lack that field too (#701).
+        let blocked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM purged_sessions \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3) \
+               AND (?6 OR NOT EXISTS(SELECT 1 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?4 \
+                   AND is_latest = 1 \
+                   AND json_extract(frontmatter_json, '$.session_id') IS NOT ?5))",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                session.as_bytes(),
+                page.path.as_str(),
+                session_text,
+                owns_file
+            ],
+            |row| row.get(0),
+        )?;
+        if blocked {
+            return Err(StoreError::SessionPurged(session_text));
+        }
+    }
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// What a conditional page write requires of the current latest version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePrecondition {
+    /// No latest version exists at the path: the write creates the page.
+    Absent,
+    /// The latest version at the path is this one.
+    Latest(PageId),
+}
+
+/// The outcome of [`upsert_page_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalUpsert {
+    /// The precondition held and the page was written; the id is current.
+    Upserted(PageId),
+    /// The precondition did not hold and nothing was written.
+    Mismatch {
+        /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
+}
+
+/// The outcome of an atomic conditional page batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalBatchUpsert {
+    /// Every precondition held and all pages were written.
+    Upserted(Vec<PageId>),
+    /// One precondition did not hold, so no page was written.
+    Mismatch {
+        /// Index of the refused page in the caller's batch.
+        index: usize,
+        /// The latest version at that path, if one exists.
+        current: Option<PageId>,
+    },
+}
+
+/// [`upsert_page`] only when `precondition` holds, checked in the same
+/// transaction as the write so no other writer can land in between.
+pub fn upsert_page_if(
+    conn: &mut Connection,
+    page: &NewPage,
+    precondition: PagePrecondition,
+) -> StoreResult<ConditionalUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let current = latest_page_id_in_tx(&tx, page)?;
+    let holds = match precondition {
+        PagePrecondition::Absent => current.is_none(),
+        PagePrecondition::Latest(expected) => current == Some(expected),
+    };
+    if !holds {
+        return Ok(ConditionalUpsert::Mismatch { current });
+    }
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(ConditionalUpsert::Upserted(id))
+}
+
+/// Upsert a batch only when every page precondition holds in the batch's
+/// transaction. A single mismatch writes nothing.
+pub fn upsert_pages_batch_if(
+    conn: &mut Connection,
+    pages: &[(NewPage, PagePrecondition)],
+) -> StoreResult<ConditionalBatchUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    for (index, (page, precondition)) in pages.iter().enumerate() {
+        let current = latest_page_id_in_tx(&tx, page)?;
+        let holds = match precondition {
+            PagePrecondition::Absent => current.is_none(),
+            PagePrecondition::Latest(expected) => current == Some(*expected),
+        };
+        if !holds {
+            return Ok(ConditionalBatchUpsert::Mismatch { index, current });
+        }
+    }
+    let mut ids = Vec::with_capacity(pages.len());
+    for (page, _) in pages {
+        ids.push(upsert_page_in_tx(&tx, page, now)?);
+    }
+    tx.commit()?;
+    Ok(ConditionalBatchUpsert::Upserted(ids))
+}
+
+fn latest_page_id_in_tx(tx: &Transaction<'_>, page: &NewPage) -> StoreResult<Option<PageId>> {
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|bytes| PageId::from_slice(&bytes).map_err(StoreError::from))
+        .transpose()
 }
 
 /// Resolve a workspace by name, creating it if missing. Atomic.
@@ -345,35 +495,56 @@ pub fn get_or_create_project_as(
     let id = if let Some(bytes) = existing {
         ai_memory_core::ProjectId::from_slice(&bytes)?
     } else {
-        also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
-        let id = ai_memory_core::ProjectId::new();
-        tx.execute(
-            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.as_bytes(),
-                workspace_id.as_bytes(),
-                name,
-                repo_path.as_deref(),
-                Timestamp::now().as_microsecond()
-            ],
-        )?;
-        // `open` and no creator are the column defaults, so the insert above
-        // is the one upstream always ran; only what differs needs a write.
-        if initial_access_mode(name, new_project_mode) == crate::AccessMode::Restricted {
-            tx.execute(
-                "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
-                params![id.as_bytes()],
-            )?;
+        // A name that a promoted project still answers to (its `legacy_name`
+        // or `canonical_name`) is not a new project. Inserting a row under it
+        // splits one project in two — the capture lands in an empty twin while
+        // every read keeps resolving the promoted project — and the name then
+        // resolves ambiguously for both paths until someone purges the twin
+        // (#1657). Reuse the row the read path already picks, and let the
+        // authorization choke point decide whether the caller may write there;
+        // an ambiguous name is an error, never another twin. The exact-name
+        // lookup above still runs first, so a name that is only a name behaves
+        // exactly as before.
+        let coordinate = if crate::project_coordinates::supports_coordinates(&tx)? {
+            crate::project_coordinates::resolve(&tx, *workspace_id, name)?
+        } else {
+            None
+        };
+        match coordinate {
+            Some(coordinate) => coordinate.id,
+            None => {
+                also_in = project_name_in_other_workspaces(&tx, workspace_id, name)?;
+                let id = ai_memory_core::ProjectId::new();
+                tx.execute(
+                    "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id.as_bytes(),
+                        workspace_id.as_bytes(),
+                        name,
+                        repo_path.as_deref(),
+                        Timestamp::now().as_microsecond()
+                    ],
+                )?;
+                // `open` and no creator are the column defaults, so the insert
+                // above is the one upstream always ran; only what differs needs
+                // a write.
+                if initial_access_mode(name, new_project_mode) == crate::AccessMode::Restricted {
+                    tx.execute(
+                        "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
+                        params![id.as_bytes()],
+                    )?;
+                }
+                if let Some(creator) = creator {
+                    tx.execute(
+                        "UPDATE projects SET created_by = ?1 WHERE id = ?2",
+                        params![creator.as_bytes(), id.as_bytes()],
+                    )?;
+                }
+                created = true;
+                id
+            }
         }
-        if let Some(creator) = creator {
-            tx.execute(
-                "UPDATE projects SET created_by = ?1 WHERE id = ?2",
-                params![creator.as_bytes(), id.as_bytes()],
-            )?;
-        }
-        created = true;
-        id
     };
     tx.commit()?;
     if scheduler_state_table_exists(conn)? {
@@ -1472,6 +1643,156 @@ fn stamped_frontmatter(mut conformed: serde_json::Value, now_us: i64) -> StoreRe
     Ok(serde_json::to_string(&conformed)?)
 }
 
+/// Rows the CJK backfill indexes per transaction before it truncates the WAL.
+const CJK_BACKFILL_BATCH: i64 = 256;
+
+/// Rows added by [`backfill_cjk_indexes`] while opening an upgraded store.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CjkBackfillSummary {
+    pub(crate) pages: u64,
+    pub(crate) observations: u64,
+}
+
+/// Repair missing rows in the derived CJK indexes before readers start.
+///
+/// Every source row receives an auxiliary row, including Latin-only content
+/// (whose terms are empty). That makes this an idempotent anti-join instead of
+/// rescanning every Latin row at each startup. Deletes and direct content
+/// updates remove the derived row through V87 triggers, so a crash or an
+/// offline maintenance edit converges here on the next open.
+pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBackfillSummary> {
+    backfill_cjk_indexes_in_batches(conn, CJK_BACKFILL_BATCH)
+}
+
+/// [`backfill_cjk_indexes`] with an explicit batch size (tests use a tiny
+/// batch to drive the cursor across several batches).
+///
+/// Each batch resumes after the highest rowid the previous one indexed. A
+/// batch returns the missing rows in rowid order and indexes every one of
+/// them before it commits, so no row at or below the cursor is still missing
+/// and the anti-join probes each source row once. Without the cursor every
+/// batch filtered from the first rowid again and re-probed the whole indexed
+/// prefix, so the pass slowed down as it went: quadratic in the row count,
+/// hours of startup on a store with 1.6 million observations (#1652).
+pub(crate) fn backfill_cjk_indexes_in_batches(
+    conn: &mut Connection,
+    batch: i64,
+) -> StoreResult<CjkBackfillSummary> {
+    type PageRow = (i64, String, String, String);
+    type ObservationRow = (i64, String, String);
+    let batch = batch.max(1);
+    let mut summary = CjkBackfillSummary::default();
+
+    let mut after = i64::MIN;
+    loop {
+        let tx = conn.transaction()?;
+        let rows: Vec<PageRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT p.rowid, p.title, p.body, p.path_search FROM pages p \
+                 WHERE p.rowid > ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM pages_cjk_fts f WHERE f.rowid = p.rowid) \
+                 ORDER BY p.rowid LIMIT ?2",
+            )?;
+            stmt.query_map(params![after, batch], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        if rows.is_empty() {
+            tx.commit()?;
+            break;
+        }
+        for (rowid, title, body, path_search) in &rows {
+            index_page_cjk(&tx, *rowid, title, body, path_search)?;
+            after = *rowid;
+        }
+        summary.pages += rows.len() as u64;
+        tx.commit()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    }
+
+    after = i64::MIN;
+    loop {
+        let tx = conn.transaction()?;
+        let rows: Vec<ObservationRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT o.rowid, o.title, o.body FROM observations o \
+                 WHERE o.rowid > ?1 AND NOT EXISTS ( \
+                     SELECT 1 FROM observations_cjk_fts f WHERE f.rowid = o.rowid \
+                 ) ORDER BY o.rowid LIMIT ?2",
+            )?;
+            stmt.query_map(params![after, batch], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        if rows.is_empty() {
+            tx.commit()?;
+            break;
+        }
+        for (rowid, title, body) in &rows {
+            index_observation_cjk(&tx, *rowid, title, body)?;
+            after = *rowid;
+        }
+        summary.observations += rows.len() as u64;
+        tx.commit()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    }
+    Ok(summary)
+}
+
+fn index_page_cjk(
+    conn: &Connection,
+    rowid: i64,
+    title: &str,
+    body: &str,
+    path_search: &str,
+) -> StoreResult<()> {
+    let result = conn.execute(
+        "INSERT INTO pages_cjk_fts(rowid, title, body, path_search) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            rowid,
+            cjk_index_terms(title),
+            cjk_index_terms(body),
+            cjk_index_terms(path_search)
+        ],
+    );
+    finish_cjk_index_write(result)
+}
+
+fn index_observation_cjk(
+    conn: &Connection,
+    rowid: i64,
+    title: &str,
+    body: &str,
+) -> StoreResult<()> {
+    let result = conn.execute(
+        "INSERT INTO observations_cjk_fts(rowid, title, body) VALUES (?1, ?2, ?3)",
+        params![rowid, cjk_index_terms(title), cjk_index_terms(body)],
+    );
+    finish_cjk_index_write(result)
+}
+
+fn finish_cjk_index_write(result: rusqlite::Result<usize>) -> StoreResult<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            // Historical migration tests deliberately stop at V18/V19/V33
+            // and then exercise current operation helpers against that frozen
+            // schema. A real Store migrates through V87 before the writer is
+            // spawned, so a missing table remains a fatal integrity error in
+            // every production build.
+            #[cfg(test)]
+            if error.to_string().contains("no such table:")
+                && error.to_string().contains("_cjk_fts")
+            {
+                return Ok(());
+            }
+            Err(error.into())
+        }
+    }
+}
+
 /// What a [`backfill_entity_index`] pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EntityBackfillSummary {
@@ -1808,6 +2129,13 @@ pub(crate) fn upsert_page_in_tx(
                 compacted_at,
             ],
         )?;
+        index_page_cjk(
+            tx,
+            tx.last_insert_rowid(),
+            &page.title,
+            &page.body,
+            &path_search,
+        )?;
         replace_links_in_tx(tx, &new_id, page)?;
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
@@ -1891,6 +2219,13 @@ pub(crate) fn upsert_page_in_tx(
             page.expires_at.map(|ts| ts.as_microsecond()),
             compacted_at,
         ],
+    )?;
+    index_page_cjk(
+        tx,
+        tx.last_insert_rowid(),
+        &page.title,
+        &page.body,
+        &path_search,
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
     attach_entities_in_tx(tx, &new_id, page, now)?;
@@ -2369,12 +2704,16 @@ fn end_lifecycle_only_session_in_tx(
     // re-check would silently revert the router's verdict. Everything else,
     // including `stop` and `notification` (some harnesses, e.g. OpenCode,
     // fire these for purely internal work), is ephemeral.
+    // The predicate text is shared with the reader's SessionEnd aggregates
+    // (`SUBSTANTIVE_OBSERVATION_KIND_SQL`), so the two cannot drift.
     let has_substantive_observation: bool = tx.query_row(
-        "SELECT EXISTS( \
-             SELECT 1 FROM observations \
-             WHERE session_id = ?1 \
-               AND kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use') \
-         )",
+        &format!(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM observations \
+                 WHERE session_id = ?1 AND {} \
+             )",
+            crate::reader::SUBSTANTIVE_OBSERVATION_KIND_SQL
+        ),
         params![session_id.as_bytes()],
         |row| row.get(0),
     )?;
@@ -2744,9 +3083,38 @@ pub fn insert_observation(
 }
 
 /// Ingest-keys older than this are swept opportunistically on every keyed
-/// insert. Keys only need to outlive the client spool (7 days + retry
-/// backoff); 30 days is a generous margin.
+/// insert. Ordinary keys only need to outlive the client spool (7 days + retry
+/// backoff); recovery keys remain tied to their stored session until it is purged.
 const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
+fn recovery_ingest_key(key: &str) -> bool {
+    key.strip_prefix("recovery_").is_some_and(|digest| {
+        digest.len() == 55 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn recovery_event_identity(obs: &NewObservation, agent: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    let session_id = obs.session_id.to_string();
+    for value in [
+        Some(session_id.as_str()),
+        agent,
+        Some(obs.kind.as_str()),
+        obs.extension.as_deref(),
+        obs.source_event.as_deref(),
+        Some(obs.title.as_str()),
+        Some(obs.body.as_str()),
+    ] {
+        if let Some(value) = value {
+            hasher.update(value.len().to_be_bytes());
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update(usize::MAX.to_be_bytes());
+        }
+    }
+    hasher.update(obs.occurred_at.unwrap_or_default().to_be_bytes());
+    format!("{digest:x}", digest = hasher.finalize())
+}
 
 /// Claim a project-scoped ingest key and append its observation atomically.
 ///
@@ -2766,18 +3134,48 @@ pub fn insert_observation_keyed(
     // Sweep before looking up the current key so an expired key can be reused
     // even when no unrelated keyed event arrived in the meantime.
     tx.execute(
-        "DELETE FROM ingest_keys WHERE seen_at < ?1",
+        "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
         params![now - INGEST_KEY_TTL_MICROS],
     )?;
-    let existing: Option<Option<i64>> = tx
+    let recovery = recovery_ingest_key(ingest_key);
+    let session_agent = if recovery {
+        tx.query_row(
+            "SELECT agent_kind FROM sessions WHERE id = ?1",
+            params![obs.session_id.as_bytes()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let event_identity = recovery.then(|| recovery_event_identity(obs, session_agent.as_deref()));
+    type IngestKeyRow = (
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    if recovery && session_agent.is_none() {
+        return Err(StoreError::SessionCollision);
+    }
+    let existing: Option<IngestKeyRow> = tx
         .query_row(
-            "SELECT completed_at FROM ingest_keys \
+            "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys \
              WHERE project_id = ?1 AND key = ?2",
             params![obs.project_id.as_bytes(), ingest_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    if let Some(completed_at) = existing {
+    if let Some((completed_at, session_id, agent, kind, identity)) = existing {
+        if recovery
+            && (session_id.as_deref() != Some(obs.session_id.as_bytes())
+                || agent.as_deref() != session_agent.as_deref()
+                || kind.as_deref() != Some(obs.kind.as_str())
+                || identity.as_deref() != event_identity.as_deref())
+        {
+            return Err(StoreError::SessionCollision);
+        }
         tx.commit()?;
         return Ok(if completed_at.is_some() {
             IngestObservationOutcome::AlreadyComplete
@@ -2787,9 +3185,18 @@ pub fn insert_observation_keyed(
     }
 
     tx.execute(
-        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
-         VALUES (?1, ?2, ?3, NULL)",
-        params![obs.project_id.as_bytes(), ingest_key, now],
+        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            obs.project_id.as_bytes(),
+            ingest_key,
+            now,
+            recovery.then_some(obs.session_id.as_bytes()),
+            session_agent,
+            recovery.then_some(obs.kind.as_str()),
+            event_identity,
+            i64::from(recovery)
+        ],
     )?;
     let id = insert_observation_row(&tx, obs)?;
     tx.commit()?;
@@ -2952,18 +3359,36 @@ pub fn admit_hook_session_event(
     }
     let ingest = if let Some(key) = ingest_key {
         tx.execute(
-            "DELETE FROM ingest_keys WHERE seen_at < ?1",
+            "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
             params![now - INGEST_KEY_TTL_MICROS],
         )?;
-        let old: Option<Option<i64>> = tx
+        let recovery = recovery_ingest_key(key);
+        let event_identity =
+            recovery.then(|| recovery_event_identity(obs, Some(session.agent_kind.as_str())));
+        type IngestKeyRow = (
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let old: Option<IngestKeyRow> = tx
             .query_row(
-                "SELECT completed_at FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
                 params![obs.project_id.as_bytes(), key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         match old {
-            Some(done) => {
+            Some((done, keyed_session, keyed_agent, keyed_kind, keyed_identity)) => {
+                if recovery
+                    && (keyed_session.as_deref() != Some(obs.session_id.as_bytes())
+                        || keyed_agent.as_deref() != Some(session.agent_kind.as_str())
+                        || keyed_kind.as_deref() != Some(obs.kind.as_str())
+                        || keyed_identity.as_deref() != event_identity.as_deref())
+                {
+                    return Err(StoreError::SessionCollision);
+                }
                 if done.is_some() {
                     IngestObservationOutcome::AlreadyComplete
                 } else {
@@ -2971,7 +3396,20 @@ pub fn admit_hook_session_event(
                 }
             }
             None => {
-                tx.execute("INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, NULL)", params![obs.project_id.as_bytes(), key, now])?;
+                tx.execute(
+                    "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        obs.project_id.as_bytes(),
+                        key,
+                        now,
+                        recovery.then_some(obs.session_id.as_bytes()),
+                        recovery.then_some(session.agent_kind.as_str()),
+                        recovery.then_some(obs.kind.as_str()),
+                        event_identity,
+                        i64::from(recovery)
+                    ],
+                )?;
                 IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
             }
         }
@@ -3086,6 +3524,326 @@ pub fn end_admitted_session_with_handoff(
     Ok(id)
 }
 
+/// An idle auto-end candidate as selected by the server-side tick
+/// ([`crate::reader::ReaderPool::idle_open_sessions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleEndAction {
+    /// A substantive session: end it with its summary page and, when the
+    /// caller asks for it, its consolidation job.
+    Substantive {
+        /// The latest `sessions/<id>.md` version the tick WROTE OR KEPT.
+        /// The stamp re-verifies it is still the latest: a checkpoint or a
+        /// real `SessionEnd` page landing after the tick's write would
+        /// otherwise leave the stamp pointing at a page that no longer
+        /// represents the session's work.
+        expected_page_id: PageId,
+        /// The session's observation count at the moment the digest was
+        /// built (read in the digest's own snapshot: EVERY observation of
+        /// the session, whatever project each row landed in — the same
+        /// population `session_observation_count` counts). The stamp
+        /// re-verifies the live count still equals it: a non-end observation
+        /// landing after the digest would otherwise reach the watermark
+        /// without reaching the page.
+        observation_count: i64,
+        /// The tick's clock, in Unix microseconds. `ended_at` is stamped
+        /// with it — not with the session's last activity — so the
+        /// auto-improvement discovery, which is ordered by `ended_at`, finds
+        /// auto-ended sessions in the order they were ended.
+        now_us: i64,
+        /// The session's last activity, in Unix microseconds. Recorded in
+        /// the audit detail next to the tick's clock.
+        last_activity_us: i64,
+    },
+    /// A boundary-only session: end it without a page or a consolidation
+    /// job; a handoff accepted for it reopens for its owner.
+    LifecycleOnly {
+        /// The tick's clock, as in [`Self::Substantive::now_us`].
+        now_us: i64,
+        /// The session's last activity, as in
+        /// [`Self::Substantive::last_activity_us`].
+        last_activity_us: i64,
+    },
+}
+
+/// Outcome of one candidate in a batched idle end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleEndResult {
+    /// The substantive session ended with its summary page and watermark.
+    EndedSubstantive,
+    /// The lifecycle-only session ended (releasing its accepted handoff
+    /// when one existed).
+    EndedLifecycleOnly,
+    /// The session could no longer be ended: a real `SessionEnd` won the
+    /// race (the CAS saw `ended_at` set), the candidate no longer matches
+    /// its row's scope, the observation count or the latest page version
+    /// moved after the tick read it, or substantive work arrived before the
+    /// lifecycle-only atomic re-check. The row is untouched.
+    Lost,
+}
+
+/// One session for [`idle_end_sessions`], fully scoped so the guarded write
+/// never trusts a caller-provided id alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleEndCandidate {
+    /// Session to end.
+    pub session_id: SessionId,
+    /// Workspace the session row must belong to.
+    pub workspace_id: WorkspaceId,
+    /// Project the session row must belong to.
+    pub project_id: ProjectId,
+    /// Harness recorded on the session row.
+    pub agent_kind: AgentKind,
+    /// What the end does.
+    pub action: IdleEndAction,
+}
+
+/// End a batch of idle sessions in one writer command.
+///
+/// Each candidate is stamped by its own guarded write. The substantive end
+/// is an `UPDATE … WHERE ended_at IS NULL` CAS that ALSO re-verifies what the
+/// summary page saw: the session's observation count (every row of the
+/// session, the digest's population) must still equal the
+/// count the digest was built from, and the latest page version must still
+/// be the one the tick wrote or kept. Any mismatch — a non-end observation,
+/// a checkpoint page, or a real `SessionEnd` landing after the tick's read —
+/// reports [`IdleEndResult::Lost`] and rolls the candidate's transaction
+/// back: no stamp, no audit, no enqueue; the page the tick wrote stays an
+/// ordinary version. The lifecycle-only end applies the same scope/open
+/// guards before any mutation and re-checks substantiveness atomically,
+/// reporting `Lost` instead of downgrading substantive work to a boundary-
+/// only end. Immediately before the batch, the writer actor also snapshots
+/// active managed-run session links. Since every managed-run link and idle
+/// stamp is serialized through that actor, no link can land between this
+/// decisive snapshot and the guarded writes.
+///
+/// `ended_at` is the tick's clock (`now_us`), and
+/// `ended_observation_count` is counted in the same transaction as the
+/// stamp, so a later real `SessionEnd` is `AlreadyEnded` (no new
+/// observations) or `ReEnd` (new work arrived) against that watermark —
+/// never a double end of the same work. The session's last activity is
+/// preserved in the audit detail (`last_activity_us`). No handoff is
+/// created here: the baton is the hook path's decision.
+///
+/// `enqueue_consolidation` is the server's resolved
+/// `consolidate_on_session_end` flag, the same effect the hook path applies
+/// to a substantive end, computed once per tick. The enqueue runs INSIDE the
+/// stamp's transaction: a failed enqueue rolls back the stamp and the audit,
+/// leaving the session open for the next tick. A lost candidate is never
+/// enqueued.
+///
+/// # Errors
+/// Returns a [`StoreError`] on any SQL or commit failure. A CAS miss is not
+/// an error: it is reported per candidate as [`IdleEndResult::Lost`].
+pub fn idle_end_sessions(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+) -> StoreResult<Vec<IdleEndResult>> {
+    idle_end_sessions_inner(conn, candidates, enqueue_consolidation, None)
+}
+
+/// Test-only: [`idle_end_sessions`] with a `pre_stamp` hook that runs on
+/// the writer connection BEFORE each candidate's stamp transaction opens
+/// (after the previous candidate finished, before the `transaction()`
+/// below) — not inside it. Lets a test race a real effect (a non-end
+/// observation, a checkpoint page, a real `SessionEnd` stamp)
+/// deterministically into the window between the tick's page write and the
+/// stamp, without sleeps. The hook simulates a concurrent writer's effect
+/// landing in that window; it is not a participant in the stamp
+/// transaction.
+#[cfg(test)]
+pub fn idle_end_sessions_pre_stamp(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+    pre_stamp: &mut dyn FnMut(&mut Connection),
+) -> StoreResult<Vec<IdleEndResult>> {
+    idle_end_sessions_inner(conn, candidates, enqueue_consolidation, Some(pre_stamp))
+}
+
+fn idle_end_sessions_inner(
+    conn: &mut Connection,
+    candidates: &[IdleEndCandidate],
+    enqueue_consolidation: bool,
+    mut pre_stamp: Option<&mut dyn FnMut(&mut Connection)>,
+) -> StoreResult<Vec<IdleEndResult>> {
+    let mut results = Vec::with_capacity(candidates.len());
+    // The production command holds the sole writer actor for the entire
+    // batch, so one snapshot is decisive and avoids one query per candidate.
+    // The test seam deliberately mutates between candidates and therefore
+    // refreshes after each injected effect.
+    let active_sessions = if pre_stamp.is_none() {
+        Some(active_managed_run_sessions(conn)?)
+    } else {
+        None
+    };
+    for candidate in candidates {
+        if let Some(hook) = pre_stamp.as_mut() {
+            hook(conn);
+        }
+        let managed_run_active = match &active_sessions {
+            Some(active) => active.contains(&candidate.session_id),
+            None => active_managed_run_sessions(conn)?.contains(&candidate.session_id),
+        };
+        if managed_run_active {
+            results.push(IdleEndResult::Lost);
+            continue;
+        }
+        let result = match &candidate.action {
+            IdleEndAction::Substantive {
+                expected_page_id,
+                observation_count,
+                now_us,
+                last_activity_us,
+            } => {
+                let tx = conn.transaction()?;
+                let page_blob: &[u8] = expected_page_id.as_bytes();
+                let changed = tx.execute(
+                    "UPDATE sessions \
+                     SET ended_at = ?1, summary_page_id = ?2, \
+                         ended_observation_count = ( \
+                             SELECT COUNT(*) FROM observations \
+                             WHERE session_id = ?3 \
+                         ) \
+                     WHERE id = ?3 AND workspace_id = ?4 AND project_id = ?5 \
+                       AND ended_at IS NULL \
+                       AND ( \
+                             SELECT COUNT(*) FROM observations \
+                             WHERE session_id = ?3 \
+                         ) = ?6 \
+                       AND ( \
+                             SELECT id FROM pages \
+                             WHERE workspace_id = ?4 AND project_id = ?5 \
+                               AND path = ?7 AND is_latest = 1 \
+                         ) = ?2",
+                    params![
+                        *now_us,
+                        page_blob,
+                        candidate.session_id.as_bytes(),
+                        candidate.workspace_id.as_bytes(),
+                        candidate.project_id.as_bytes(),
+                        *observation_count,
+                        format!("sessions/{}.md", candidate.session_id)
+                    ],
+                )?;
+                if changed == 0 {
+                    // A real SessionEnd (or another writer) ended the
+                    // session after the tick selected it, the session's
+                    // work or its page moved after the tick's read, or the
+                    // candidate no longer matches its row: the newer effect
+                    // owns the row. Drop the transaction to roll back.
+                    results.push(IdleEndResult::Lost);
+                    continue;
+                }
+                audit_with_detail(
+                    &tx,
+                    "idle_session_end",
+                    Some(candidate.workspace_id.as_bytes()),
+                    Some(candidate.project_id.as_bytes()),
+                    Some(expected_page_id.as_bytes()),
+                    None,
+                    *now_us,
+                    &serde_json::json!({
+                        "session_id": candidate.session_id.to_string(),
+                        "action": "substantive",
+                        "last_activity_us": *last_activity_us,
+                    })
+                    .to_string(),
+                )?;
+                // The enqueue runs inside the stamp's transaction: a failed
+                // enqueue propagates, the transaction rolls back, and the
+                // session stays open for the next tick.
+                if enqueue_consolidation {
+                    crate::session_consolidation::enqueue_in_tx(
+                        &tx,
+                        candidate.workspace_id,
+                        candidate.project_id,
+                        candidate.session_id,
+                    )?;
+                }
+                tx.commit()?;
+                IdleEndResult::EndedSubstantive
+            }
+            IdleEndAction::LifecycleOnly {
+                now_us,
+                last_activity_us,
+            } => {
+                let tx = conn.transaction()?;
+                // The same guards as the substantive arm, before any
+                // mutation or handoff release: the candidate's scope must
+                // match the row and the row must still be open. Anything
+                // else is a stale or foreign candidate: `Lost`, nothing
+                // written.
+                let open: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM sessions \
+                     WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                       AND ended_at IS NULL",
+                    params![
+                        candidate.session_id.as_bytes(),
+                        candidate.workspace_id.as_bytes(),
+                        candidate.project_id.as_bytes()
+                    ],
+                    |row| row.get(0),
+                )?;
+                if open == 0 {
+                    results.push(IdleEndResult::Lost);
+                    continue;
+                }
+                let outcome =
+                    end_lifecycle_only_session_in_tx(&tx, &candidate.session_id, Some(*now_us))?;
+                match outcome {
+                    LifecycleOnlyEndOutcome::Ended { .. } => {
+                        // The auto-end audit is its own row in the stamp's
+                        // transaction, distinct from the
+                        // `release_lifecycle_only_handoff` row the handoff
+                        // release writes when a handoff was released.
+                        audit_with_detail(
+                            &tx,
+                            "idle_session_end",
+                            Some(candidate.workspace_id.as_bytes()),
+                            Some(candidate.project_id.as_bytes()),
+                            None,
+                            None,
+                            *now_us,
+                            &serde_json::json!({
+                                "session_id": candidate.session_id.to_string(),
+                                "action": "lifecycle_only",
+                                "last_activity_us": *last_activity_us,
+                            })
+                            .to_string(),
+                        )?;
+                        tx.commit()?;
+                        IdleEndResult::EndedLifecycleOnly
+                    }
+                    // Substantive work raced the tick's classification: leave
+                    // the session open (the transaction rolls back) and let
+                    // the real end — or the next tick — handle it.
+                    LifecycleOnlyEndOutcome::Substantive => {
+                        results.push(IdleEndResult::Lost);
+                        continue;
+                    }
+                }
+            }
+        };
+        results.push(result);
+    }
+    Ok(results)
+}
+
+fn active_managed_run_sessions(conn: &Connection) -> StoreResult<HashSet<SessionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT native_session_id FROM managed_runs \
+         WHERE state = 'active' AND native_session_id IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut sessions = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let native_session_id: String = row.get(0)?;
+        sessions.insert(SessionId::from_native(&native_session_id));
+    }
+    Ok(sessions)
+}
+
 /// Mark a keyed hook event complete after its downstream effects finish.
 ///
 /// This transition is idempotent so two resumed processors can converge on the
@@ -3156,6 +3914,7 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
             now,
         ],
     )?;
+    index_observation_cjk(conn, conn.last_insert_rowid(), &obs.title, &obs.body)?;
     Ok(id)
 }
 
@@ -3888,6 +4647,20 @@ pub struct ObservationPruneOutcome {
     pub sessions_resynced: usize,
 }
 
+/// Active-work exclusion shared, byte for byte, by the observation prune and
+/// its dry-run count (`ReaderPool::prunable_observation_count`). The caller
+/// applies this once per distinct candidate session as alias `s`: a queued job
+/// still needs its raw capture, and an ended session whose observation count
+/// advanced has resumed but not yet reached the next consolidation enqueue.
+pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "NOT EXISTS ( \
+    SELECT 1 FROM session_consolidation_jobs j \
+    WHERE j.session_id = s.id \
+      AND j.state IN ('pending', 'running') \
+) AND s.ended_observation_count >= ( \
+    SELECT COUNT(*) FROM observations current \
+    WHERE current.session_id = s.id \
+)";
+
 /// Permanently delete one bounded batch of raw observations belonging to
 /// sessions that were already distilled into a live summary page.
 ///
@@ -3901,6 +4674,20 @@ pub struct ObservationPruneOutcome {
 /// by the same sweep is excluded for free, because the `ON DELETE SET NULL`
 /// foreign key has already cleared the pointer. A session with no `sessions`
 /// row, or one that never ended, matches nothing and can never be pruned.
+///
+/// A session with a consolidation job the worker can still claim is excluded
+/// by [`OBSERVATION_PRUNE_SESSION_GUARD_SQL`] even when every other predicate
+/// holds: that job — a `pending` row (a transient failure is recorded as a
+/// `pending` retry, not `failed`) or a `running` row whose stale lease the
+/// next claim reclaims — still reads the raw capture to consolidate the
+/// session, and pruning underneath it would consolidate a truncated session.
+/// `completed`, `failed` and `superseded` rows are terminal for the automatic
+/// worker and block nothing.
+///
+/// The same guard excludes a resumed session before its next job exists.
+/// `ended_observation_count` is the generation covered by its latest end; a
+/// larger live count means new capture has arrived and is not yet represented
+/// by the session-end page/queue state.
 ///
 /// `ORDER BY created_at` makes the batching deterministic: a run interrupted
 /// halfway leaves a clean age boundary rather than holes, so the next run
@@ -3929,24 +4716,29 @@ pub fn prune_consolidated_observations(
     let mut deleted = 0usize;
     let mut sessions: BTreeSet<Vec<u8>> = BTreeSet::new();
     {
-        let mut stmt = tx.prepare(
-            "DELETE FROM observations \
+        let guard = OBSERVATION_PRUNE_SESSION_GUARD_SQL;
+        let mut stmt = tx.prepare(&format!(
+            "WITH candidate_sessions AS ( \
+                 SELECT DISTINCT session_id FROM observations \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND created_at < ?3 \
+             ), eligible_sessions AS MATERIALIZED ( \
+                 SELECT s.id FROM candidate_sessions candidate \
+                 JOIN sessions s ON s.id = candidate.session_id \
+                 JOIN pages p ON p.id = s.summary_page_id \
+                 WHERE p.superseded_at IS NULL AND {guard} \
+             ) \
+             DELETE FROM observations \
              WHERE id IN ( \
                  SELECT o.id FROM observations o \
+                 JOIN eligible_sessions eligible ON eligible.id = o.session_id \
                  WHERE o.workspace_id = ?1 \
                    AND o.project_id = ?2 \
                    AND o.created_at < ?3 \
-                   AND EXISTS ( \
-                       SELECT 1 FROM sessions s \
-                       JOIN pages p ON p.id = s.summary_page_id \
-                       WHERE s.id = o.session_id \
-                         AND p.superseded_at IS NULL \
-                   ) \
                  ORDER BY o.created_at \
                  LIMIT ?4 \
              ) \
              RETURNING session_id",
-        )?;
+        ))?;
         let rows = stmt.query_map(
             params![
                 workspace_id.as_bytes(),
@@ -5382,7 +6174,13 @@ pub enum PurgeMode {
 /// being made about it. A list inside a string literal cannot be compared to
 /// anything, and the failure mode of getting it wrong is silent — text stays
 /// searchable after an operator asked for it to be reclaimed.
-const ALL_FTS_INDEXES: &[&str] = &["observations_fts", "pages_fts", "workstream_events_fts"];
+const ALL_FTS_INDEXES: &[&str] = &[
+    "observations_cjk_fts",
+    "observations_fts",
+    "pages_cjk_fts",
+    "pages_fts",
+    "workstream_events_fts",
+];
 
 /// Rebuild every FTS5 index, then `VACUUM`. Runs after the caller's
 /// transaction has committed: `VACUUM` cannot run inside one, and a rebuild is
@@ -5407,7 +6205,72 @@ pub(crate) fn reclaim_freed_pages(conn: &Connection) -> StoreResult<()> {
     }
     batch.push_str("VACUUM;");
     conn.execute_batch(&batch)?;
+    truncate_wal_best_effort(conn, "vacuum");
     Ok(())
+}
+
+/// The `(busy, log, checkpointed)` row `PRAGMA wal_checkpoint` returns.
+///
+/// `busy` is non-zero when a reader kept the checkpoint from finishing. `log`
+/// and `checkpointed` are WAL frame counts, and both are `-1` when the
+/// database is not in WAL mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalCheckpoint {
+    pub(crate) busy: i64,
+    pub(crate) log: i64,
+    pub(crate) checkpointed: i64,
+}
+
+/// Checkpoint the whole WAL into the database file and truncate it to zero
+/// bytes.
+///
+/// # Errors
+/// Propagates the SQL error. A checkpoint that a reader holds back is not an
+/// error: it is reported through [`WalCheckpoint::busy`].
+pub(crate) fn wal_checkpoint_truncate(conn: &Connection) -> StoreResult<WalCheckpoint> {
+    Ok(
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok(WalCheckpoint {
+                busy: row.get(0)?,
+                log: row.get(1)?,
+                checkpointed: row.get(2)?,
+            })
+        })?,
+    )
+}
+
+/// Truncate the WAL, and log instead of failing when that cannot be done.
+///
+/// `VACUUM` rewrites every page through the WAL. SQLite's automatic checkpoint
+/// copies those pages back but never shrinks the file, so a `VACUUM` on a
+/// multi-gigabyte database leaves a `-wal` as large as the database until the
+/// next clean close, and a crash or a `SIGKILL` makes the next start replay it
+/// in full. Truncating here, right after the rewrite, is what stops that.
+///
+/// Best effort and deliberately not retried: the operation this follows has
+/// already committed, so a reader that holds the checkpoint back (or a failed
+/// checkpoint) must not turn it into an error. `journal_size_limit` and the
+/// next checkpoint reclaim the space once the reader is gone.
+pub(crate) fn truncate_wal_best_effort(conn: &Connection, after: &'static str) {
+    match wal_checkpoint_truncate(conn) {
+        Ok(WalCheckpoint { busy: 0, .. }) => {}
+        Ok(WalCheckpoint {
+            busy,
+            log,
+            checkpointed,
+        }) => tracing::warn!(
+            after,
+            busy,
+            log,
+            checkpointed,
+            "WAL checkpoint(TRUNCATE) was blocked by an active reader; the -wal file keeps its size until a later checkpoint"
+        ),
+        Err(error) => tracing::warn!(
+            after,
+            %error,
+            "WAL checkpoint(TRUNCATE) failed; the -wal file keeps its size until a later checkpoint"
+        ),
+    }
 }
 
 /// What one [`compact`] run reclaimed.
@@ -5688,6 +6551,7 @@ pub fn reclaim_ledger_versions(
         // `VACUUM` cannot run inside a transaction, and it is the whole-file
         // rewrite `compact` already documents the cost of.
         conn.execute_batch("VACUUM;")?;
+        truncate_wal_best_effort(conn, "vacuum");
         summary.compacted = true;
         summary.bytes_after = database_bytes(conn)?;
     }
@@ -5826,6 +6690,30 @@ pub fn purge_session(
     compaction: Compaction,
     mode: PurgeMode,
 ) -> StoreResult<PurgeSessionSummary> {
+    purge_session_with_owner(
+        conn,
+        workspace_id,
+        project_id,
+        session_id,
+        author_id,
+        compaction,
+        mode,
+        None,
+    )
+}
+
+// Ownership is checked inside the deletion transaction, including previews.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn purge_session_with_owner(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    author_id: Option<ai_memory_core::UserId>,
+    compaction: Compaction,
+    mode: PurgeMode,
+    owner: Option<&ai_memory_core::IdentityKey>,
+) -> StoreResult<PurgeSessionSummary> {
     let wid = workspace_id.as_bytes();
     let pid = project_id.as_bytes();
     let sid = session_id.as_bytes();
@@ -5844,6 +6732,27 @@ pub fn purge_session(
         return Err(StoreError::NotFound(format!(
             "session {session_id} not found in this workspace/project"
         )));
+    }
+
+    if let Some(owner) = owner {
+        let user = author_id.ok_or(StoreError::Forbidden("operator required"))?;
+        let authz = crate::project_authz::resolve_project_authz_strict(
+            &tx,
+            workspace_id,
+            project_id,
+            &crate::ProjectPrincipal::user(user),
+            true,
+        )?;
+        crate::authorize_project(&authz, crate::ProjectAccess::Write)
+            .map_err(|_| StoreError::Forbidden("project write access required"))?;
+        let owned: bool = tx.query_row(
+            "SELECT actor_user = ?4 FROM sessions WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![&sid[..], &wid[..], &pid[..], owner.storage_key()],
+            |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+        )?;
+        if !owned {
+            return Err(StoreError::NotFound("session not found".into()));
+        }
     }
 
     // ---- collect, before anything is cut ----
@@ -5958,6 +6867,13 @@ pub fn purge_session(
         rusqlite::params![&pid[..], &sid[..]],
         |row| row.get(0),
     )?;
+
+    if owner.is_some() && (collateral_observations_deleted > 0 || collateral_handoffs_denulled > 0)
+    {
+        return Err(StoreError::InvalidState(
+            "session spans projects; an administrator must purge it".into(),
+        ));
+    }
 
     if mode == PurgeMode::Preview {
         // Same counts a confirmed purge would produce, read the same way it
@@ -7015,9 +7931,10 @@ pub struct MoveSessionSummary {
 }
 
 /// Re-stamp one session and every row that hangs off it (`observations`,
-/// `handoffs` it produced, its consolidation jobs, auto-improve runs and
-/// scheduler claim) into `(target_workspace, target_project)` in ONE
-/// transaction, plus its `sessions/<session_id>.md` page per `pages`.
+/// `handoffs` it produced, its consolidation jobs, auto-improve runs,
+/// scheduler claim, profile prompt candidates, and ingest keys) into
+/// `(target_workspace, target_project)` in ONE transaction, plus its
+/// `sessions/<session_id>.md` page per `pages`.
 ///
 /// Dependent rows are matched by session id alone, so a hybrid session whose
 /// events were scattered over other scopes (mid-session routing before the
@@ -7178,6 +8095,36 @@ pub fn move_session(
     summary.consolidation_jobs = restamp("session_consolidation_jobs", "session_id")?;
     summary.auto_improve_runs = restamp("auto_improve_runs", "session_id")?;
     summary.auto_improve_claims = restamp("auto_improve_scheduler_claims", "session_id")?;
+
+    // Profile evidence harvested from this session's prompts, keyed by
+    // `session:<id>`. Re-stamped so later convergence attributes the
+    // statements to the target project, and a subsequent purge of the
+    // source project does not delete them via CASCADE.
+    let session_ref = format!("session:{session_id}");
+    tx.execute(
+        "UPDATE OR IGNORE profile_candidates SET workspace_id = ?1, project_id = ?2 \
+         WHERE source_kind = 'prompt' AND source_ref = ?3 \
+           AND NOT (workspace_id = ?1 AND project_id = ?2)",
+        params![&to_ws[..], &to_proj[..], session_ref.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM profile_candidates \
+         WHERE source_kind = 'prompt' AND source_ref = ?1 \
+           AND NOT (workspace_id = ?2 AND project_id = ?3)",
+        params![session_ref.as_str(), &to_ws[..], &to_proj[..]],
+    )?;
+
+    // Ingest idempotency and recovery keys tied to the session.
+    tx.execute(
+        "UPDATE OR IGNORE ingest_keys SET project_id = ?1 \
+         WHERE session_id = ?2 AND project_id != ?1",
+        params![&to_proj[..], &sid[..]],
+    )?;
+    tx.execute(
+        "DELETE FROM ingest_keys \
+         WHERE session_id = ?1 AND project_id != ?2",
+        params![&sid[..], &to_proj[..]],
+    )?;
 
     // Page rows to handle: the source scope's in a real move; in a re-home,
     // any scope other than the target (the source IS the target).
@@ -8783,6 +9730,14 @@ pub(crate) mod tests {
     fn purge_session_removes_the_session_and_everything_derived_from_it() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let (sid, _page) = seed_session(&mut conn, ws, proj, "target");
+        let recovery_key = format!("recovery_{}", "a".repeat(55));
+        conn.execute(
+            "INSERT INTO ingest_keys \
+             (project_id, key, seen_at, completed_at, session_id, recovery_retained) \
+             VALUES (?1, ?2, 1, 1, ?3, 1)",
+            params![proj.as_bytes(), recovery_key, sid.as_bytes()],
+        )
+        .unwrap();
 
         let summary = purge_session(
             &mut conn,
@@ -8806,6 +9761,11 @@ pub(crate) mod tests {
             "observations=0"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0, "pages=0");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM ingest_keys"),
+            0,
+            "session-bound recovery keys cascade with the purged session"
+        );
         assert_eq!(summary.observations_deleted, 1);
         assert_eq!(summary.pages_deleted, 1);
         assert_eq!(
@@ -8873,6 +9833,88 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert_eq!(survivor, (manual.as_bytes().to_vec(), false));
+    }
+
+    #[test]
+    fn disk_reindex_checks_purge_and_surviving_version_ownership() {
+        for (label, manual_before, manual_after, incoming_owned, blocked) in [
+            ("owned leftover", false, false, true, true),
+            ("legacy leftover", false, false, false, true),
+            ("older manual is not live", true, false, false, true),
+            ("live manual replacement", false, true, false, false),
+            ("summary over live manual", false, true, true, true),
+        ] {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let sid = SessionId::new();
+            let path = format!("sessions/{sid}.md");
+            begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+            if manual_before {
+                upsert_page(&mut conn, &page(ws, proj, &path, "older manual")).unwrap();
+            }
+            let id = upsert_page(&mut conn, &session_page(ws, proj, sid, "summary")).unwrap();
+            end_session(&mut conn, &sid, Some(&id)).unwrap();
+            if manual_after {
+                upsert_page(&mut conn, &page(ws, proj, &path, "manual survivor")).unwrap();
+            }
+            purge_session(
+                &mut conn,
+                ws,
+                proj,
+                sid,
+                None,
+                Compaction::Skip,
+                PurgeMode::Commit,
+            )
+            .unwrap();
+            let disk = if incoming_owned {
+                session_page(ws, proj, sid, "rewritten summary")
+            } else {
+                page(ws, proj, &path, "rewritten manual")
+            };
+            let rows_before = count(&conn, "SELECT COUNT(*) FROM pages");
+            let result = upsert_page_from_disk(&mut conn, &disk);
+            if blocked {
+                assert!(
+                    matches!(result, Err(StoreError::SessionPurged(_))),
+                    "{label}: {result:?}"
+                );
+                assert_eq!(
+                    count(&conn, "SELECT COUNT(*) FROM pages"),
+                    rows_before,
+                    "{label}"
+                );
+            } else {
+                assert!(result.is_ok(), "{label}: {result:?}");
+            }
+            // Tombstones are scoped; the same session id in a sibling project
+            // and another session's path in this project remain writable.
+            let sibling = get_or_create_project(&mut conn, &ws, "sibling", None).unwrap();
+            assert!(
+                upsert_page_from_disk(&mut conn, &session_page(ws, sibling, sid, "sibling"))
+                    .is_ok()
+            );
+            assert!(
+                upsert_page_from_disk(
+                    &mut conn,
+                    &session_page(ws, proj, SessionId::new(), "other session")
+                )
+                .is_ok()
+            );
+            let other_ws = get_or_create_workspace(&mut conn, "other-workspace").unwrap();
+            let other_proj = get_or_create_project(&mut conn, &other_ws, "other", None).unwrap();
+            assert!(
+                upsert_page_from_disk(
+                    &mut conn,
+                    &session_page(other_ws, other_proj, sid, "other workspace")
+                )
+                .is_ok()
+            );
+            // A session_id on an ordinary content page has never made that
+            // page the reserved session summary targeted by this gate.
+            let mut note = page(ws, proj, "notes/ordinary.md", "ordinary");
+            note.frontmatter_json = serde_json::json!({"session_id": sid.to_string()});
+            assert!(upsert_page_from_disk(&mut conn, &note).is_ok());
+        }
     }
 
     #[test]
@@ -10359,6 +11401,64 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn conditional_page_batch_is_all_or_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let first_path = "notes/first.md";
+        let second_path = "notes/second.md";
+        let first_id = upsert_page(&mut conn, &page(ws, proj, first_path, "first-v1")).unwrap();
+        let second_id = upsert_page(&mut conn, &page(ws, proj, second_path, "second-v1")).unwrap();
+        let concurrent = upsert_page(&mut conn, &page(ws, proj, second_path, "second-v2")).unwrap();
+
+        let stale = vec![
+            (
+                page(ws, proj, first_path, "first-stale-batch"),
+                PagePrecondition::Latest(first_id),
+            ),
+            (
+                page(ws, proj, second_path, "second-stale-batch"),
+                PagePrecondition::Latest(second_id),
+            ),
+        ];
+        assert_eq!(
+            upsert_pages_batch_if(&mut conn, &stale).unwrap(),
+            ConditionalBatchUpsert::Mismatch {
+                index: 1,
+                current: Some(concurrent),
+            }
+        );
+        fn latest_body(conn: &Connection, ws: WorkspaceId, proj: ProjectId, path: &str) -> String {
+            conn.query_row(
+                "SELECT body FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+                 AND path = ?3 AND is_latest = 1",
+                params![ws.as_bytes(), proj.as_bytes(), path],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+        assert_eq!(latest_body(&conn, ws, proj, first_path), "first-v1");
+        assert_eq!(latest_body(&conn, ws, proj, second_path), "second-v2");
+
+        let fresh = vec![
+            (
+                page(ws, proj, first_path, "first-v2"),
+                PagePrecondition::Latest(first_id),
+            ),
+            (
+                page(ws, proj, second_path, "second-v3"),
+                PagePrecondition::Latest(concurrent),
+            ),
+        ];
+        let ConditionalBatchUpsert::Upserted(ids) =
+            upsert_pages_batch_if(&mut conn, &fresh).unwrap()
+        else {
+            panic!("current preconditions must admit the whole batch");
+        };
+        assert_eq!(ids.len(), 2);
+        assert_eq!(latest_body(&conn, ws, proj, first_path), "first-v2");
+        assert_eq!(latest_body(&conn, ws, proj, second_path), "second-v3");
+    }
+
     /// The V65 A2 marker is derived from the `compacted: true` frontmatter
     /// mirror at the single write choke point, in the same transaction as the
     /// body — a normal write leaves it NULL, so every pre-A2 path is unchanged.
@@ -10667,6 +11767,211 @@ pub(crate) mod tests {
             wal_len < 256 * 1024,
             "WAL not bounded by the between-batch checkpoint: {wal_len} bytes"
         );
+    }
+
+    /// Two bare source tables under the V87 derived indexes and triggers,
+    /// holding `rows` pages and as many observations with no derived row yet:
+    /// the shape of a store opened for the first time after that upgrade.
+    fn unindexed_cjk_fixture(rows: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pages (title TEXT, body TEXT, path_search TEXT);
+             CREATE TABLE observations (title TEXT, body TEXT);",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("../migrations/V87__cjk_search_indexes.sql"))
+            .unwrap();
+        for i in 0..rows {
+            conn.execute(
+                "INSERT INTO pages (title, body, path_search) VALUES (?1, ?2, 'notes')",
+                params![format!("page {i}"), format!("支付服务 {i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO observations (title, body) VALUES ('prompt', ?1)",
+                [format!("需要恢复索引 {i}")],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Source rows still without a derived row, as `(pages, observations)`.
+    fn missing_cjk_rows(conn: &Connection) -> (i64, i64) {
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        (
+            count(
+                "SELECT COUNT(*) FROM pages p \
+                 WHERE NOT EXISTS (SELECT 1 FROM pages_cjk_fts f WHERE f.rowid = p.rowid)",
+            ),
+            count(
+                "SELECT COUNT(*) FROM observations o \
+                 WHERE NOT EXISTS (SELECT 1 FROM observations_cjk_fts f WHERE f.rowid = o.rowid)",
+            ),
+        )
+    }
+
+    /// The cursor must pick up a missing row that follows an indexed one
+    /// inside a batch window, stop after the last one, and leave a repaired
+    /// store alone on the next run.
+    #[test]
+    fn cjk_backfill_resumes_past_indexed_rows_in_small_batches() {
+        let mut conn = unindexed_cjk_fixture(7);
+        // What an interrupted earlier run leaves behind: a prefix, a row in
+        // the middle and the last row already carry their derived rows.
+        for rowid in [1, 2, 4, 7] {
+            conn.execute(
+                "INSERT INTO pages_cjk_fts (rowid, title, body, path_search) \
+                 VALUES (?1, '', '', '')",
+                [rowid],
+            )
+            .unwrap();
+        }
+        for rowid in [3, 6] {
+            conn.execute(
+                "INSERT INTO observations_cjk_fts (rowid, title, body) VALUES (?1, '', '')",
+                [rowid],
+            )
+            .unwrap();
+        }
+        assert_eq!(missing_cjk_rows(&conn), (3, 5));
+
+        let summary = backfill_cjk_indexes_in_batches(&mut conn, 2).unwrap();
+        assert_eq!((summary.pages, summary.observations), (3, 5));
+        assert_eq!(missing_cjk_rows(&conn), (0, 0));
+        // The repaired rows carry their terms, not placeholders.
+        let searchable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages_cjk_fts WHERE pages_cjk_fts MATCH 'body:支付'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(searchable, 3);
+
+        let again = backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!(again, CjkBackfillSummary::default());
+    }
+
+    /// Doubling the rows must not quadruple the work. Each batch resumes
+    /// after the last rowid it indexed instead of probing the indexed prefix
+    /// again, which made the pass quadratic on a large upgraded store (#1652).
+    /// SQLite's progress handler counts virtual-machine steps: a measure of
+    /// the rows visited that, unlike a clock, reads the same on every machine.
+    #[test]
+    fn cjk_backfill_work_grows_linearly_with_the_row_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let steps = |rows: i64| -> usize {
+            let mut conn = unindexed_cjk_fixture(rows);
+            let visits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&visits);
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            let summary = backfill_cjk_indexes_in_batches(&mut conn, 1).unwrap();
+            assert_eq!(
+                (summary.pages, summary.observations),
+                (rows as u64, rows as u64)
+            );
+            visits.load(Ordering::Relaxed)
+        };
+
+        let small = steps(100);
+        let large = steps(200);
+        assert!(
+            large < small * 3,
+            "doubling the rows must not triple the work: {small} steps for 100, {large} for 200"
+        );
+    }
+
+    /// A checkpoint a reader holds back must not fail the operation it follows:
+    /// the `VACUUM` has already committed. It is logged with the
+    /// `(busy, log, checkpointed)` triple, left for a later checkpoint, and
+    /// converges once the reader is gone.
+    ///
+    /// The test zeroes `busy_timeout` (rusqlite defaults to 5s) so the blocked
+    /// checkpoint returns at once; the server's writer connection waits up to
+    /// its own 5s timeout for the reader first.
+    #[test]
+    fn compact_survives_a_checkpoint_blocked_by_an_open_reader() {
+        let (tmp, mut conn, ..) = fresh_db();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "busy_timeout", 0).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE junk (b BLOB);
+             INSERT INTO junk VALUES (zeroblob(500000));
+             INSERT INTO junk VALUES (zeroblob(500000));
+             DELETE FROM junk;",
+        )
+        .unwrap();
+        let wal = tmp.path().join("test.sqlite-wal");
+
+        // A read transaction pins a snapshot older than the VACUUM's frames.
+        let reader = Connection::open(tmp.path().join("test.sqlite")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM junk;")
+            .unwrap();
+
+        let mut summary = None;
+        let logs = capture_warnings(|| summary = Some(compact(&mut conn)));
+        summary
+            .unwrap()
+            .expect("a blocked checkpoint must not fail the VACUUM that preceded it");
+        // The subscriber colours field names; drop the escape sequences so
+        // the `busy=1` below reads as plain text.
+        let mut plain = String::new();
+        let mut chars = logs.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                chars.by_ref().find(|c| *c == 'm');
+            } else {
+                plain.push(c);
+            }
+        }
+        assert!(
+            plain.contains("blocked by an active reader")
+                && plain.contains("busy=1")
+                && plain.contains("log=")
+                && plain.contains("checkpointed="),
+            "the blocked checkpoint is logged with its triple: {plain:?}"
+        );
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "control: the reader really did hold the checkpoint back"
+        );
+
+        // Convergence, no retry loop needed: the next checkpoint finishes.
+        reader.execute_batch("COMMIT;").unwrap();
+        let triple = wal_checkpoint_truncate(&conn).unwrap();
+        assert_eq!(triple.busy, 0);
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    }
+
+    /// Control for the warning above: an unblocked checkpoint is silent, so a
+    /// log line means a reader really did hold it back.
+    #[test]
+    fn compact_truncates_the_wal_without_warning_when_no_reader_is_open() {
+        let (tmp, mut conn, ..) = fresh_db();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE junk (b BLOB);
+             INSERT INTO junk VALUES (zeroblob(500000));
+             DELETE FROM junk;",
+        )
+        .unwrap();
+
+        let mut summary = None;
+        let logs = capture_warnings(|| summary = Some(compact(&mut conn)));
+        summary.unwrap().unwrap();
+
+        assert!(!logs.contains("checkpoint"), "unexpected warning: {logs:?}");
+        let wal = tmp.path().join("test.sqlite-wal");
+        assert_eq!(std::fs::metadata(wal).map_or(0, |m| m.len()), 0);
     }
 
     #[test]
@@ -12007,6 +13312,76 @@ pub(crate) mod tests {
             end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
             LifecycleOnlyEndOutcome::Substantive
         );
+    }
+
+    /// The writer's lifecycle-only re-check and the reader's existence query
+    /// (the router's early SessionEnd decision) must classify every
+    /// observation kind alike: a disagreement would have the writer revert the
+    /// router's verdict on a session the router just rendered a page for.
+    #[test]
+    fn the_lifecycle_only_verdict_follows_the_reader_predicate() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let reader = crate::reader::ReaderPool::new(&tmp.path().join("test.sqlite"), 1).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for kind in [
+            ObservationKind::SessionStart,
+            ObservationKind::UserPrompt,
+            ObservationKind::PreToolUse,
+            ObservationKind::PostToolUse,
+            ObservationKind::PreCompact,
+            ObservationKind::PostCompaction,
+            ObservationKind::Notification,
+            ObservationKind::Stop,
+            ObservationKind::SessionEnd,
+            ObservationKind::Other,
+        ] {
+            let session = SessionId::new();
+            begin_session(
+                &mut conn,
+                &NewSession {
+                    occurred_at: None,
+                    id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                },
+            )
+            .unwrap();
+            insert_observation(
+                &mut conn,
+                &NewObservation {
+                    occurred_at: None,
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind,
+                    extension: None,
+                    source_event: None,
+                    title: "t".into(),
+                    body: "b".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+            // Asked before the writer ends the session: the question is the
+            // same one, put to the rows as they are.
+            let reader_says_substantive = runtime
+                .block_on(reader.session_has_substantive_observation(ws, proj, session))
+                .unwrap();
+            let writer_says_substantive = matches!(
+                end_lifecycle_only_session(&mut conn, &session).unwrap(),
+                LifecycleOnlyEndOutcome::Substantive
+            );
+            assert_eq!(
+                reader_says_substantive, writer_says_substantive,
+                "{kind:?}: reader and writer classify the same single-row session differently"
+            );
+        }
     }
 
     #[test]
@@ -13619,6 +14994,20 @@ pub(crate) mod tests {
             params![ws.as_bytes(), proj.as_bytes(), sid.as_bytes()],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'topic', 'workflow', 'statement', 'quote', 1, 'general')",
+            params![ws.as_bytes(), proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, ?2, 1, 1, ?3)",
+            params![proj.as_bytes(), format!("key-{sid}"), sid.as_bytes()],
+        )
+        .unwrap();
         let path = format!("sessions/{sid}.md");
         upsert_page(conn, &page(ws, proj, &path, "first version")).unwrap();
         upsert_page(conn, &page(ws, proj, &path, "second version")).unwrap();
@@ -13718,6 +15107,65 @@ pub(crate) mod tests {
                 session_rows_in_scope(conn, table, col, sid, gone.0, gone.1),
                 0,
                 "{table} rows must not sit in the other scope"
+            );
+        }
+        let candidate_here: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    here.0.as_bytes(),
+                    here.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_here, 1,
+            "profile_candidates must sit in the expected scope"
+        );
+        let candidate_gone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    gone.0.as_bytes(),
+                    gone.1.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_gone, 0,
+            "profile_candidates must not sit in the other scope"
+        );
+
+        let ingest_here: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND session_id = ?2",
+                params![here.1.as_bytes(), sid.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ingest_here, 1,
+            "ingest_keys must sit in the expected project"
+        );
+        if here.1 != gone.1 {
+            let ingest_gone: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND session_id = ?2",
+                    params![gone.1.as_bytes(), sid.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                ingest_gone, 0,
+                "ingest_keys must not sit in the other project"
             );
         }
     }
@@ -14218,6 +15666,308 @@ pub(crate) mod tests {
         assert_eq!(summary.page_versions_moved, 0);
         assert_eq!(session_page_versions(&conn, sid, ws, stray), (1, 0));
         assert_eq!(session_page_versions(&conn, sid, ws, target), (2, 1));
+    }
+
+    #[test]
+    fn move_session_restamps_profile_candidates_and_ingest_keys() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+
+        let (moved_sid, _) = seed_session(&mut conn, src_ws, src_proj, "moved");
+        let (sibling_sid, _) = seed_session(&mut conn, src_ws, src_proj, "sibling");
+
+        let insert_candidate =
+            |ws: WorkspaceId, proj: ProjectId, kind: &str, source_ref: &str, topic: &str| {
+                conn.execute(
+                    "INSERT INTO profile_candidates \
+                     (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+                      statement, quote, observed_at, generality) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'workflow', 'statement', 'quote', 1, 'general')",
+                    params![ws.as_bytes(), proj.as_bytes(), kind, source_ref, topic],
+                )
+                .unwrap();
+            };
+
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{moved_sid}"),
+            "topic1",
+        );
+        insert_candidate(
+            src_ws,
+            src_proj,
+            "prompt",
+            &format!("session:{sibling_sid}"),
+            "topic1",
+        );
+        insert_candidate(src_ws, src_proj, "page", "page:_rules/keep.md", "topic1");
+
+        let insert_ingest_key = |proj: ProjectId, key: &str, sid: Option<SessionId>| {
+            conn.execute(
+                "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+                 VALUES (?1, ?2, 1, 1, ?3)",
+                params![
+                    proj.as_bytes(),
+                    key,
+                    sid.as_ref().map(|s| &s.as_bytes()[..])
+                ],
+            )
+            .unwrap();
+        };
+
+        insert_ingest_key(src_proj, "key-moved", Some(moved_sid));
+        insert_ingest_key(src_proj, "key-sibling", Some(sibling_sid));
+        insert_ingest_key(src_proj, "key-unattached", None);
+
+        // Move `moved_sid` from src to dst.
+        let summary = move_session(
+            &mut conn,
+            moved_sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.session_moved);
+
+        // Verify `moved_sid` candidate moved to (dst_ws, dst_proj).
+        let moved_candidate_in_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_candidate_in_dst, 1);
+
+        let moved_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{moved_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_candidate_in_src, 0);
+
+        // Verify sibling and page candidates stayed in (src_ws, src_proj).
+        let sibling_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'prompt' AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sibling_sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling_candidate_in_src, 1);
+
+        let page_candidate_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND source_kind = 'page' AND source_ref = 'page:_rules/keep.md'",
+                params![src_ws.as_bytes(), src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_candidate_in_src, 1);
+
+        // Verify ingest keys: moved key sits in dst_proj, sibling and unattached in src_proj.
+        let moved_key_in_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-moved'",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_key_in_dst, 1);
+
+        let moved_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-moved'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_key_in_src, 0);
+
+        let sibling_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-sibling'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling_key_in_src, 1);
+
+        let unattached_key_in_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'key-unattached'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unattached_key_in_src, 1);
+
+        // Now purge src_proj: because moved_sid's candidate and ingest key
+        // were re-stamped to dst_proj, they MUST survive the purge cascade.
+        purge_project(
+            &mut conn,
+            &src_ws,
+            &src_proj,
+            "default/source",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let dst_candidates_after_purge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2",
+                params![dst_ws.as_bytes(), dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dst_candidates_after_purge, 1,
+            "moved session's profile candidate must survive source project purge"
+        );
+
+        let dst_ingest_keys_after_purge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dst_ingest_keys_after_purge, 1,
+            "moved session's ingest key must survive source project purge"
+        );
+    }
+
+    #[test]
+    fn move_session_handles_duplicate_candidate_and_ingest_key_conflicts() {
+        let (_tmp, mut conn, src_ws, src_proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let dst_proj = get_or_create_project(&mut conn, &dst_ws, "target", None).unwrap();
+
+        let (sid, _) = seed_session(&mut conn, src_ws, src_proj, "conflict-test");
+
+        // Seed duplicate candidate in both src and dst with same topic_key
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'duptopic', 'workflow', 'stmt1', 'quote1', 1, 'general')",
+            params![src_ws.as_bytes(), src_proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'prompt', ?3, 'duptopic', 'workflow', 'stmt2', 'quote2', 2, 'general')",
+            params![dst_ws.as_bytes(), dst_proj.as_bytes(), format!("session:{sid}")],
+        )
+        .unwrap();
+
+        // Seed duplicate ingest key in both src and dst
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, 'dupkey', 1, 1, ?2)",
+            params![src_proj.as_bytes(), sid.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id) \
+             VALUES (?1, 'dupkey', 2, 2, NULL)",
+            params![dst_proj.as_bytes()],
+        )
+        .unwrap();
+
+        // Move must not fail with UNIQUE constraint error
+        let summary = move_session(
+            &mut conn,
+            sid,
+            dst_ws,
+            dst_proj,
+            PagesMode::Move,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.session_moved);
+
+        // Exactly 1 candidate in dst for this session, 0 in src
+        let count_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
+                params![
+                    dst_ws.as_bytes(),
+                    dst_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_dst, 1);
+        let count_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM profile_candidates \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND source_ref = ?3",
+                params![
+                    src_ws.as_bytes(),
+                    src_proj.as_bytes(),
+                    format!("session:{sid}")
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_src, 0);
+
+        // Exactly 1 ingest key in dst with key 'dupkey', 0 in src
+        let key_count_dst: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'dupkey'",
+                params![dst_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_count_dst, 1);
+        let key_count_src: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1 AND key = 'dupkey'",
+                params![src_proj.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_count_src, 0);
     }
 
     #[test]
@@ -15645,6 +17395,58 @@ pub(crate) mod tests {
         );
     }
 
+    /// `title:` must still filter on the title column when its term has
+    /// punctuation and has to be quoted.
+    #[test]
+    fn title_filter_on_punctuated_term_searches_only_titles() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &NewPage {
+                title: "ai-memory handoff".into(),
+                ..page(ws, proj, "notes/titled.md", "unrelated body")
+            },
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                "notes/mention.md",
+                "a body that mentions ai-memory",
+            ),
+        )
+        .unwrap();
+
+        let hits = fts_match_paths(&conn, "title:ai-memory")
+            .expect("column-filtered search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["notes/titled.md".to_string()]);
+    }
+
+    #[test]
+    fn grouped_title_filter_searches_only_titles() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &NewPage {
+                title: "handoff protocol".into(),
+                ..page(ws, proj, "notes/titled.md", "unrelated body")
+            },
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "notes/mention.md", "a body about the handoff"),
+        )
+        .unwrap();
+
+        for raw in ["(title:handoff)", "(title:handoff OR title:deploy)"] {
+            let hits = fts_match_paths(&conn, raw).unwrap();
+            assert_eq!(hits, vec!["notes/titled.md".to_string()], "{raw}");
+        }
+    }
+
     /// Regression for the live-found hyphen bug: searching `ui-refresh`
     /// returned nothing in prod even though
     /// `follow-ups/ui-refresh-scroll-restoration.md` exists. The first fix
@@ -15692,6 +17494,32 @@ pub(crate) mod tests {
             "kept-hyphen phrase must not match"
         );
         assert_eq!(count("\"ui refresh\""), 1, "sub-token phrase must match");
+    }
+
+    /// A prefix search on a hyphenated term (`ai-mem*`) must still be a
+    /// prefix search once the token is quoted for its punctuation, and match
+    /// both the content token `ai-memory` and the split path index.
+    #[test]
+    fn prefix_search_on_punctuated_term_matches_content_and_path() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "notes/content.md", "we ship ai-memory today"),
+        )
+        .unwrap();
+        upsert_page(
+            &mut conn,
+            &page(ws, proj, "follow-ups/ui-refresh-scroll.md", "body text"),
+        )
+        .unwrap();
+
+        let hits = fts_match_paths(&conn, "ai-mem*")
+            .expect("prefix search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["notes/content.md".to_string()]);
+
+        let hits = fts_match_paths(&conn, "ui-ref*")
+            .expect("prefix search must not raise an FTS5 syntax error");
+        assert_eq!(hits, vec!["follow-ups/ui-refresh-scroll.md".to_string()]);
     }
 
     /// Issue #103 legacy heal: the two broad sentinels ($HOME and `/`) are

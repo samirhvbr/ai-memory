@@ -26,10 +26,13 @@ pub(crate) fn is_scope_ambiguous(error: &anyhow::Error) -> bool {
         })
 }
 
+pub(crate) mod agent_plugins;
+pub(crate) mod agentmemory_residue;
 pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;
 pub mod auth;
+pub mod auth_enable;
 pub mod auto_improve;
 pub mod auto_improve_report;
 pub mod backfill;
@@ -37,6 +40,7 @@ pub mod backup;
 pub mod backup_agents;
 pub mod bootstrap;
 pub mod checkpoints;
+pub mod codex_hook_trust;
 pub mod commit;
 pub mod compact;
 pub mod completions;
@@ -72,17 +76,22 @@ pub mod openclaw_plugin;
 pub mod opencode_dialect;
 pub mod path_util;
 pub mod pending_writes;
+pub(crate) mod plugin_origin;
 pub mod profile;
 pub mod project;
+pub mod project_init;
 pub mod project_registry;
 pub mod purge_preview;
 pub mod purge_project;
 pub mod purge_session;
 pub mod read_page;
+pub mod recent;
 pub mod reclaim_ledger_versions;
+pub mod recovery;
 pub mod reindex;
 pub mod rename_project;
 pub mod rename_workstream;
+pub mod render_plugins;
 pub mod render_shared;
 pub mod reorg;
 pub mod repair_backfill_timestamps;
@@ -96,13 +105,17 @@ pub mod run_autowire;
 pub mod search;
 pub mod serve;
 pub mod server;
+pub mod service_host;
+pub mod setup;
 pub mod setup_agent;
+pub(crate) mod setup_web;
 pub mod show;
 pub mod status;
 pub mod transcript_capture;
 pub mod uninstall;
 pub mod upgrade;
 pub mod user;
+pub mod user_service;
 pub mod workstream_search;
 pub mod workstreams;
 pub mod write_page;
@@ -152,6 +165,29 @@ pub(crate) fn humanize_age_secs(seconds: i64) -> String {
         v => (v / 2_592_000, "month"),
     };
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+}
+
+/// Refuse an explicitly empty scope or target flag on a mutating command.
+///
+/// [`resolve_scope`] treats an empty string as absent, so a harness that
+/// fills an unset variable with `""` still resolves the scope it would have
+/// resolved without the flag. That is the right reading for a read, and the
+/// wrong one for a mutation: `--project "" --confirm` would aim a purge at
+/// whatever the current directory resolves to, and an empty message scope
+/// would claim or cancel mail there. These commands ask for the flag to be
+/// omitted instead.
+///
+/// # Errors
+/// Returns an error naming `flag` when it was passed as an empty or
+/// whitespace-only value.
+pub(crate) fn refuse_empty_explicit(value: Option<&str>, flag: &str) -> Result<()> {
+    if value.is_some_and(|v| v.trim().is_empty()) {
+        bail!(
+            "{flag} was passed empty; provide a non-empty value, or omit an optional scope \
+             flag to use the project this directory resolves to"
+        );
+    }
+    Ok(())
 }
 
 /// `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 entirely.
@@ -271,6 +307,15 @@ pub(crate) fn resolve_scope_for_path(
     config: &Config,
     cwd: &std::path::Path,
 ) -> Result<(String, String)> {
+    resolve_scope_for_path_with_explicit(config, cwd, None, None)
+}
+
+pub(crate) fn resolve_scope_for_path_with_explicit(
+    config: &Config,
+    cwd: &std::path::Path,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String)> {
     if !cwd.exists() {
         return Err(anyhow!(
             "project candidate does not exist: {}",
@@ -280,39 +325,44 @@ pub(crate) fn resolve_scope_for_path(
     let cwd = crate::marker::absolute_normalized(cwd);
     let identity = cwd.to_string_lossy().into_owned();
     let marker = crate::marker::read_scope(&identity, &config.runtime_env)?;
-    let workspace = marker
-        .as_ref()
-        .and_then(|scope| scope.workspace.clone())
+    let workspace = explicit_ws
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| marker.as_ref().and_then(|scope| scope.workspace.clone()))
         .unwrap_or_else(|| crate::config::DEFAULT_WORKSPACE.to_string());
-    let project = match marker.as_ref() {
-        Some(scope) => scope
-            .project
-            .clone()
-            .or_else(|| scope.canonical_remote_project())
-            .or_else(|| {
-                if scope.is_repo_root() {
-                    crate::marker::repo_root_project(&identity)
-                } else {
+    let project = if let Some(project) = explicit_proj.filter(|value| !value.is_empty()) {
+        project.to_owned()
+    } else {
+        match marker.as_ref() {
+            Some(scope) => scope
+                .project
+                .clone()
+                .or_else(|| scope.canonical_remote_project())
+                .or_else(|| {
+                    if scope.is_repo_root() {
+                        crate::marker::repo_root_project(&identity)
+                    } else {
+                        ai_memory_consolidate::derive_project_name(
+                            &cwd,
+                            ai_memory_consolidate::ProjectNameStrategy::Basename,
+                        )
+                        .map(|(name, _)| name)
+                    }
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+            None => crate::marker::discover_remote_identity(&identity)
+                .and_then(|repository| {
+                    ai_memory_core::repository_identity::path_style_name(&repository)
+                })
+                .or_else(|| {
                     ai_memory_consolidate::derive_project_name(
                         &cwd,
                         ai_memory_consolidate::ProjectNameStrategy::Basename,
                     )
                     .map(|(name, _)| name)
-                }
-            })
-            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
-        None => crate::marker::discover_remote_identity(&identity)
-            .and_then(|repository| {
-                ai_memory_core::repository_identity::path_style_name(&repository)
-            })
-            .or_else(|| {
-                ai_memory_consolidate::derive_project_name(
-                    &cwd,
-                    ai_memory_consolidate::ProjectNameStrategy::Basename,
-                )
-                .map(|(name, _)| name)
-            })
-            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+        }
     };
     Ok((workspace, project))
 }

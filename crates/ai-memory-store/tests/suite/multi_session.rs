@@ -17,13 +17,13 @@
 //! core capability rather than a detail.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, HandoffAcceptance, HandoffState, IdentityKey, NewHandoff, NewPage,
-    NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
-    owner_stamp,
+    ActorContext, AgentKind, FeedbackKind, HandoffAcceptance, HandoffState, IdentityKey,
+    NewHandoff, NewPage, NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier,
+    UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun, Store, StoreError,
-    WorkstreamSelection,
+    ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    PagePrecondition, PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -69,6 +69,199 @@ async fn open_session(
     id
 }
 
+/// A SessionEnd digest takes a raw session id internally, but the reader must
+/// still require the admitted scope. Otherwise a future caller could render a
+/// foreign project's prompts merely by learning its id.
+#[tokio::test]
+async fn session_end_readers_refuse_foreign_session_ids() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .unwrap();
+    let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: session,
+                workspace_id: ws,
+                project_id: home,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "private prompt".into(),
+                body: "foreign scopes must not read this".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .session_has_substantive_observation(ws, home, session)
+            .await
+            .unwrap(),
+        "the owning scope is the legitimate control"
+    );
+    let total = store
+        .reader
+        .read_session_observations(ws, home, session, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+
+    for (attempt_ws, attempt_project) in [(ws, sibling), (other_ws, home)] {
+        assert!(
+            !store
+                .reader
+                .session_has_substantive_observation(attempt_ws, attempt_project, session)
+                .await
+                .unwrap(),
+            "a foreign scope must not learn the session's substantive state"
+        );
+        let error = store
+            .reader
+            .read_session_observations(attempt_ws, attempt_project, session, |snapshot| {
+                Ok(snapshot.kind_summary()?.total)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::SessionCollision));
+    }
+
+    let missing = SessionId::new();
+    let error = store
+        .reader
+        .read_session_observations(ws, home, missing, |snapshot| {
+            Ok(snapshot.kind_summary()?.total)
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::SessionCollision),
+        "missing and foreign ids deliberately expose the same refusal"
+    );
+}
+
+/// The point-fetch rowid API is scoped to the snapshot's session: a
+/// `rowid` belonging to another session is refused through a legitimate
+/// snapshot, while the session's own rowid is returned (the legitimate
+/// control). A constructor-only test cannot see the removal of the
+/// `session_id = ?1` predicate alone — this one hands a foreign rowid to a
+/// legitimate session and asserts the refusal.
+#[tokio::test]
+async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    for (session, tag) in [(session_a, "a"), (session_b, "b")] {
+        for i in 0..12u32 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id: session,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::PostToolUse,
+                        extension: None,
+                        source_event: None,
+                        title: "routine".into(),
+                        body: format!("{tag} row {i}"),
+                        importance: 1,
+                    },
+                    &sanitizer,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    // Each session's first rowid: session B's rows landed after session
+    // A's, so the rowids are distinct.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let first_rowid = |session: SessionId| {
+        conn.query_row(
+            "SELECT rowid FROM observations WHERE session_id = ?1 ORDER BY rowid LIMIT 1",
+            rusqlite::params![session.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let rowid_a = first_rowid(session_a);
+    let rowid_b = first_rowid(session_b);
+    assert_ne!(rowid_a, rowid_b, "the attack needs distinct rowids");
+
+    // Legitimate control: a session reads its own rowid through its own
+    // legitimate snapshot.
+    let own = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        own.as_ref().map(|observation| observation.body.as_str()),
+        Some("a row 0"),
+        "the session's own rowid must be readable"
+    );
+
+    // The attack: session A's legitimate snapshot handed session B's rowid.
+    let foreign = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_a, move |snapshot| {
+            snapshot.row_by_rowid(rowid_b)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign.is_none(),
+        "a foreign session's rowid must be refused by the session-scoped fetch"
+    );
+
+    // And the mirror: session B's snapshot handed session A's rowid.
+    let foreign_mirror = store
+        .reader
+        .read_session_observations_in_scope(ws, proj, session_b, move |snapshot| {
+            snapshot.row_by_rowid(rowid_a)
+        })
+        .await
+        .unwrap();
+    assert!(
+        foreign_mirror.is_none(),
+        "the refusal must hold in both directions"
+    );
+}
+
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
     NewPage {
         workspace_id: ws,
@@ -85,6 +278,103 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         entities: Vec::new(),
         evidence: Vec::new(),
     }
+}
+
+/// #986 slice 2 under invariant #16: two harnesses edit one page from the
+/// same version with a precondition. Exactly one wins; the loser writes
+/// nothing, and the version both started from stays reachable as superseded.
+/// Without the in-transaction check both would supersede it and the first
+/// winner's text would be buried under the second.
+#[tokio::test]
+async fn conditional_writers_on_one_base_exactly_one_wins_and_nothing_is_destroyed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "shared", None)
+        .await
+        .unwrap();
+    let base = store
+        .writer
+        .upsert_page(page(ws, proj, "notes/plan.md", "Plan", "# Plan\n\nbase"))
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        store.writer.upsert_page_if(
+            page(
+                ws,
+                proj,
+                "notes/plan.md",
+                "Plan",
+                "# Plan\n\nfrom harness A"
+            ),
+            PagePrecondition::Latest(base),
+        ),
+        store.writer.upsert_page_if(
+            page(
+                ws,
+                proj,
+                "notes/plan.md",
+                "Plan",
+                "# Plan\n\nfrom harness B"
+            ),
+            PagePrecondition::Latest(base),
+        ),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    let winners: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ConditionalUpsert::Upserted(id) => Some(*id),
+            ConditionalUpsert::Mismatch { .. } => None,
+        })
+        .collect();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    assert!(
+        outcomes.contains(&ConditionalUpsert::Mismatch {
+            current: Some(winners[0])
+        }),
+        "the loser is told the winner's version: {outcomes:?}"
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let rows: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT body, is_latest FROM pages WHERE path = 'notes/plan.md' ORDER BY created_at",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "base plus one winner, no loser row: {rows:?}"
+    );
+    assert_eq!((rows[0].0.as_str(), rows[0].1), ("# Plan\n\nbase", 0));
+    assert_eq!(rows[1].1, 1);
+
+    // A precondition naming no page, against an existing page, writes nothing.
+    assert_eq!(
+        store
+            .writer
+            .upsert_page_if(
+                page(ws, proj, "notes/plan.md", "Plan", "# Plan\n\nfresh"),
+                PagePrecondition::Absent,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpsert::Mismatch {
+            current: Some(winners[0])
+        }
+    );
 }
 
 /// #1033 under invariant #16: two operators on two clones of one repository,
@@ -203,25 +493,29 @@ async fn two_operators_promote_two_clone_keys_to_one_uuid_without_moving_active_
         .0;
     let alice = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "alice-promotion".into(),
                 name: None,
                 email: None,
             },
-            [41; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();
     let bob = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "bob-promotion".into(),
                 name: None,
                 email: None,
             },
-            [42; ai_memory_store::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -477,6 +771,91 @@ async fn concurrent_writes_to_one_path_supersede_rather_than_destroy() {
     );
 }
 
+/// The history readers behind the web page-history view: every version at a
+/// path, the overwritten one included, and nothing from another project or
+/// workspace at the same path. A foreign version id reads as `None`, the
+/// same as an unknown one.
+#[tokio::test]
+async fn page_history_keeps_the_overwritten_version_and_stays_in_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling".to_string(), None)
+        .await
+        .unwrap();
+    let far_ws = store
+        .writer
+        .get_or_create_workspace("far".to_string())
+        .await
+        .unwrap();
+    let far = store
+        .writer
+        .get_or_create_project(far_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+    let path = "notes/shared.md";
+    let first = store
+        .writer
+        .upsert_page(page(ws, proj, path, "Shared", "alice's text"))
+        .await
+        .unwrap();
+    let second = store
+        .writer
+        .upsert_page(page(ws, proj, path, "Shared", "carol's text"))
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .upsert_page(page(ws, sibling, path, "Shared", "sibling text"))
+        .await
+        .unwrap();
+    let far_id = store
+        .writer
+        .upsert_page(page(far_ws, far, path, "Shared", "far text"))
+        .await
+        .unwrap();
+
+    let history = store
+        .reader
+        .page_versions(ws, proj, path.to_string(), 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(history.total, 2);
+    let ids: Vec<_> = history.versions.iter().map(|v| v.id).collect();
+    assert_eq!(
+        ids,
+        [second, first],
+        "newest first, the overwritten one kept"
+    );
+    assert_eq!(history.versions[0].supersedes, Some(first));
+    assert!(history.versions[0].is_latest && !history.versions[1].is_latest);
+
+    let body = |version| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .page_version_body(ws, proj, path.to_string(), version)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(body(first).await.unwrap().body.contains("alice's text"));
+    assert_eq!(body(second).await.unwrap().supersedes, Some(first));
+    assert!(body(foreign).await.is_none(), "a sibling project's version");
+    assert!(body(far_id).await.is_none(), "another workspace's version");
+    assert!(
+        store
+            .reader
+            .page_version_body(ws, proj, "notes/other.md".to_string(), first)
+            .await
+            .unwrap()
+            .is_none(),
+        "a version under a path it does not belong to"
+    );
+}
+
 /// The batched path-existence probe the consolidation link guard validates
 /// proposed cross-scope wikilinks against (#1218): it reports exactly the
 /// paths with a latest row, in any input order, and never invents one.
@@ -549,6 +928,30 @@ async fn existing_latest_paths_reports_exactly_the_live_paths() {
         .await
         .unwrap();
     assert!(found.is_empty());
+
+    // An expired page is never reported as live.
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired page");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let mut future_exp = page(ws, proj, "notes/future.md", "Future", "future page");
+    future_exp.expires_at = Some(jiff::Timestamp::from_second(4_102_444_800).unwrap());
+    store.writer.upsert_page(future_exp).await.unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/expired.md".to_string(),
+                "notes/future.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["notes/future.md"]);
 }
 
 /// The link guard's path probe is no existence oracle for a restricted
@@ -707,6 +1110,115 @@ async fn a_second_accept_cannot_steal_an_accepted_handoff() {
         accepted_session.as_deref(),
         Some(&winner.as_bytes()[..]),
         "and the winning session must not have been overwritten by the loser"
+    );
+}
+
+/// Two parallel sessions in separate Tokio worker threads concurrently race
+/// to claim the exact same open handoff baton via `tokio::join!`.
+///
+/// Invariant: Under genuine multi-threaded concurrency, the single-writer
+/// transaction guard (`WHERE state = 'open'`) must ensure that exactly one
+/// session claims the baton (`true`) and the loser receives `false`.
+/// The winning session's attribution is committed atomically and cannot be
+/// overwritten or corrupted by the losing task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_accept_race_on_single_handoff_yields_exactly_one_winner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            from_session_id: None,
+            summary: "concurrent race for the baton".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let accept = |agent: AgentKind, session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: agent,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    let session_a = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let session_b = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+
+    let (res_a, res_b) = tokio::join!(
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::Codex, session_a)),
+        store
+            .writer
+            .accept_handoff(accept(AgentKind::OpenCode, session_b)),
+    );
+    let outcome_a = res_a.unwrap();
+    let outcome_b = res_b.unwrap();
+
+    // Invariant: Exactly one must succeed, and the other must be refused.
+    assert!(
+        (outcome_a && !outcome_b) || (!outcome_a && outcome_b),
+        "exactly one session must win the claim; got outcome_a={outcome_a}, outcome_b={outcome_b}"
+    );
+
+    let (winner_agent, winner_session, loser_agent, loser_session) = if outcome_a {
+        ("codex", session_a, AgentKind::OpenCode, session_b)
+    } else {
+        ("opencode", session_b, AgentKind::Codex, session_a)
+    };
+
+    let handoff_bytes = id.as_bytes().to_vec();
+    let (state, accepted_by, accepted_session): (String, Option<String>, Option<Vec<u8>>) = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT state, accepted_by, accepted_by_session FROM handoffs WHERE id = ?1",
+                rusqlite::params![handoff_bytes],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state, "accepted",
+        "the baton state must be transitioned to accepted"
+    );
+    assert_eq!(
+        accepted_by.as_deref(),
+        Some(winner_agent),
+        "the winner agent must be recorded as accepted_by"
+    );
+    assert_eq!(
+        accepted_session.as_deref(),
+        Some(&winner_session.as_bytes()[..]),
+        "the winning session id must be recorded in accepted_by_session"
+    );
+
+    // Subsequent retry by the loser must be cleanly rejected without modifying anything.
+    let retry = store
+        .writer
+        .accept_handoff(accept(loser_agent, loser_session))
+        .await
+        .unwrap();
+    assert!(
+        !retry,
+        "subsequent retry by the losing session must return false"
     );
 }
 
@@ -2016,6 +2528,37 @@ async fn owner_finish_store_refuses_another_writer_including_finished_retry() {
     assert_eq!(retry.imported_events, 0);
     assert_eq!(retry.latest_sequence, result.latest_sequence);
     assert_eq!(finish_snapshot(&f.store).await, before);
+    for mutate in ["event-id", "content", "cursor", "exit-code"] {
+        let mut changed = finish_input(run.run_id);
+        match mutate {
+            "event-id" => changed.events[0].event_id = "losing-event".into(),
+            "content" => changed.events[0].content = "losing payload".into(),
+            "cursor" => changed.source_cursor = Some("uncommitted-cursor".into()),
+            "exit-code" => changed.exit_code = Some(9),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                f.store
+                    .writer
+                    .recover_expired_workstream_run(f.alice(), changed)
+                    .await,
+                Err(StoreError::InvalidState(_))
+            ),
+            "finished recovery must reject changed {mutate}"
+        );
+        assert_eq!(finish_snapshot(&f.store).await, before);
+    }
+    assert_eq!(
+        f.store
+            .writer
+            .recover_expired_workstream_run(f.alice(), finish_input(run.run_id))
+            .await
+            .unwrap()
+            .imported_events,
+        0,
+        "an exact owner retry remains idempotent"
+    );
     for (name, auth) in [
         (
             "root-shared",
@@ -2381,7 +2924,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
         .authorize_managed_run(run.run_id, anonymous.clone())
         .await
         .unwrap();
-    store
+    let owner_user = store
         .writer
         .create_human_user(
             NewUser {
@@ -2472,6 +3015,92 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
         0
     );
     assert_eq!(finish_snapshot(&store).await, before);
+    // Explicit recovery admits the original owner only when no newer run exists.
+    store
+        .writer
+        .grant_memory(
+            owner_user,
+            project,
+            ai_memory_store::GrantLevel::Write,
+            None,
+        )
+        .await
+        .unwrap();
+    let recoverable = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                workspace_id: ws,
+                project_id: project,
+                repo_fingerprint: "recoverable".into(),
+                worktree_fingerprint: "recoverable".into(),
+                cwd: "/repo".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::New("recoverable".into()),
+                lease_owner: "reload".into(),
+            },
+            Some("user:new-user".into()),
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .cancel_managed_run(recoverable.run_id)
+        .await
+        .unwrap();
+    let foreign_user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "foreign-recovery".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(
+            foreign_user,
+            project,
+            ai_memory_store::GrantLevel::Write,
+            None,
+        )
+        .await
+        .unwrap();
+    let foreign = finish_authority(
+        ai_memory_core::AuthLevel::User,
+        Some(foreign_user),
+        Some("foreign-recovery"),
+    );
+    assert!(matches!(
+        store
+            .writer
+            .recover_expired_workstream_run(foreign, finish_input(recoverable.run_id))
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    let owner = finish_authority(
+        ai_memory_core::AuthLevel::User,
+        Some(owner_user),
+        Some("new-user"),
+    );
+    assert_eq!(
+        store
+            .writer
+            .recover_expired_workstream_run(owner, finish_input(recoverable.run_id))
+            .await
+            .unwrap()
+            .imported_events,
+        1
+    );
+
     // Cancel and replacement both store the existing expired phase.
     for replaced in [false, true] {
         let old = store
@@ -2496,7 +3125,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
                 [old.run_id.as_bytes()],
             )
             .unwrap();
-            store
+            let replacement = store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
                     workspace_id: ws,
@@ -2512,6 +3141,11 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
                 })
                 .await
                 .unwrap();
+            conn.execute(
+                "UPDATE managed_runs SET started_at = 7 WHERE id IN (?1, ?2)",
+                rusqlite::params![old.run_id.as_bytes(), replacement.run_id.as_bytes()],
+            )
+            .unwrap();
         } else {
             store.writer.cancel_managed_run(old.run_id).await.unwrap();
         }
@@ -2523,7 +3157,29 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
                 .await,
             Err(StoreError::InvalidState(_))
         ));
-        assert_eq!(finish_snapshot(&store).await, before);
+        if replaced {
+            assert!(matches!(
+                store
+                    .writer
+                    .recover_expired_workstream_run(root.clone(), finish_input(old.run_id))
+                    .await,
+                Err(StoreError::InvalidState(_))
+            ));
+        } else {
+            assert_eq!(
+                store
+                    .writer
+                    .recover_expired_workstream_run(root.clone(), finish_input(old.run_id))
+                    .await
+                    .unwrap()
+                    .imported_events,
+                0,
+                "the unsuperseded expired run is recoverable and stable event ids remain idempotent"
+            );
+        }
+        if replaced {
+            assert_eq!(finish_snapshot(&store).await, before);
+        }
     }
     let before = finish_snapshot(&store).await;
     assert!(matches!(
@@ -2606,16 +3262,16 @@ async fn owner_finish_store_strict_resolution_refuses_pairing_missing_and_sql_fa
     conn.execute_batch("ALTER TABLE project_grants RENAME TO unavailable_grants;")
         .unwrap();
     f.refused_unchanged(run.run_id, f.alice()).await;
-    // The legacy resolution remains fail-open; it is insufficient for finish.
-    let legacy = ai_memory_store::resolve_project_authz(
+    // The common resolver also refuses when its authorization data is
+    // unreadable; a store fault must not open a restricted project.
+    let common = ai_memory_store::resolve_project_authz(
         &conn,
         f.ws,
         f.project,
         &ai_memory_store::ProjectPrincipal::user(f.alice),
         true,
-    )
-    .unwrap();
-    assert_eq!(legacy.access_mode, ai_memory_store::AccessMode::Open);
+    );
+    assert!(common.is_err());
     conn.execute_batch("ALTER TABLE unavailable_grants RENAME TO project_grants;")
         .unwrap();
     conn.execute(
@@ -3019,4 +3675,1001 @@ async fn two_harnesses_of_one_operator_share_one_private_profile() {
             .unwrap();
         assert!(read.is_ok(), "an open project stays shared");
     }
+}
+
+/// R1 observation stream, per-project isolation (row 1). The stream maps an
+/// observation to `sessions/<id>.md` by session id, so the two lookups it
+/// joins are each a place a foreign scope could leak in: an observation from
+/// another project voting for this project's page, or this project's
+/// observation voting for a same-path page in another project. Both must be
+/// filtered to the queried `(workspace_id, project_id)`.
+#[tokio::test]
+async fn observation_stream_never_crosses_a_project_or_workspace() {
+    use super::retrieval_observation_stream::{observe, search, session, session_page, stream_on};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, home) = scope(&store).await;
+    let foreign = store
+        .writer
+        .get_or_create_project(ws, "foreign-app".to_string(), None)
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("other-ws".to_string())
+        .await
+        .unwrap();
+    let twin = store
+        .writer
+        .get_or_create_project(other_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+
+    // A home session whose evidence lives only in its observation. Pages at
+    // its session path exist in the foreign project and the cross-workspace
+    // twin, but not (yet) at home.
+    let sid = session(&store, ws, home).await;
+    // The foreign and twin scopes write before and after it, so home's
+    // observation sits inside their slice of the shared log and only the
+    // scope predicates can keep it out.
+    let foreign_sid = session(&store, ws, foreign).await;
+    let twin_sid = session(&store, other_ws, twin).await;
+    observe(&store, ws, foreign, foreign_sid, "foreign chatter before").await;
+    observe(&store, other_ws, twin, twin_sid, "twin chatter before").await;
+    let evidence = observe(&store, ws, home, sid, "the lynx password rotation plan").await;
+    observe(&store, ws, foreign, foreign_sid, "foreign chatter after").await;
+    observe(&store, other_ws, twin, twin_sid, "twin chatter after").await;
+    session_page(&store, ws, foreign, sid, "foreign copy").await;
+    session_page(&store, other_ws, twin, sid, "twin copy").await;
+
+    // Home's observation must not vote for a page outside home...
+    assert!(
+        search(&store, ws, home, "lynx").await.is_empty(),
+        "a home observation lifted a foreign page into home results"
+    );
+    // ...and the foreign scopes must not be lifted by home's observation.
+    assert!(
+        search(&store, ws, foreign, "lynx").await.is_empty(),
+        "another project's observation lifted this project's page"
+    );
+    assert!(
+        search(&store, other_ws, twin, "lynx").await.is_empty(),
+        "another workspace's observation lifted this workspace's page"
+    );
+
+    // A foreign session's own observation votes for its own page there, and
+    // never surfaces at home.
+    session_page(&store, ws, foreign, foreign_sid, "foreign session").await;
+    observe(&store, ws, foreign, foreign_sid, "ibex budget numbers").await;
+    assert!(search(&store, ws, home, "ibex").await.is_empty());
+    assert_eq!(search(&store, ws, foreign, "ibex").await.len(), 1);
+
+    // Control: once home has its own session page, home's observation lifts
+    // exactly that page.
+    session_page(&store, ws, home, sid, "home copy").await;
+    let hits = search(&store, ws, home, "lynx").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0.path.as_str(), format!("sessions/{sid}.md"));
+    assert_eq!(hits[0].0.title, format!("sessions/{sid}.md"));
+    assert_eq!(hits[0].1.observation_ids, vec![evidence]);
+    let home_ids = store
+        .reader
+        .latest_page_ids_by_paths(ws, home, vec![format!("sessions/{sid}.md")])
+        .await
+        .unwrap();
+    assert_eq!(vec![hits[0].0.id], home_ids, "the vote went to home's page");
+}
+
+/// R1 observation stream, pages shared (row 5a, invariant #16). Operator B's
+/// session, page and observations in a shared project are evidence for
+/// operator A's query: neither the session owner nor `author_id` becomes a
+/// read filter on the stream.
+#[tokio::test]
+async fn another_operators_observations_lift_their_session_page_in_a_shared_project() {
+    use super::retrieval_observation_stream::{observe, search, stream_on};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.reader.set_retrieval_tuning(stream_on());
+    let (ws, proj) = scope(&store).await;
+    let operator_b = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "operator-b".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: Some("/repo".into()),
+            actor_user: Some(operator("operator-b")),
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            author_id: Some(operator_b),
+            ..page(
+                ws,
+                proj,
+                &format!("sessions/{sid}.md"),
+                "B's session",
+                "Operator B worked on the build.",
+            )
+        })
+        .await
+        .unwrap();
+    let evidence = observe(
+        &store,
+        ws,
+        proj,
+        sid,
+        "the walrus migration needs a backfill",
+    )
+    .await;
+
+    // Operator A's query carries no owner coordinate: hybrid search has none.
+    let hits = search(&store, ws, proj, "walrus backfill").await;
+    assert_eq!(hits.len(), 1, "B's session evidence must be visible to A");
+    assert_eq!(hits[0].0.path.as_str(), format!("sessions/{sid}.md"));
+    assert_eq!(hits[0].1.observation_ids, vec![evidence]);
+}
+
+/// Begin a session owned by `owner` (`None`: unattributed, as a single-user
+/// server or a legacy row stores it).
+async fn owned_session(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    owner: Option<String>,
+) -> SessionId {
+    let id = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: Some("/repo".into()),
+            actor_user: owner,
+        })
+        .await
+        .unwrap();
+    id
+}
+
+async fn explained_search_as(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    query: &str,
+    owner: &OwnerFilter,
+) -> Vec<(ai_memory_store::PageHit, ai_memory_store::SearchExplain)> {
+    store
+        .reader
+        .hybrid_search_scopes(
+            &[(ws, proj)],
+            ai_memory_store::HybridSearch {
+                query,
+                vector: None,
+                limit: 10,
+                expiry_cutoff_us: None,
+                include_superseded: false,
+                explain: true,
+                owner,
+                filter: ai_memory_store::PageFilter::default(),
+            },
+        )
+        .await
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|(hit, details)| (hit, details.unwrap()))
+        .collect()
+}
+
+/// Session pages are shared (invariant #16), so another operator's
+/// observations may still vote for one. The observation text is not: the
+/// excerpt a vote attaches, the observation ids in `explain`, and the
+/// raw-observation fallback follow the session timeline's owner rule, so
+/// operator B searching A's words learns that A's session page matches but
+/// never reads A's observation. Controls: A sees their own excerpt, and an
+/// unattributed session's excerpt reaches everyone, as does the unfiltered
+/// single-user path.
+#[tokio::test]
+async fn observation_excerpts_follow_the_session_owner_while_the_vote_stays_shared() {
+    use super::retrieval_observation_stream::{observe, session_page};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = OwnerFilter::User(operator("alice"));
+    let bob = OwnerFilter::User(operator("bob"));
+
+    let a_session = owned_session(&store, ws, proj, Some(operator("alice"))).await;
+    session_page(&store, ws, proj, a_session, "Alice worked on the build.").await;
+    let a_obs = observe(
+        &store,
+        ws,
+        proj,
+        a_session,
+        "alice private quasar credentials discussion",
+    )
+    .await;
+    let shared_session = owned_session(&store, ws, proj, None).await;
+    session_page(&store, ws, proj, shared_session, "A legacy session.").await;
+    let shared_obs = observe(&store, ws, proj, shared_session, "the zebra migration plan").await;
+
+    let a_path = format!("sessions/{a_session}.md");
+
+    // B: the vote still lifts A's shared session page, but nothing of A's
+    // observation comes with it.
+    let hits = explained_search_as(&store, ws, proj, "quasar", &bob).await;
+    let (hit, details) = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == a_path)
+        .expect("the shared session page still ranks for B");
+    assert_eq!(details.observation_rank, Some(1));
+    assert!(details.observation_ids.is_empty(), "{details:?}");
+    assert!(!hit.snippet.contains("quasar"), "{}", hit.snippet);
+    assert!(!hit.snippet.contains("credentials"), "{}", hit.snippet);
+    assert!(
+        hit.snippet.contains("Alice worked"),
+        "page's own snippet: {}",
+        hit.snippet
+    );
+    assert!(!hit.title.is_empty());
+    for filter in [&bob, &OwnerFilter::Unattributed] {
+        let raw = store
+            .reader
+            .search_observations_for_project_as(ws, proj, "quasar".into(), 10, filter.clone())
+            .await
+            .unwrap();
+        assert!(
+            raw.is_empty(),
+            "{filter:?} must get no raw hit from A: {raw:?}"
+        );
+    }
+
+    // Control: A reads their own excerpt and raw hit.
+    let hits = explained_search_as(&store, ws, proj, "quasar", &alice).await;
+    let (hit, details) = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == a_path)
+        .unwrap();
+    assert_eq!(details.observation_ids, vec![a_obs]);
+    assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
+    let raw = store
+        .reader
+        .search_observations_for_project_as(ws, proj, "quasar".into(), 10, alice.clone())
+        .await
+        .unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].session_id, a_session);
+
+    // Control: an unattributed session's excerpt reaches every viewer.
+    let shared_path = format!("sessions/{shared_session}.md");
+    for filter in [&alice, &bob, &OwnerFilter::Unattributed, &OwnerFilter::Any] {
+        let hits = explained_search_as(&store, ws, proj, "zebra", filter).await;
+        let (hit, details) = hits
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == shared_path)
+            .unwrap();
+        assert_eq!(details.observation_ids, vec![shared_obs], "{filter:?}");
+        assert!(hit.snippet.contains("zebra"), "{filter:?}: {}", hit.snippet);
+        let raw = store
+            .reader
+            .search_observations_for_project_as(ws, proj, "zebra".into(), 10, filter.clone())
+            .await
+            .unwrap();
+        assert_eq!(raw.len(), 1, "{filter:?}");
+    }
+
+    // Control: the unfiltered single-user path is unchanged.
+    let hits = explained_search_as(&store, ws, proj, "quasar", &OwnerFilter::Any).await;
+    let (hit, _) = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == a_path)
+        .unwrap();
+    assert!(hit.snippet.contains("quasar"), "{}", hit.snippet);
+}
+
+/// The self-service purge checks exact ownership in the writer transaction,
+/// including previews; shared legacy rows are readable but never user-deletable.
+#[tokio::test]
+async fn owned_session_purge_refuses_foreign_shared_and_wrong_scope_sessions() {
+    use ai_memory_core::IdentityKey;
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "purge-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let mut sessions = Vec::new();
+    for owner in [Some("user:purge-alice"), Some("user:purge-bob"), None] {
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: owner.map(str::to_string),
+            })
+            .await
+            .unwrap();
+        sessions.push(sid);
+    }
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        for (project, sid) in [
+            (proj, sessions[1]),
+            (proj, sessions[2]),
+            (other, sessions[0]),
+        ] {
+            let result = store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    project,
+                    sid,
+                    IdentityKey::User("purge-alice".into()),
+                    Some(user),
+                    mode,
+                )
+                .await;
+            assert!(matches!(result, Err(StoreError::NotFound(_))));
+            assert!(
+                store
+                    .reader
+                    .session_summary_scoped(ws, proj, sid, OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // Simulate a grant revoked after the HTTP preflight: the writer must refuse.
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .writer
+            .purge_owned_session(
+                ws,
+                proj,
+                sessions[0],
+                IdentityKey::User("purge-alice".into()),
+                Some(user),
+                PurgeMode::Commit
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    store
+        .writer
+        .set_access_mode(proj, ai_memory_store::AccessMode::Open)
+        .await
+        .unwrap();
+    store
+        .writer
+        .purge_owned_session(
+            ws,
+            proj,
+            sessions[0],
+            IdentityKey::User("purge-alice".into()),
+            Some(user),
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .session_summary_scoped(ws, proj, sessions[0], OwnerFilter::Any)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Admin control remains able to purge an ownerless legacy session.
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sessions[2],
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control() {
+    use ai_memory_core::{IdentityKey, NewObservation, ObservationKind, Sanitized, Sanitizer};
+    use ai_memory_store::{Compaction, PurgeMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "cascade-alice".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(ws, "foreign", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: Some("user:cascade-alice".into()),
+        })
+        .await
+        .unwrap();
+    let observation = NewObservation {
+        session_id: sid,
+        workspace_id: ws,
+        project_id: foreign,
+        kind: ObservationKind::UserPrompt,
+        extension: None,
+        source_event: None,
+        title: "foreign record".into(),
+        body: "must survive a self-service purge".into(),
+        importance: 5,
+        occurred_at: None,
+    };
+    store
+        .writer
+        .insert_observation(Sanitized::new(observation, &Sanitizer::default()))
+        .await
+        .unwrap();
+    for mode in [PurgeMode::Preview, PurgeMode::Commit] {
+        assert!(matches!(
+            store
+                .writer
+                .purge_owned_session(
+                    ws,
+                    proj,
+                    sid,
+                    IdentityKey::User("cascade-alice".into()),
+                    Some(user),
+                    mode
+                )
+                .await,
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            store
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let preview = store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Preview,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.collateral_observations_deleted, 1);
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            sid,
+            Some(user),
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .observations_for_session(sid)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Open feedback findings ignore feedback attached to expired pages.
+#[tokio::test]
+async fn open_feedback_findings_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let live = page(ws, proj, "notes/live.md", "Live", "active content");
+    store.writer.upsert_page(live).await.unwrap();
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/live.md").unwrap(),
+            FeedbackKind::Stale,
+            Some("live page is stale".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/expired.md").unwrap(),
+            FeedbackKind::Wrong,
+            Some("expired page was wrong".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    let findings = store.reader.open_feedback_findings(ws, proj).await.unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].path, "notes/live.md");
+    assert_eq!(findings[0].kind, "stale");
+    assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
+}
+
+/// A link authored by a superseded page version is not a reference.
+/// `replace_links_in_tx` deletes rows only for the new version's id, so v1's
+/// row survives an edit, and `refresh_incoming_links_for_path` repoints it at
+/// the new latest id without filtering on `is_latest` — so without a join to a
+/// live source page, a link the author removed still answers for its target.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_a_superseded_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/b.md", "B", "target"))
+        .await
+        .unwrap();
+
+    // a.md v1 links b.md.
+    let mut a_v1 = page(ws, proj, "notes/a.md", "A", "see b");
+    a_v1.links = vec![ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new("notes/b.md").unwrap(),
+        relation: None,
+    }];
+    store.writer.upsert_page(a_v1).await.unwrap();
+
+    // Control: while the link is live, b.md is not an orphan.
+    let (_, _, linked_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        linked_orphans, 0,
+        "with a live inbound link neither page is an orphan"
+    );
+
+    // a.md v2 drops the link; v1's row survives, repointed at b.md's latest id.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/a.md", "A", "no link now"))
+        .await
+        .unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 2,
+        "both pages are orphans once the only link is gone from the latest version"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert!(
+        orphan_paths.contains(&"notes/b.md"),
+        "b.md lost its only inbound link and must be listed: {orphan_paths:?}"
+    );
+}
+
+/// A link authored by a TTL-expired page is not a reference either, and the
+/// workspace-wide health queries (which bind no project) agree with the
+/// project-scoped ones. A live link to a second target is the control.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_an_expired_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let link_to = |path: &str| ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: None,
+    };
+
+    for path in ["notes/expired_target.md", "notes/live_target.md"] {
+        store
+            .writer
+            .upsert_page(page(ws, proj, path, path, "target"))
+            .await
+            .unwrap();
+    }
+    let mut expired_source = page(ws, proj, "notes/expired_source.md", "E", "see target");
+    expired_source.links = vec![link_to("notes/expired_target.md")];
+    expired_source.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired_source).await.unwrap();
+    let mut live_source = page(ws, proj, "notes/live_source.md", "L", "see target");
+    live_source.links = vec![link_to("notes/live_target.md")];
+    store.writer.upsert_page(live_source).await.unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 1,
+        "only the target of the expired page's link is an orphan"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(orphan_paths, ["notes/expired_target.md"]);
+}
+
+/// Memory health counts and detail lists ignore TTL-expired pages.
+#[tokio::test]
+async fn memory_health_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let past_time = jiff::Timestamp::from_second(1).unwrap();
+
+    // 1. Live episodic page and expired episodic page.
+    let mut live_stale = page(ws, proj, "notes/live_stale.md", "LiveStale", "content");
+    live_stale.tier = Tier::Episodic;
+    store.writer.upsert_page(live_stale).await.unwrap();
+
+    let mut expired_stale = page(
+        ws,
+        proj,
+        "notes/expired_stale.md",
+        "ExpiredStale",
+        "content",
+    );
+    expired_stale.tier = Tier::Episodic;
+    expired_stale.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_stale).await.unwrap();
+
+    // 2. Duplicate titles: one live page and one expired page sharing title "SameTitle".
+    let live_dup = page(ws, proj, "notes/live_dup.md", "SameTitle", "content");
+    store.writer.upsert_page(live_dup).await.unwrap();
+
+    let mut expired_dup = page(ws, proj, "notes/expired_dup.md", "SameTitle", "content");
+    expired_dup.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_dup).await.unwrap();
+
+    // 3. Orphans: live_stale and live_dup have no links.
+    // An expired orphan page should not be counted or listed as an orphan.
+    let mut expired_orphan = page(
+        ws,
+        proj,
+        "notes/expired_orphan.md",
+        "ExpiredOrphan",
+        "content",
+    );
+    expired_orphan.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_orphan).await.unwrap();
+
+    // Set updated_at on the episodic pages to 60 days ago so they qualify as stale (< 30 days).
+    let sixty_days_ago_us = jiff::Timestamp::now().as_microsecond() - 60 * 86_400 * 1_000_000;
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = ?1 WHERE path IN ('notes/live_stale.md', 'notes/expired_stale.md')",
+        rusqlite::params![sixty_days_ago_us],
+    )
+    .unwrap();
+
+    // Workspace-level health counts and detail:
+    let (stale, dups, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale, 1,
+        "only live_stale is counted, expired_stale is ignored"
+    );
+    assert_eq!(
+        dups, 0,
+        "SameTitle has only one live page, expired_dup is ignored"
+    );
+    assert_eq!(
+        orphans, 2,
+        "only live_stale and live_dup are orphans; expired_orphan is ignored"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(detail.stale.len(), 1);
+    assert_eq!(detail.stale[0].path, "notes/live_stale.md");
+    assert!(detail.duplicates.is_empty());
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(
+        orphan_paths,
+        vec!["notes/live_dup.md", "notes/live_stale.md"]
+    );
+
+    // Project-level health counts and detail:
+    let (p_stale, p_dups, p_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(p_stale, 1);
+    assert_eq!(p_dups, 0);
+    assert_eq!(p_orphans, 2);
+
+    let p_detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    assert_eq!(p_detail.stale.len(), 1);
+    assert_eq!(p_detail.stale[0].path, "notes/live_stale.md");
+    assert!(p_detail.duplicates.is_empty());
+    assert_eq!(p_detail.orphans.len(), 2);
+}
+
+/// The briefing's `pages_latest` must agree with the page lists in the same
+/// snapshot: an expired page is hidden from every one of them, so counting it
+/// in the headline makes the brief advertise a page the agent cannot reach.
+#[tokio::test]
+async fn briefing_pages_latest_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let live_pages = store
+        .reader
+        .list_unexpired_pages("acme", "shared-app")
+        .await
+        .unwrap();
+    assert_eq!(live_pages.len(), 1, "one of the two pages is expired");
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        project.counts.pages_latest,
+        live_pages.len() as u64,
+        "project pages_latest counts only the unexpired latest page"
+    );
+    assert_eq!(
+        project.recent_pages.len(),
+        1,
+        "control: the list the count is supposed to agree with holds one page"
+    );
+    // Control: the all-versions total is deliberately TTL-blind, so a fix that
+    // merely broke both counts the same way cannot satisfy this test.
+    assert_eq!(
+        project.counts.pages_all, 2,
+        "control: pages_all stays the raw all-versions total"
+    );
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.counts.pages_latest, 1);
+    assert_eq!(workspace.counts.pages_all, 2);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.counts.pages_latest, 1);
+    assert_eq!(global.counts.pages_all, 2);
+}
+
+/// The briefing's activity windows are what an agent calibrates verbosity
+/// against, and `recent_pages` in the same snapshot already hides TTL-expired
+/// pages. A page written today with an expiry an hour ago must not make the
+/// project look active.
+#[tokio::test]
+async fn briefing_activity_windows_ignore_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert!(
+        project.recent_pages.is_empty(),
+        "control: the only page in the window is already hidden from the list"
+    );
+    assert_eq!(
+        project.activity_7d.pages_updated, 0,
+        "the expired page does not count as 7-day project activity"
+    );
+    assert_eq!(project.activity_30d.pages_updated, 0);
+
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 0);
+    assert_eq!(workspace.activity_30d.pages_updated, 0);
+
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 0);
+    assert_eq!(global.activity_30d.pages_updated, 0);
+
+    // Control: a live page written in the same window still counts, so the
+    // guard cannot pass by zeroing the counter outright.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/live.md", "Live", "content"))
+        .await
+        .unwrap();
+    let project = store
+        .reader
+        .briefing_for_project(ws, proj, 5, ai_memory_core::OwnerFilter::Any, false)
+        .await
+        .unwrap();
+    assert_eq!(project.activity_7d.pages_updated, 1);
+    assert_eq!(project.activity_30d.pages_updated, 1);
+    let workspace = store
+        .reader
+        .briefing_for_workspace(ws, 5, ai_memory_core::OwnerFilter::Any, None)
+        .await
+        .unwrap();
+    assert_eq!(workspace.activity_7d.pages_updated, 1);
+    let global = store
+        .reader
+        .briefing(5, ai_memory_core::OwnerFilter::Any)
+        .await
+        .unwrap();
+    assert_eq!(global.activity_7d.pages_updated, 1);
 }

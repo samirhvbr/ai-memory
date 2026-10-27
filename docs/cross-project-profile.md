@@ -95,9 +95,20 @@ folder: `stack`, `architecture`, `workflow`, `testing`, `tools`, `style` or
 
 | Key | Meaning |
 |---|---|
-| `summary` | The digest line (otherwise the first line of prose in the body). |
+| `summary` | The digest line (otherwise `abstract`, then the first line of prose in the body). The digest keeps at most 240 bytes of it and ends a longer line in `…`, so keep the rule itself inside that. |
 | `applies_to` | Stack tags the entry is scoped to, e.g. `[rust]` or `typescript`. |
 | `enforced_by` | Something already enforces it (e.g. `pre-push hook`); kept out of the digest. |
+
+`memory_write_page` and `ai-memory write-page` set the last two directly:
+`applies_to: ["rust"]` and `enforced_by: "pre-push hook"` in the tool call,
+or `--applies-to rust --enforced-by "pre-push hook"` on the command line
+(with `--workspace default --project _global --path profile/...` in the
+default deployment). A tag must be one the profile detects in a project
+(`rust`, `typescript`, `python`, ...); an unknown tag is refused rather than
+silently hiding the entry. Like the other metadata, a rewrite that omits them
+clears them. Both are refused on a page the digest does not read: one outside
+`profile/`, or a `profile/` path in a project other than `_global` or a
+profile project.
 
 Entries are ordinary wiki pages, markdown in git: edit them by hand, and every
 change is versioned. `memory_delete_page` with `scope: "profile"` removes one
@@ -177,7 +188,16 @@ is new since the last one.
   `<task-notification>` blocks), the instruction files Codex injects as a user
   message, and ai-memory's own routing snippet or recalled-history digest
   pasted into a prompt (only that block; your sentences around it still
-  count). Your verbatim words are kept as evidence.
+  count). A prompt written by a program driving the agent through its SDK is
+  skipped whole: one that wraps a transcript ("Here is a conversation between
+  a user and a coding agent…") or asks for a verbatim reply ("Reply with
+  exactly…") is a summarizer or a demo, and its instructions are the program's,
+  not yours. A sentence that switches off one of the agent's own capabilities
+  (*do not use tools*, *never call browser_close*, *do not use the browser*)
+  only counts when you scoped it across projects, because as a default it
+  stops every project's agent from working. Affirmative preferences such as
+  "Always use tools to verify facts" still qualify under the normal project
+  threshold. Your verbatim words are kept as evidence.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
   `procedures/`. A page contributes its `summary`, or else its first line of
   prose; metadata fields such as `**Status:** Accepted` or `**Date:**` at the

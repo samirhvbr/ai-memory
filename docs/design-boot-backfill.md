@@ -21,7 +21,11 @@ behavior and touches the trust boundary (retroactive untrusted text enters the s
    gate (only bootstrap a project with zero captured sessions) plus a per-checkout local
    sentinel (`<data_dir>/backfill-state/<hash(cwd)>`) that stops the SessionStart trigger
    re-spawning. Live hook capture (install-time forward) and backfill (before-install
-   history) do not overlap, so there is no double-capture to reconcile.
+   history) do not overlap, so there is no double-capture to reconcile. Until the
+   sentinel exists, a sibling `<hash(cwd)>.inflight` marker, created with `O_EXCL`,
+   lets only one SessionStart in a burst spawn the worker (#1287). The worker rewrites
+   it as it starts and after each imported session and removes it when it ends; a
+   marker untouched for 30 minutes belongs to a dead worker and is taken over.
 
 `backfill --dry-run` only plans the import; it neither creates nor overwrites
 the local sentinel, so it does not suppress a later automatic attempt.
@@ -225,6 +229,9 @@ Retroactive text is exactly as untrusted as live hook text, since it is old mode
   contacting the server.
 - **Emptiness + lease** prevent a backfill from overwriting or racing an established
   project's real history.
+- **Detached Windows execution stays hidden.** Git CLI fallbacks and repository
+  probes use `CREATE_NO_WINDOW`, and one backfill caches the session directory per
+  harness instead of repeating the same checkout probe for every selected session.
 - **Multi-user posture.** On a shared server, default-on retro-import of a long local
   history is more sensitive than on a single-user box. Backfill attributes to the booting
   operator, imports only into an *empty* project scope, and is opt-outable per project via

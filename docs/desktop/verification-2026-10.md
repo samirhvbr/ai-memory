@@ -74,8 +74,8 @@ recorder, `agy -p` and the documented stream-json input
   event to SessionStart (`should_process_hook_event` in
   `crates/ai-memory-cli/src/commands/hook.rs`), so it posts session-start
   and fetches the handoff on every turn. The brief and the profile digest
-  have their own once-per-session markers; whether the per-turn
-  session-start post and handoff fetch are acceptable is open.
+  have their own once-per-session markers. Resolved in #1306: only the
+  first turn of a conversation (by `conversationId`) maps to SessionStart.
 - **A `PreToolUse` reply without a `decision` denies the tool.** A recorder
   that printed `{}` made the transcript record `tool call denied by
   pre-tool hook` and `PostToolUse` never fired. ai-memory's shell and native
@@ -88,9 +88,9 @@ recorder, `agy -p` and the documented stream-json input
   `transcript.jsonl` sits next to it. The docs name only `transcript.jsonl`.
   Both start with a `USER_INPUT` step whose `content` holds the prompt in
   `<USER_REQUEST>` tags, in print mode as well.
-- Print mode writes no `~/.gemini/antigravity-cli/history.jsonl` line (the
-  #1160 replay therefore has nothing to replay for `agy -p`); the transcript
-  does have the prompt.
+- Print mode writes no `~/.gemini/antigravity-cli/history.jsonl` line; the
+  transcript does have the prompt and managed export now uses it as the
+  print-mode fallback (#1605).
 - Conversation state is kept per conversation in
   `~/.gemini/antigravity-cli/conversations/<id>.db`, with `brain/<id>/`,
   `annotations/<id>.pbtxt` and `presence/<id>.lock` alongside.

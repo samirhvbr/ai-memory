@@ -64,6 +64,18 @@ assert_eq "parse project_strategy"    "repo-root"  "$(ai_memory_parse_toml_key "
 assert_eq "absent key returns empty"  ""           "$(ai_memory_parse_toml_key "$TMP/sample.toml" missing)"
 assert_eq "absent file returns empty" ""           "$(ai_memory_parse_toml_key "$TMP/no-such-file.toml" workspace)"
 
+printf '\357\273\277workspace = "bom-workspace"\ndefault_global = true\n' >"$TMP/bom.toml"
+assert_eq "BOM does not hide first-line key" "bom-workspace" \
+    "$(ai_memory_parse_toml_key "$TMP/bom.toml" workspace)"
+assert_eq "BOM does not hide first-line flag" "true" \
+    "$(ai_memory_parse_toml_flag "$TMP/bom.toml" default_global)"
+printf '\357\273\277aliases = ["former-name"]\n' >"$TMP/bom-aliases.toml"
+bom_aliases_declared=no
+ai_memory_marker_declares_settings "$TMP/bom-aliases.toml" && bom_aliases_declared=yes
+assert_eq "BOM does not hide first-line aliases boundary" "yes" "$bom_aliases_declared"
+assert_eq "BOM does not hide first-line aliases value" '["former-name"]' \
+    "$(ai_memory_aliases_json "$TMP/bom-aliases.toml")"
+
 # --- find_marker ------------------------------------------------------
 mkdir -p "$TMP/a/b/c/d"
 printf 'workspace = "deep"\n' >"$TMP/a/.ai-memory.toml"
@@ -175,6 +187,28 @@ assert_eq "antigravity initial invocation after a 256 KB field" "yes" \
 assert_eq "extract session id after a 256 KB field" "agy" \
     "$(ai_memory_extract_session_id "$PAYLOAD_AGY_BIG")"
 
+# A subagent marker only counts as a top-level key with a non-empty string
+# value, so a tool result that quotes the key name is still a root payload.
+subagent_payload() {
+    if ai_memory_payload_is_subagent "$1"; then printf 'yes'; else printf 'no'; fi
+}
+assert_eq "top-level agent_id marks a subagent" "yes" \
+    "$(subagent_payload '{"session_id":"s","agent_id":"planner"}')"
+assert_eq "top-level parentSessionId marks a subagent" "yes" \
+    "$(subagent_payload '{"parentSessionId":"p","session_id":"s"}')"
+assert_eq "blank marker value is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","agent_id":"  "}')"
+assert_eq "marker key quoted in a tool result is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_response":"keys = [\"subagentType\", \"agent_id\"]"}')"
+assert_eq "marker key and value quoted in a tool result is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_response":"{\"agent_id\": \"x\"}"}')"
+assert_eq "marker nested in tool input is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_input":{"agent_id":"x"}}')"
+assert_eq "marker nested after a non-string field is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_input":{"timeout":30,"agent_id":"x"}}')"
+assert_eq "no marker at all is not a subagent" "no" \
+    "$(subagent_payload '{"session_id":"s","tool_name":"read_file"}')"
+
 FAKE_CURL_BIN="$TMP/fake-curl-bin"
 FAKE_CURL_LOG="$TMP/fake-curl.log"
 mkdir -p "$FAKE_CURL_BIN"
@@ -200,14 +234,68 @@ AGY_INITIAL_OUTPUT=$(printf '%s' '{"invocationNum":0,"conversationId":"agy","wor
     | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
         AI_MEMORY_HOOK_URL='http://memory.test' sh hooks/antigravity-cli/session-start.sh)
 assert_eq "antigravity initial invocation injects handoff" \
-    '{"injectSteps":[{"ephemeralMessage":"next-session-context"}]}' "$AGY_INITIAL_OUTPUT"
+    '{"injectSteps":[{"systemMessage":{"systemMessage":"next-session-context"}}]}' "$AGY_INITIAL_OUTPUT"
 assert_eq "antigravity initial invocation posts then fetches" "2" \
     "$(wc -l <"$FAKE_CURL_LOG" | tr -d ' ')"
 assert_eq "antigravity handoff fetch carries conversation id" "yes" \
     "$(grep -q '/handoff?.*session_id=agy' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
 
-PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityInitialInvocation' hooks/lib/ai-memory-hook.ps1 \
-    && grep -q '\$AntigravityPreInvocationOutput -and -not' hooks/lib/ai-memory-hook.ps1 \
+# Native SessionStart: no invocationNum, so it is a start boundary.
+rm -f "$FAKE_CURL_LOG"
+AGY_SESSION_START_OUTPUT=$(printf '%s' '{"conversationId":"agy-native","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_DATA_DIR="$TMP/agy-native" AI_MEMORY_HOOK_URL='http://memory.test' \
+        sh hooks/antigravity-cli/session-start.sh)
+assert_eq "antigravity SessionStart injects a persistent handoff" \
+    '{"injectSteps":[{"systemMessage":{"systemMessage":"next-session-context"}}]}' "$AGY_SESSION_START_OUTPUT"
+assert_eq "antigravity SessionStart posts session-start" "yes" \
+    "$(grep -q '/hook?event=session-start&agent=antigravity-cli' "$FAKE_CURL_LOG" && printf 'yes' || printf 'no')"
+
+# PreInvocation: a later invocation, or one without its counter, does nothing.
+for agy_payload in '{"invocationNum":2,"conversationId":"agy-pre","workspacePaths":["/work"]}' \
+    '{"conversationId":"agy-pre","workspacePaths":["/work"]}'; do
+    rm -f "$FAKE_CURL_LOG"
+    AGY_PRE_OUTPUT=$(printf '%s' "$agy_payload" \
+        | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+            AI_MEMORY_DATA_DIR="$TMP/agy-pre" AI_MEMORY_HOOK_URL='http://memory.test' \
+            sh hooks/antigravity-cli/pre-invocation.sh)
+    assert_eq "antigravity PreInvocation outside invocation zero is empty: $agy_payload" "{}" "$AGY_PRE_OUTPUT"
+    assert_eq "antigravity PreInvocation outside invocation zero sends nothing: $agy_payload" "0" \
+        "$([ -f "$FAKE_CURL_LOG" ] && wc -l <"$FAKE_CURL_LOG" | tr -d ' ' || printf '0')"
+done
+# Without a SessionStart, the first turn's PreInvocation starts the
+# conversation; the conversation's second turn is a no-op.
+rm -f "$FAKE_CURL_LOG"
+AGY_PRE_FIRST=$(printf '%s' '{"invocationNum":0,"conversationId":"agy-pre","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_DATA_DIR="$TMP/agy-pre" AI_MEMORY_HOOK_URL='http://memory.test' \
+        sh hooks/antigravity-cli/pre-invocation.sh)
+assert_eq "antigravity first PreInvocation without SessionStart injects the handoff" \
+    '{"injectSteps":[{"systemMessage":{"systemMessage":"next-session-context"}}]}' "$AGY_PRE_FIRST"
+rm -f "$FAKE_CURL_LOG"
+AGY_PRE_SECOND=$(printf '%s' '{"invocationNum":0,"conversationId":"agy-pre","workspacePaths":["/work"]}' \
+    | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        AI_MEMORY_DATA_DIR="$TMP/agy-pre" AI_MEMORY_HOOK_URL='http://memory.test' \
+        sh hooks/antigravity-cli/pre-invocation.sh)
+assert_eq "antigravity later turn PreInvocation is empty" "{}" "$AGY_PRE_SECOND"
+assert_eq "antigravity later turn PreInvocation sends nothing" "0" \
+    "$([ -f "$FAKE_CURL_LOG" ] && wc -l <"$FAKE_CURL_LOG" | tr -d ' ' || printf '0')"
+# SessionStart then the first turn's PreInvocation: one start, one handoff.
+rm -f "$FAKE_CURL_LOG"
+for agy_step in 'session-start {"conversationId":"agy-once","workspacePaths":["/work"]}' \
+    'pre-invocation {"invocationNum":0,"conversationId":"agy-once","workspacePaths":["/work"]}'; do
+    printf '%s' "${agy_step#* }" \
+        | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+            AI_MEMORY_DATA_DIR="$TMP/agy-once" AI_MEMORY_HOOK_URL='http://memory.test' \
+            sh "hooks/antigravity-cli/${agy_step%% *}.sh" >/dev/null
+done
+assert_eq "antigravity SessionStart plus first PreInvocation claims one handoff" "1" \
+    "$(grep -c '/handoff?' "$FAKE_CURL_LOG")"
+
+PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityStartBoundary' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q '\$AntigravityStartOutput -and -not' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q 'systemMessage = @{ systemMessage =' hooks/lib/ai-memory-hook.ps1 \
+    && grep -q -- '-AntigravityPreInvocation' hooks/antigravity-cli/pre-invocation.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell antigravity hook has invocation guard" "ok" "$PS_ANTIGRAVITY_STATIC"
 
@@ -265,7 +353,7 @@ printf 'project = "acme-api"\naliases = [" former-name ", "legacy_name", "former
 ALIAS_JSON='["former-name","legacy_name"]'
 ALIAS_QS=$(ai_memory_marker_qs "$TMP/aliases")
 assert_eq "marker aliases keep canonical project and forward remote identity" "yes" \
-    "$(case "$ALIAS_QS" in *'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$ALIAS_QS" in (*'&project=acme-api&project_src=marker'*"&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote&identity_style=path&aliases=$(ai_memory_url_encode "$ALIAS_JSON")"*) printf yes ;; (*) printf no ;; esac)"
 
 mkdir -p "$TMP/home-routes/src/api/lib" "$TMP/home-routes/src/api-sibling"
 HOME="$TMP/home-routes"
@@ -283,9 +371,9 @@ route_aliases = ["old-api"]
 EOF
 HOME_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
 assert_eq "home route uses longest component path and marker provenance" "yes" \
-    "$(case "$HOME_ROUTE" in *'&workspace=oss&project=acme-api&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_ROUTE" in (*'&workspace=oss&project=acme-api&project_src=marker'*) printf yes ;; (*) printf no ;; esac)"
 assert_eq "non-git home path route omits aliases" "no" \
-    "$(case "$HOME_ROUTE" in *'&aliases='*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_ROUTE" in (*'&aliases='*) printf yes ;; (*) printf no ;; esac)"
 PS_ROUTE_STATIC=$(grep -Fq 'if ($aliases) { $qs += "&aliases=' hooks/lib/ai-memory-hook.ps1 \
     && grep -Fq 'if (-not $stack.Count) { return $null }' hooks/lib/ai-memory-hook.ps1 \
     && printf ok || printf fail)
@@ -305,14 +393,14 @@ route_project = "wrong"
 EOF
 HOME_IDENTITY_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
 assert_eq "home exact hostful identity wins path and forwards aliases safely" "yes" \
-    "$(case "$HOME_IDENTITY_ROUTE" in *'&workspace=identity&project=identity-api&project_src=marker'*'&identity=github.com%2Facme%2Fapi&identity_src=git_remote&identity_style=path'*'&aliases=%5B%22main%22%5D'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_IDENTITY_ROUTE" in (*'&workspace=identity&project=identity-api&project_src=marker'*'&identity=github.com%2Facme%2Fapi&identity_src=git_remote&identity_style=path'*'&aliases=%5B%22main%22%5D'*) printf yes ;; (*) printf no ;; esac)"
 HOME_SIBLING=$(ai_memory_marker_qs "$HOME/src/api-sibling")
 assert_eq "home route does not string-prefix match a sibling" "yes" \
-    "$(case "$HOME_SIBLING" in *'&project=broad&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_SIBLING" in (*'&project=broad&project_src=marker'*) printf yes ;; (*) printf no ;; esac)"
 printf 'workspace = "local"\nproject = "local-project"\n' >"$HOME/src/api/.ai-memory.toml"
 LOCAL_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
 assert_eq "local settings marker wins over home route" "yes" \
-    "$(case "$LOCAL_ROUTE" in *'&workspace=local&project=local-project&project_src=marker'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$LOCAL_ROUTE" in (*'&workspace=local&project=local-project&project_src=marker'*) printf yes ;; (*) printf no ;; esac)"
 rm -f "$HOME/src/api/.ai-memory.toml"
 cat >"$HOME/.ai-memory.toml" <<EOF
 workspace = "wrong"
@@ -333,13 +421,13 @@ route_project = "api"
 EOF
 HOME_FLAG_ROUTE=$(ai_memory_marker_qs "$HOME/src/api")
 assert_eq "home route replaces scope and keeps root privacy settings" "yes" \
-    "$(case "$HOME_FLAG_ROUTE" in *'&workspace=right&project=api&project_src=marker'*'&drop_subagent=true&default_global=true&profile_contribute=1&profile_consume=0'*) printf yes ;; *) printf no ;; esac)"
+    "$(case "$HOME_FLAG_ROUTE" in (*'&workspace=right&project=api&project_src=marker'*'&drop_subagent=true&default_global=true&profile_contribute=1&profile_consume=0'*) printf yes ;; (*) printf no ;; esac)"
 printf 'workspace = "wrong"\nproject = "wrong"\n[routes.path."relative"]\nroute_workspace = "oss"\nroute_project = "api"\n' >"$HOME/.ai-memory.toml"
 assert_eq "malformed home routes fail closed instead of root fallback" "&ai_memory_invalid_home_routes=1" \
     "$(ai_memory_marker_qs "$HOME/src/api")"
 printf 'workspace = wrong\n' >"$HOME/.ai-memory.toml"
 assert_eq "malformed root-only home marker keeps legacy parser behavior" "yes" \
-    "$(case "$(ai_memory_marker_qs "$HOME/src/api")" in *'&ai_memory_invalid_home_routes=1'*) printf no ;; *) printf yes ;; esac)"
+    "$(case "$(ai_memory_marker_qs "$HOME/src/api")" in (*'&ai_memory_invalid_home_routes=1'*) printf no ;; (*) printf yes ;; esac)"
 ai_memory_home
 ROUTE_FS=$(printf '\034')
 printf '[routes.path."C:/Work/API"]\nroute_workspace="windows"\nroute_project="drive"\n[routes.path."//Server/Share/API"]\nroute_workspace="windows"\nroute_project="unc"\n' >"$HOME/.ai-memory.toml"
@@ -567,6 +655,29 @@ assert_eq "url_encode encodes an accented macOS path" \
     "$(ai_memory_url_encode '/Users/me/Área de Trabalho')"
 
 # --- offline spool ----------------------------------------------------
+# Without an explicit data-dir, the script fallback must agree with the
+# native client's platform default. In particular, macOS setup stores state
+# under Application Support rather than a shadow ~/.local/share tree.
+MAC_HOME="$TMP/mac-home"
+mkdir -p "$MAC_HOME/Library/Application Support/ai-memory"
+: > "$MAC_HOME/Library/Application Support/ai-memory/auth-header"
+MAC_STATE=$(
+    HOME="$MAC_HOME"; export HOME
+    unset AI_MEMORY_DATA_DIR XDG_DATA_HOME
+    uname() { printf 'Darwin\n'; }
+    ai_memory_state_dir
+)
+assert_eq "state_dir uses the macOS data directory" \
+    "$MAC_HOME/Library/Application Support/ai-memory" "$MAC_STATE"
+MAC_AUTH=$(
+    HOME="$MAC_HOME"; export HOME
+    unset AI_MEMORY_DATA_DIR XDG_DATA_HOME
+    uname() { printf 'Darwin\n'; }
+    ai_memory_auth_header_file
+)
+assert_eq "auth header follows the macOS state directory" \
+    "$MAC_HOME/Library/Application Support/ai-memory/auth-header" "$MAC_AUTH"
+
 # The spool dir follows the data dir, which the harness pins inside $TMP.
 AI_MEMORY_DATA_DIR="$TMP/spool-data"
 export AI_MEMORY_DATA_DIR
@@ -786,7 +897,7 @@ assert_eq "owner: post_hook sends nothing" "0" "$(owner_requests)"
 assert_eq "owner: post_hook spools nothing and drains nothing" "$BACKLOG" "$(owner_spooled)"
 
 # 2. Delivery is untouched: the handoff GET still runs and still returns.
-HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor")
+HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork")
 assert_eq "owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
 assert_eq "owner: the GET is the only request" "1" "$(owner_requests)"
 assert_eq "owner: still no POST"               "0" "$(owner_posts)"
@@ -902,6 +1013,36 @@ for key in subagentType subagent_type agent_type agent_id parentSessionId; do
     assert_eq "grok: $key payload does not fetch the handoff" "{}" "$OUT"
     assert_eq "grok: $key payload sent zero GETs" "0" "$(grok_gets)"
 done
+
+# 3b. A marker key nested in a tool's arguments or result is data, not a
+# claim about the session: a root payload like this still fetches.
+grok_case nested-marker
+NESTED='{"session_id":"g-nested","cwd":"'"$GROK_CASE_DIR"'","tool_name":"bash","tool_input":{"timeout":30,"agent_id":"planner-a"}}'
+OUT=$(grok_run "$NESTED")
+case "$OUT" in
+    *'"additionalContext":"HANDOFF BODY"'*)
+        PASS=$((PASS + 1))
+        printf '  ok  %s\n' "grok: a marker nested in tool input still fetches" ;;
+    *)
+        FAIL=$((FAIL + 1))
+        printf '  FAIL grok: a marker nested in tool input still fetches\n    got =%s\n' "$OUT" ;;
+esac
+assert_eq "grok: nested marker payload GETs the handoff once" "1" "$(grok_gets)"
+
+# 3c. A blank top-level marker is not a child session either — parity with
+# `payload_is_subagent`, which requires a non-empty string.
+grok_case blank-marker
+BLANK='{"session_id":"g-blank","cwd":"'"$GROK_CASE_DIR"'","tool_name":"read_file","agent_id":"   "}'
+OUT=$(grok_run "$BLANK")
+case "$OUT" in
+    *'"additionalContext":"HANDOFF BODY"'*)
+        PASS=$((PASS + 1))
+        printf '  ok  %s\n' "grok: a blank marker value still fetches" ;;
+    *)
+        FAIL=$((FAIL + 1))
+        printf '  FAIL grok: a blank marker value still fetches\n    got =%s\n' "$OUT" ;;
+esac
+assert_eq "grok: blank marker payload GETs the handoff once" "1" "$(grok_gets)"
 
 unset AI_MEMORY_DATA_DIR GROK_LOG
 PATH=${PATH#"$TMP/bin:"}
@@ -1029,42 +1170,136 @@ mkdir -p "$BRIEF_REPO" "$PLAIN_REPO"
 printf '[briefing]\ninject_on_session_start = true\nmax_chars = 6000\n' >"$BRIEF_REPO/.ai-memory.toml"
 printf '[briefing]\ninject_on_session_start = false\nmax_chars = 6000\n' >"$PLAIN_REPO/.ai-memory.toml"
 
-# Runs bundle "$1" from repository "$2" with a fresh state dir and prints the
+# Runs script "$1" from repository "$2" with a fresh state dir and prints the
 # handoff GET it sent. The payload carries every cwd and session field the
 # bundles read, plus Antigravity's first-invocation marker.
-session_start_handoff_get() {
+briefing_handoff_get() {
     rm -rf "$TMP/brief-data" "$FAKE_CURL_LOG"
-    printf '{"cwd":"%s","workspacePaths":["%s"],"invocationNum":0,"session_id":"brief-s","conversationId":"brief-s"}' "$2" "$2" \
+    printf '{"cwd":"%s","workspacePaths":["%s"],"invocationNum":0,"session_id":"brief-s","conversationId":"brief-s","prompt":"continue","tool_name":"read_file","tool_input":{}}' "$2" "$2" \
         | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
             AI_MEMORY_DATA_DIR="$TMP/brief-data" AI_MEMORY_HOOK_URL='http://memory.test' \
-            sh "$(dirname "$0")/../../hooks/$1/session-start.sh" >/dev/null 2>&1
+            sh "$1" >/dev/null 2>&1
     grep '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null || true
 }
 
-BRIEF_BUNDLES=0
-for script in "$(dirname "$0")"/../../hooks/*/session-start.sh; do
-    grep -q 'ai_memory_get_handoff' "$script" || continue
-    bundle=$(basename "$(dirname "$script")")
-    BRIEF_BUNDLES=$((BRIEF_BUNDLES + 1))
-    GET=$(session_start_handoff_get "$bundle" "$BRIEF_REPO")
+BRIEF_SCRIPTS=0
+for script in "$(dirname "$0")"/../../hooks/*/*.sh; do
+    grep -q 'ai_memory_get_handoff "' "$script" || continue
+    name="$(basename "$(dirname "$script")")/$(basename "$script")"
+    BRIEF_SCRIPTS=$((BRIEF_SCRIPTS + 1))
+    GET=$(briefing_handoff_get "$script" "$BRIEF_REPO")
     case "$GET" in
         *'&briefing=true&briefing_budget=6000'*)
-            PASS=$((PASS + 1)); printf '  ok  %s\n' "$bundle: opted-in handoff GET carries the briefing keys" ;;
-        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-in handoff GET carries the briefing keys\n    got =%s\n' "$bundle" "$GET" ;;
+            PASS=$((PASS + 1)); printf '  ok  %s\n' "$name: opted-in handoff GET carries the briefing keys" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-in handoff GET carries the briefing keys\n    got =%s\n' "$name" "$GET" ;;
     esac
-    GET=$(session_start_handoff_get "$bundle" "$PLAIN_REPO")
+    GET=$(briefing_handoff_get "$script" "$PLAIN_REPO")
     case "$GET" in
         *'/handoff?'*briefing*)
-            FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out handoff GET omits the briefing keys\n    got =%s\n' "$bundle" "$GET" ;;
+            FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out handoff GET omits the briefing keys\n    got =%s\n' "$name" "$GET" ;;
         *'/handoff?'*)
-            PASS=$((PASS + 1)); printf '  ok  %s\n' "$bundle: opted-out handoff GET omits the briefing keys" ;;
-        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out session start still fetches the handoff\n    got =%s\n' "$bundle" "$GET" ;;
+            PASS=$((PASS + 1)); printf '  ok  %s\n' "$name: opted-out handoff GET omits the briefing keys" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out session start still fetches the handoff\n    got =%s\n' "$name" "$GET" ;;
     esac
 done
 # Guards the discovery itself: an empty glob or a renamed helper would
 # otherwise pass with nothing checked.
-assert_eq "session-start bundles that fetch the handoff were found" "yes" \
-    "$([ "$BRIEF_BUNDLES" -ge 9 ] && printf 'yes' || printf 'no (%s)' "$BRIEF_BUNDLES")"
+assert_eq "all handoff-fetching scripts were checked for briefing" "13" "$BRIEF_SCRIPTS"
+
+# --- a handoff is never claimed without a project directory -------------
+# `GET /handoff` claims the newest open handoff in whatever project the server
+# resolves. A payload that names no directory sent no `cwd`, so the server fell
+# back to its default or last active project and the hook consumed another
+# repository's handoff. Every script that fetches a handoff (session start,
+# Kimi's user prompt, Grok's first tool call) is discovered and run twice
+# from an unrelated directory: with no directory it must not claim; the
+# control, with a directory, claims once and names it. Devin is the one
+# bundle with a fallback (DEVIN_PROJECT_DIR, then the hook's own directory),
+# so it still claims, naming that directory.
+HOOKS_ABS=$(cd "$(dirname "$0")/../../hooks" && pwd)
+SCOPE_REPO="$TMP/scope-repo"
+SCOPE_ELSEWHERE="$TMP/scope-elsewhere"
+mkdir -p "$SCOPE_REPO" "$SCOPE_ELSEWHERE"
+SCOPE_RUN=0
+# Runs script "$1" with a payload that names directory "$2" (none when empty)
+# and prints the handoff GETs it sent. It runs in a command substitution, so
+# the caller advances SCOPE_RUN to give every run its own session and state.
+scope_handoff_gets() {
+    rm -f "$FAKE_CURL_LOG"
+    if [ -n "$2" ]; then
+        dir_fields=$(printf '"cwd":"%s","workspacePaths":["%s"],' "$2" "$2")
+    else
+        dir_fields=""
+    fi
+    printf '{%s"invocationNum":0,"session_id":"scope-%s","conversationId":"scope-%s","prompt":"continue","tool_name":"read_file","tool_input":{}}' \
+        "$dir_fields" "$SCOPE_RUN" "$SCOPE_RUN" \
+        | (cd "$SCOPE_ELSEWHERE" && unset DEVIN_PROJECT_DIR \
+            && PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+                AI_MEMORY_DATA_DIR="$TMP/scope-data-$SCOPE_RUN" AI_MEMORY_HOOK_URL='http://memory.test' \
+                sh "$1") >/dev/null 2>&1 || true
+    grep '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null || true
+}
+SCOPE_SCRIPTS=0
+for script in "$HOOKS_ABS"/*/*.sh; do
+    grep -q 'ai_memory_get_handoff "' "$script" || continue
+    name="$(basename "$(dirname "$script")")/$(basename "$script")"
+    SCOPE_SCRIPTS=$((SCOPE_SCRIPTS + 1))
+    SCOPE_RUN=$((SCOPE_RUN + 1))
+    GETS=$(scope_handoff_gets "$script" "")
+    case "$name" in
+        devin/*)
+            case "$GETS" in
+                *"cwd=$(ai_memory_url_encode "$SCOPE_ELSEWHERE")"*)
+                    PASS=$((PASS + 1)); printf '  ok  %s\n' "$name: no payload directory claims for the hook's own directory" ;;
+                *) FAIL=$((FAIL + 1)); printf '  FAIL %s: no payload directory claims for the hook'"'"'s own directory\n    got =%s\n' "$name" "$GETS" ;;
+            esac
+            ;;
+        *)
+            assert_eq "$name: no project directory claims no handoff" "" "$GETS"
+            ;;
+    esac
+    SCOPE_RUN=$((SCOPE_RUN + 1))
+    GETS=$(scope_handoff_gets "$script" "$SCOPE_REPO")
+    case "$GETS" in
+        *"cwd=$(ai_memory_url_encode "$SCOPE_REPO")"*)
+            PASS=$((PASS + 1)); printf '  ok  %s\n' "$name: a project directory claims, naming it" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s: a project directory claims, naming it\n    got =%s\n' "$name" "$GETS" ;;
+    esac
+done
+assert_eq "scripts that fetch the handoff were found" "yes" \
+    "$([ "$SCOPE_SCRIPTS" -ge 12 ] && printf 'yes' || printf 'no (%s)' "$SCOPE_SCRIPTS")"
+assert_eq "get_handoff refuses a URL without cwd" "" \
+    "$(PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+        ai_memory_get_handoff 'http://memory.test/handoff?agent=cursor&session_id=s')"
+
+# PowerShell: the same rule in Invoke-AiMemoryHook. Run it with
+# Invoke-WebRequest shadowed where a PowerShell exists; otherwise pin the guard.
+PS_SCOPE_STATIC=$(grep -Fq 'if ($FetchHandoff -and $Cwd) {' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell handoff fetch requires a directory (static)" "ok" "$PS_SCOPE_STATIC"
+PSH=""
+if command -v pwsh >/dev/null 2>&1; then
+    PSH=$(command -v pwsh)
+elif command -v powershell >/dev/null 2>&1; then
+    PSH=$(command -v powershell)
+fi
+if [ -n "$PSH" ]; then
+    PS_LIB=$(host_path "$PWD/hooks/lib/ai-memory-hook.ps1")
+    PS_REPO=$(host_path "$SCOPE_REPO")
+    ps_scope_gets() {
+        rm -f "$TMP/ps-scope.log"
+        printf '%s' "$1" | (cd "$SCOPE_ELSEWHERE" && HOME="$TMP" AI_MEMORY_DATA_DIR="$TMP/ps-scope-data-$2" \
+            AI_MEMORY_TEST_LOG="$(host_path "$TMP/ps-scope.log")" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+            ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [int] \$TimeoutSec, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'HANDOFF' } }; Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff") >/dev/null 2>&1 || true
+        grep '/handoff?' "$TMP/ps-scope.log" 2>/dev/null || true
+    }
+    assert_eq "powershell: no project directory claims no handoff" "" \
+        "$(ps_scope_gets '{"session_id":"ps-scope-1"}' 1)"
+    case "$(ps_scope_gets "{\"session_id\":\"ps-scope-2\",\"cwd\":\"$(printf '%s' "$PS_REPO" | sed 's/\\/\\\\/g')\"}" 2)" in
+        *'/handoff?'*cwd=*) PASS=$((PASS + 1)); printf '  ok  %s\n' "powershell: a project directory claims" ;;
+        *) FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "powershell: a project directory claims" ;;
+    esac
+fi
 
 # The PowerShell bundle builds every session-start handoff GET in one place.
 PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {' hooks/lib/ai-memory-hook.ps1 \
@@ -1106,7 +1341,7 @@ MARKER_LOG="$AI_MEMORY_DATA_DIR/marker.log"
 marker_round() {
     # The hooks call it under `|| true`; without that, `set -e` stops at the
     # missing auth-header file lookup inside it.
-    ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor" >/dev/null 2>&1 || true
+    ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork" >/dev/null 2>&1 || true
     printf '%s' '{"e":"marker"}' \
         | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=stop&agent=cursor" >/dev/null 2>&1
 }
@@ -1129,23 +1364,97 @@ assert_eq "client marker: no request went out without it" "0" \
     "$(grep -c UNMARKED "$MARKER_LOG")"
 unset AI_MEMORY_DATA_DIR
 
+# --- no environment proxy on any request --------------------------------
+# A sandbox that exports a proxy with an empty NO_PROXY (ai-jail) otherwise
+# sends the loopback POST and the handoff GET to that proxy, which answers
+# 4xx. `ai_memory_post_hook` treats a 4xx as a permanent rejection, so the
+# observation is dropped outright rather than spooled. The native client
+# (`hook_capture::build_client`) and the MCP bridge both build with
+# `no_proxy()`; every curl branch in the shell bundle must match them.
+curl() {
+    _tnp=PROXYABLE
+    _tdata=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --noproxy) shift; [ "$#" -gt 0 ] || break
+                [ "$1" = '*' ] && _tnp=noproxy ;;
+            -H|-X|-w|-o) shift ;;
+            --data-binary) shift; [ "$#" -gt 0 ] || break; _tdata="$1" ;;
+        esac
+        shift
+    done
+    [ "$_tdata" = "@-" ] && cat >/dev/null
+    printf '%s\n' "$_tnp" >>"$NOPROXY_LOG"
+    printf '200'
+    return 0
+}
+AI_MEMORY_DATA_DIR="$TMP/noproxy"
+export AI_MEMORY_DATA_DIR
+mkdir -p "$AI_MEMORY_DATA_DIR"
+NOPROXY_LOG="$AI_MEMORY_DATA_DIR/noproxy.log"
+: >"$NOPROXY_LOG"
+noproxy_round() {
+    ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork" >/dev/null 2>&1 || true
+    printf '%s' '{"e":"noproxy"}' \
+        | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=stop&agent=cursor" >/dev/null 2>&1
+}
+noproxy_round                                  # no auth
+(umask 077; printf 'Authorization: Bearer file-token\n' >"$AI_MEMORY_DATA_DIR/auth-header")
+noproxy_round                                  # header file
+rm -f "$AI_MEMORY_DATA_DIR/auth-header"
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"n1"}'
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain without a token
+AI_MEMORY_AUTH_TOKEN=env-token
+export AI_MEMORY_AUTH_TOKEN
+noproxy_round                                  # env token
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"n2"}'
+unset AI_MEMORY_AUTH_TOKEN
+ai_memory_drain_spool 64 >/dev/null 2>&1       # drain with the spooled token
+unset -f curl
+assert_eq "no proxy: every curl branch was exercised" "yes" \
+    "$([ "$(awk 'END { print NR + 0 }' "$NOPROXY_LOG")" -ge 8 ] && printf 'yes' || printf 'no')"
+assert_eq "no proxy: no request could reach an environment proxy" "0" \
+    "$(grep -c PROXYABLE "$NOPROXY_LOG")"
+unset AI_MEMORY_DATA_DIR
+
 # The PowerShell helper builds its request headers in one hashtable per call
 # site; each must carry the marker, and every Invoke-WebRequest must pass one.
 PS_HELPER=hooks/lib/ai-memory-hook.ps1
 PS_HEADER_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders = @\{\}' "$PS_HELPER")
 PS_MARKED_TABLES=$(grep -Ec '^[[:space:]]*\$[Hh]eaders\["X-AI-Memory-Client"\] = "hook-ps"' "$PS_HELPER")
-PS_REQUESTS=$(grep -c 'Invoke-WebRequest `' "$PS_HELPER")
-PS_REQUESTS_WITH_HEADERS=$(grep -A6 'Invoke-WebRequest `' "$PS_HELPER" | grep -Ec -- '-Headers \$[Hh]eaders')
+PS_REQUESTS=$(grep -Ec '^[^#]*Invoke-WebRequest( @NoProxy)? `$' "$PS_HELPER")
+PS_REQUESTS_WITH_HEADERS=$(grep -E -A6 '^[^#]*Invoke-WebRequest( @NoProxy)? `$' "$PS_HELPER" | grep -Ec -- '-Headers \$[Hh]eaders')
+PS_REQUESTS_NO_PROXY=$(grep -Ec '^[^#]*Invoke-WebRequest @NoProxy `$' "$PS_HELPER")
 assert_eq "powershell: header tables found" "yes" \
     "$([ "$PS_HEADER_TABLES" -ge 2 ] && printf 'yes' || printf 'no (%s)' "$PS_HEADER_TABLES")"
 assert_eq "powershell: every header table carries the client marker" "$PS_HEADER_TABLES" "$PS_MARKED_TABLES"
 assert_eq "powershell: every request passes the header table" "$PS_REQUESTS" "$PS_REQUESTS_WITH_HEADERS"
+assert_eq "powershell: every request call site found" "yes" \
+    "$([ "$PS_REQUESTS" -ge 3 ] && [ "$PS_REQUESTS" -eq "$(grep -Ec '^[^#]*Invoke-WebRequest' "$PS_HELPER")" ] && printf 'yes' || printf 'no (%s)' "$PS_REQUESTS")"
+# PowerShell 7 reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY for Invoke-WebRequest;
+# `Get-AiMemoryNoProxy` supplies -NoProxy there, like the curl branches above.
+assert_eq "powershell: every request skips environment proxies" "$PS_REQUESTS" "$PS_REQUESTS_NO_PROXY"
 
 # A spooled fixture event names this run's temp tree or targets the fake
 # `memory.test` host. Live sessions share the spool and may mention that host
 # in their own payloads, where it is JSON-escaped, so match only the URL field.
 assert_eq "no fixture event was spooled into the caller's data dir" "" \
     "$(grep -rlF -e "$TMP" -e '{"url":"http://memory.test' "$CALLER_SPOOL" 2>/dev/null | head -n 1)"
+
+# Antigravity: invocationNum restarts per turn, so the first turn of a
+# conversation records a start marker and the next turn exits before any
+# request. A closed port proves no request is attempted on the second turn.
+AGY_DATA="$TMP/agy-gate"
+AGY_TURN='{"invocationNum":0,"conversationId":"agy/conv-1","workspacePaths":["/tmp"]}'
+printf '%s' "$AGY_TURN" | AI_MEMORY_DATA_DIR="$AGY_DATA" AI_MEMORY_HOOK_URL="http://127.0.0.1:9" \
+    sh hooks/antigravity-cli/session-start.sh >/dev/null 2>&1
+assert_eq "antigravity first turn records the conversation start marker" "yes" \
+    "$([ -e "$AGY_DATA/briefed/agy-start-agy_conv-1" ] && printf yes || printf no)"
+assert_eq "antigravity later turn of the same conversation prints an empty reply" "{}" \
+    "$(printf '%s' "$AGY_TURN" | AI_MEMORY_DATA_DIR="$AGY_DATA" AI_MEMORY_HOOK_URL="http://127.0.0.1:9" \
+        sh -x hooks/antigravity-cli/session-start.sh 2>"$TMP/agy-trace")"
+assert_eq "antigravity later turn sends no request" "" \
+    "$(grep -E 'ai_memory_(post_hook|get_handoff)' "$TMP/agy-trace" | head -n 1)"
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

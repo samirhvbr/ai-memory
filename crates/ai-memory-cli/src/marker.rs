@@ -326,11 +326,17 @@ impl HomeRoutes {
 }
 
 impl PathSelector {
+    /// A drive-letter or UNC root names a filesystem that compares names
+    /// case-insensitively, so its components must fold ASCII case.
+    fn is_windows(&self) -> bool {
+        matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _))
+    }
+
     fn same_selector(&self, other: &Self) -> bool {
         if !self.root.same_root(&other.root) || self.components.len() != other.components.len() {
             return false;
         }
-        let windows = matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _));
+        let windows = self.is_windows();
         self.components
             .iter()
             .zip(&other.components)
@@ -373,7 +379,7 @@ impl PathSelector {
         if !self.root.same_root(&cwd.root) || self.components.len() > cwd.components.len() {
             return false;
         }
-        let windows = matches!(self.root, PathRoot::Drive(_) | PathRoot::Unc(_, _));
+        let windows = self.is_windows();
         self.components
             .iter()
             .zip(&cwd.components)
@@ -385,6 +391,27 @@ impl PathSelector {
                 }
             })
     }
+}
+
+/// Whether `root` contains `candidate`, comparing whole components and
+/// folding ASCII case under a Windows root — the rule [`PathSelector`]
+/// already applies to the home marker's path routes.
+///
+/// `pub(crate)`: `server_profiles::resolve` admits a marker against a
+/// profile's `roots` with the same rule, so one checkout cannot be routed by
+/// a path route yet refused by a root that covers it. `Path::starts_with`
+/// alone compares components byte-exactly, which on a case-insensitive
+/// filesystem rejects `C:\work\team-b` against a root spelled
+/// `C:\Work\team-b`. A path that is not a Windows selector keeps the
+/// byte-exact comparison rather than being folded.
+pub(crate) fn path_contains(root: &Path, candidate: &Path) -> bool {
+    if let Ok(root_selector) = parse_absolute_selector(&root.to_string_lossy())
+        && root_selector.is_windows()
+        && let Ok(candidate_selector) = parse_absolute_selector(&candidate.to_string_lossy())
+    {
+        return root_selector.contains(&candidate_selector);
+    }
+    candidate.starts_with(root)
 }
 
 fn parse_absolute_selector(raw: &str) -> Result<PathSelector, ()> {
@@ -1242,7 +1269,8 @@ fn declares_more_than_capture(text: &str) -> bool {
             .any(|key| parse_flag_in(text, key).is_some())
         || server_selection_in(text).is_some()
         || text.lines().any(|line| {
-            line.trim_start()
+            line.trim_start_matches('\u{feff}')
+                .trim_start()
                 .strip_prefix("aliases")
                 .is_some_and(|rest| rest.trim_start().starts_with('='))
         })
@@ -1399,7 +1427,8 @@ pub(crate) fn parse_toml_key(file: &Path, key: &str) -> Option<String> {
 /// several keys pays for one read.
 fn parse_key_in(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
-        let trimmed = line.trim_start();
+        // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
+        let trimmed = line.trim_start_matches('\u{feff}').trim_start();
         let Some(after_key) = trimmed.strip_prefix(key) else {
             continue;
         };
@@ -1439,7 +1468,8 @@ pub(crate) fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
 /// for one read per key instead of re-opening the file.
 fn parse_flag_in(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
-        let trimmed = line.trim_start();
+        // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
+        let trimmed = line.trim_start_matches('\u{feff}').trim_start();
         let Some(after_key) = trimmed.strip_prefix(key) else {
             continue;
         };
@@ -2515,6 +2545,20 @@ project = "infra" # this is fine
     }
 
     /// A BOM or a non-UTF-8 byte must not hide the key.
+    /// The same BOM that could hide a first-line `server` key could hide a
+    /// first-line scope key or flag: a marker saved as "UTF-8 with BOM"
+    /// routed capture to the fallback workspace.
+    #[test]
+    fn a_bom_cannot_hide_a_first_line_scope_key_or_flag() {
+        let routing = RoutingFields::from_text("\u{feff}workspace = \"acme\"\nproject = \"api\"\n");
+        assert_eq!(routing.workspace.as_deref(), Some("acme"));
+        assert_eq!(routing.project.as_deref(), Some("api"));
+        assert_eq!(
+            parse_flag_in("\u{feff}default_global = true\n", "default_global").as_deref(),
+            Some("true")
+        );
+    }
+
     #[test]
     fn encoding_noise_cannot_hide_a_server_key() {
         let tmp = TempDir::new().unwrap();
@@ -2545,5 +2589,39 @@ project = "infra" # this is fine
         let selection =
             find_server_selection(tmp.path().to_str().unwrap(), Some(tmp.path())).unwrap();
         assert_eq!(selection.name, None);
+    }
+
+    /// A profile's `roots` must admit a checkout whose drive-letter cwd
+    /// differs from the registered root only in case — the spelling a
+    /// harness reports on a case-insensitive filesystem. The selector logic
+    /// is textual, so these assertions hold on every host.
+    #[test]
+    fn path_contains_folds_case_under_a_windows_root_only() {
+        assert!(path_contains(
+            Path::new(r"C:\Work\team-b"),
+            Path::new(r"C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"\\Server\Share\Work"),
+            Path::new(r"\\server\share\work\repo")
+        ));
+        // Folding case must not also loosen the component boundary.
+        assert!(!path_contains(
+            Path::new(r"C:\Work\team-b"),
+            Path::new(r"C:\work\team-bb\repo")
+        ));
+        assert!(!path_contains(
+            Path::new(r"C:\Work\team-b"),
+            Path::new(r"D:\work\team-b\repo")
+        ));
+        // Control: a POSIX root stays case-sensitive.
+        assert!(!path_contains(
+            Path::new("/work/Team-B"),
+            Path::new("/work/team-b/repo")
+        ));
+        assert!(path_contains(
+            Path::new("/work/team-b"),
+            Path::new("/work/team-b/repo")
+        ));
     }
 }

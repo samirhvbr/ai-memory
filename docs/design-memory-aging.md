@@ -1,5 +1,11 @@
 # Design: memory aging — decay curves, tier-down, dream pass, access-weighting (2.4)
 
+**Status: implemented in 2.4.** The zero-LLM aging set and the opt-in LLM
+dream pass shipped; ranking-affecting and lossy behavior remains default-off
+as designed. Sections labelled "Current state" and the phased PR plan preserve
+the pre-implementation baseline. Current feature status and R2 results are in
+[`competitive-parity.md`](competitive-parity.md#prior-gaps-and-current-status).
+
 Design-of-record for a 2.4 feature set that improves how ai-memory handles
 **old** memory: decay/compression/consolidation and access-weighted retention.
 It is honest about what already ships, what is dormant, and what is proposed;
@@ -186,20 +192,26 @@ Everything in A works with no provider and does not require ranking changes.
   mcp-memory-service ship extractive compression with no LLM. Tier-down beats
   eviction because the durable facts survive.
 - *Mechanism:* a new sweep pass, before the decay-eviction pass, that rewrites the
-  page through `Wiki::write_page`/`apply_batch` (supersession + git preserve the
+  page through the wiki's conditional batch write (supersession + git preserve the
   original, so it is **reversible**: the full body stays in the version chain and git
-  history). Regex keep-token miner lives beside the sanitizer's patterns. Needs a
+  history). Every replacement is conditional on the selected source `PageId`, and
+  the writer validates the whole batch in the same SQLite transaction: one page
+  changed by a concurrent user leaves every replacement unwritten for the next
+  sweep. Regex keep-token miner lives beside the sanitizer's patterns. Needs a
   **`tier_state`/`compacted` marker** (frontmatter flag + a `pages` column, V65) so
   the sweep and `curator.rs` distinguish a *deliberately short* page from a *cold*
   one and never re-compact or misread it as cold.
 - *Schema delta:* V65 `pages.compacted_at` (nullable) + frontmatter mirror.
 - *Invariants:* mutation through the wiki layer only (#16 supersession keeps the
-  loser reachable); zero-LLM (#13).
+  loser reachable); one conditional writer transaction for the batch (#2 and #3);
+  zero-LLM (#13).
 - *R2 bar:* compaction must not drop recall on R2 vs. the pre-compaction corpus
   (the keep-token set is the hypothesis: facts survive, prose doesn't matter).
 - *Failure modes:* keep-token miner drops a load-bearing sentence → the original is
   one supersession-restore away; `restore-page` covers it. Re-compaction loop →
-  the `compacted_at` marker blocks it.
+  the `compacted_at` marker blocks it. Concurrent user correction → the selected
+  source id no longer matches and the full batch is retried later rather than
+  replacing the correction.
 
 **A3. Cold-cluster dedup (DBSCAN, adaptive eps).**
 - *What:* cluster near-duplicate cold pages by embedding and collapse each cluster
@@ -246,6 +258,36 @@ Everything in A works with no provider and does not require ranking changes.
   `design-hindsight-borrowings.md` §4) that step is R2-gated separately.
 - *Failure modes:* false-positive band → advisory-only output; the operator/lint
   decides.
+
+**Classification fixtures ([RFC #1685](https://github.com/akitaonrails/ai-memory/issues/1685)).**
+The existing `contradiction_lint` suite also runs
+[`contradiction_evidence.json`](../crates/ai-memory-consolidate/tests/fixtures/contradiction_evidence.json),
+a small manually labeled English, Portuguese and Chinese corpus. Its vectors
+are controlled inputs, not outputs from an embedding model. The fixtures record
+current classification, including compatible pairs inside the band and a
+conflicting pair above it; they do not estimate production precision or propose
+a new response contract.
+
+A prediction is any `contradiction` finding, including an advisory similarity
+candidate. Positives contain incompatible simultaneous values for the same
+setting and scope; compatible active pairs are negatives. Superseded, expired
+and foreign-project pairs test eligibility separately and do not enter the
+classification metrics. The declared-edge control contains conflicting
+prose and has no embeddings. Expected counts document the current behavior;
+labels should remain independent when an approved classifier change updates
+those counts.
+
+```bash
+cargo test -p ai-memory-consolidate labeled_evidence_pairs_record_current_classification -- --nocapture
+cargo test -p ai-memory-consolidate labeled_evidence_pairs_timing_receipt -- --ignored --nocapture
+```
+
+The first command reports the confusion counts, precision, recall, F1 and
+false-positive/false-negative rates and checks repeated classification parity.
+The optional second command reports lint p50/p95 over 20 runs per isolated pair after a
+warm-up, excluding fixture creation. Both run offline without an LLM. Timing has
+no pass threshold and is not a benchmark of a full store. Neither changes lint's
+public classification; that decision remains in the RFC.
 
 ### Bucket B — LLM "dream" pass (opt-in, OFF by default, R2-gated)
 
@@ -424,11 +466,12 @@ phase, and encodes the lessons from that incident.
 New migrations start at **V65** and are additive. A2's `compacted_at` is an
 `ADD COLUMN` (nullable): instant, no table rewrite, no lock on a large store.
 No shipped migration's SQL is ever edited in place: doing so trips refinery's
-divergence check, which is exactly why `migrations.rs:33-34` sets
-`set_abort_divergent(false)` (a hash mismatch on an already-applied migration is
-tolerated) while keeping `set_abort_missing(true)` (a store *ahead* of the binary
-fails closed). Any change to a shipped migration must preserve that
-divergence-tolerance handling.
+divergence check. V62 is the historical exception. Its exact v2.2.1 checksum is
+repaired to the embedded checksum before the runner starts (#1443), after which
+`set_abort_divergent(true)` keeps every unknown edit fatal. `set_abort_missing(true)`
+also keeps a store *ahead* of the binary fail-closed. Future changes must never
+edit a shipped migration in place or broaden the narrow V62 repair;
+`scripts/check-migrations-immutable.sh` enforces that rule in CI.
 
 **Any data backfill runs on the boot path, not inside the migration
 transaction**: chunked, resumable, and WAL-checkpointed, mirroring the #776
@@ -495,9 +538,9 @@ content.
 
 ### 4. Downgrade note
 
-Additive columns plus `set_abort_missing(true)` (`migrations.rs:34`) mean an older
+Additive columns plus `set_abort_missing(true)` in `migrations::run` mean an older
 binary opening a newer store **fails closed** with the actionable
-`StoreError::DataSchemaAhead` (`error.rs:36`, raised at `migrations.rs:55`). It
+`StoreError::DataSchemaAhead` raised by `classify_run_error`. It
 names the applied-vs-supported versions and refuses to open, rather than silently
 corrupting a store it doesn't understand. That guarantee must be preserved by
 every new migration.

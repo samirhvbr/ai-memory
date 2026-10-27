@@ -16,7 +16,9 @@ use ai_memory_hooks::{
     CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
     WorkstreamState, hook_router, workstream_router,
 };
-use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder};
+use ai_memory_llm::{
+    Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder, local_capacity,
+};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
@@ -313,6 +315,58 @@ fn validate_api_credential_pepper(api_credentials_exist: bool, auth: &AuthSettin
     Ok(())
 }
 
+/// Bind native API-key hashes to the pepper that produced them.
+///
+/// The Argon2id verifier travels with SQLite backups without storing the
+/// pepper. A different pepper is safe to bind while no credentials exist;
+/// once hashes exist, a mismatch means the restored database and config do
+/// not belong together and serving would silently reject every key.
+async fn validate_api_credential_pepper_binding(
+    store: &Store,
+    api_credentials_exist: bool,
+    auth: &AuthSettings,
+) -> Result<()> {
+    validate_api_credential_pepper(api_credentials_exist, auth)?;
+    let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    if let Some(verifier) = store.reader.api_credential_pepper_verifier().await? {
+        let matches = ai_memory_store::password::verify_password(pepper.to_owned(), verifier)
+            .await
+            .context("verifying the configured API credential pepper")?;
+        if matches {
+            return Ok(());
+        }
+        if api_credentials_exist {
+            anyhow::bail!(
+                "[auth].token_pepper does not match the pepper that hashed the restored API \
+                 credentials; restore the original external config or token_pepper before \
+                 serving (ai-memory backup does not archive config files outside the data dir)"
+            );
+        }
+    }
+
+    let verifier = ai_memory_store::password::hash_password(pepper.to_owned())
+        .await
+        .context("binding the configured API credential pepper")?;
+    let bound = store
+        .writer
+        .bind_api_credential_pepper_verifier(verifier)
+        .await?;
+    if !bound {
+        anyhow::bail!(
+            "API credentials were added while binding [auth].token_pepper; restart so the \
+             server can verify the final credential state"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the credentials that keep an existing multi-user installation
 /// closed. Bootstrap installs have no user rows yet and retain their historical
 /// compatibility behavior regardless of placeholder auth values.
@@ -545,6 +599,9 @@ enum HttpExposure {
     /// Unauthenticated on a non-loopback address, allowed because the
     /// operator passed `--allow-insecure-no-auth`.
     InsecureByOverride,
+    /// Human passwords and cookies are crossing a non-loopback plain-HTTP
+    /// connection because the operator accepted that transport risk.
+    InsecureHumanAuthByOverride,
     /// Unauthenticated on a non-loopback address inside a container, where
     /// the bind address is not evidence either way. See
     /// [`validate_http_exposure`].
@@ -585,16 +642,21 @@ fn validate_http_exposure(
     human_mode: bool,
     secure_cookie: bool,
     allow_insecure_no_auth: bool,
+    allow_insecure_human_auth: bool,
     containerized: bool,
 ) -> Result<HttpExposure> {
     if local_addr.ip().is_loopback() {
         return Ok(HttpExposure::Safe);
     }
     if human_mode && !secure_cookie {
+        if auth_enabled && allow_insecure_human_auth {
+            return Ok(HttpExposure::InsecureHumanAuthByOverride);
+        }
         anyhow::bail!(
             "refusing human authentication on non-loopback plain HTTP address {local_addr}: \
              passwords and session cookies require [auth].secure_cookie=true behind a trusted \
-             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback."
+             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback unless \
+             --allow-insecure-human-auth explicitly accepts plaintext transport."
         );
     }
     if auth_enabled {
@@ -629,6 +691,12 @@ fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<Str
              --allow-insecure-no-auth was supplied. Anyone who can reach this address can call \
              destructive MCP tools."
         )),
+        HttpExposure::InsecureHumanAuthByOverride => Some(format!(
+            "WARNING: ai-memory is serving HUMAN AUTHENTICATION on plain HTTP at {local_addr} \
+             because --allow-insecure-human-auth was supplied. Passwords, API credentials, \
+             session cookies, and memory data are unencrypted; a network peer can steal or \
+             modify them. Use this only on a network whose plaintext risk you explicitly accept."
+        )),
         HttpExposure::UndeterminedInContainer => Some(format!(
             "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION. Inside a \
              container the bind address cannot show whether this port reaches the network - the \
@@ -637,6 +705,22 @@ fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<Str
              MCP tools. Run `ai-memory generate-auth-token` and set AI_MEMORY_AUTH_TOKEN."
         )),
     }
+}
+
+/// A configured `[auth].bearer_token_file` that holds no token must stop the
+/// server: starting without one would serve every route unauthenticated, the
+/// opposite of what the key asks for.
+fn refuse_a_missing_token_file(auth: &AuthSettings) -> Result<()> {
+    if let Some(path) = auth.missing_token_file() {
+        anyhow::bail!(
+            "[auth].bearer_token_file names {}, which is missing or empty; refusing to serve \
+             without the bearer token it should hold. Run `ai-memory auth enable` to create a \
+             new one, or restore it from your separate secret backup (`ai-memory backup` \
+             intentionally excludes auth token files).",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Validate the trusted proxy's least-privilege credential and optional stable
@@ -766,6 +850,36 @@ async fn run_persisted_maintenance_job<F, Fut, R, RFut, N>(
 fn session_consolidation_retry_delay(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(4);
     Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
+}
+
+/// Failures that must terminate a SessionEnd queue job: re-sending the same
+/// expensive prompt cannot clear them.
+///
+/// An LLM failure defers to [`ai_memory_llm::LlmError::is_transient`], which
+/// is the same predicate the two in-process consolidation retry loops already
+/// gate on — `complete_structured_with_retry` in `ai-memory-consolidate`'s
+/// `consolidator.rs` and the bootstrap chunk loop in its `bootstrap.rs`. One
+/// definition of "worth another expensive call" then covers all three retry
+/// sites: a provider `429` or `5xx` and an `Http` timeout/connect failure
+/// never reached the model, so they keep the queue's bounded,
+/// backoff-scheduled retry up to the attempt cap, while everything else — a
+/// malformed (`Serde`) or unexpected (`UnexpectedShape`) structured response,
+/// an output-budget stop (`TruncatedResponse`), empty content
+/// (`EmptyContent`), a rejected or expired credential (`Auth`), a missing
+/// provider configuration (`NotConfigured`), a schema failure (`Schema`), a
+/// malformed-request `4xx` — reproduces on identical inputs, so the job goes
+/// terminal and the heuristic page the SessionEnd hook already wrote remains.
+///
+/// A `ConsolidatorError::Serde` is not an `LlmError`: it is this crate's own
+/// JSON failure on an unchanged input and stays terminal on its own.
+fn is_terminal_session_consolidation_error(
+    error: &ai_memory_consolidate::ConsolidatorError,
+) -> bool {
+    match error {
+        ai_memory_consolidate::ConsolidatorError::Llm(llm) => !llm.is_transient(),
+        ai_memory_consolidate::ConsolidatorError::Serde(_) => true,
+        _ => false,
+    }
 }
 
 /// Delay before the first profile pass, so it never competes with migration
@@ -994,7 +1108,11 @@ async fn run_session_consolidation_worker(
                 ),
             },
             Err(error) => {
-                let retry_at = if attempts < ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+                let retry_at = if is_terminal_session_consolidation_error(&error)
+                    || attempts >= ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS
+                {
+                    None
+                } else {
                     let delay = session_consolidation_retry_delay(attempts);
                     let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
                     Some(
@@ -1002,8 +1120,6 @@ async fn run_session_consolidation_worker(
                             .as_microsecond()
                             .saturating_add(delay_micros),
                     )
-                } else {
-                    None
                 };
                 let terminal = retry_at.is_none();
                 if let Err(store_error) = writer
@@ -1107,6 +1223,24 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let mut shutdown = ShutdownSignals::install();
 
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-management-ui requires --transport http");
+    }
+
+    #[cfg(feature = "management-ui")]
+    if args.enable_management_ui && args.enable_web && normalize_prefix(&args.web_slug) == "/manage"
+    {
+        anyhow::bail!("the management console reserves /manage; choose a different --web-slug");
+    }
+
+    refuse_a_missing_token_file(&config.auth)?;
+    if args.enable_session_management && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-session-management requires --transport http");
+    }
+    if args.enable_self_service_keys && !matches!(args.transport, TransportKind::Http) {
+        anyhow::bail!("--enable-self-service-keys requires --transport http");
+    }
     config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -1163,7 +1297,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     }
 
     let api_credentials_exist = store.reader.api_credentials_exist().await?;
-    validate_api_credential_pepper(api_credentials_exist, &config.auth)?;
+    validate_api_credential_pepper_binding(&store, api_credentials_exist, &config.auth).await?;
     let bootstrap_completed_before_start = store.reader.bootstrap_completed().await?;
     validate_configured_secret_collisions(&store, &config.auth, !bootstrap_completed_before_start)
         .await?;
@@ -1316,6 +1450,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_ledger_retention(config.decay.ledger_retention())
         .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_contradiction_band(config.contradiction_band_min, config.contradiction_band_max)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
@@ -1351,10 +1486,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         embedder.clone(),
         admin_llm.clone(),
         config.decay,
+        config.sessions,
         config.dream,
         activity_clock,
         config.contradiction_band_min,
         config.contradiction_band_max,
+        config.consolidate_on_session_end,
+        consolidator.is_some(),
     )
     .await;
 
@@ -1409,6 +1547,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     }
                 }
             }
+            close_store(&store).await;
         }
         TransportKind::Http => {
             seed_active_project_fallback(&store.reader, &active_project).await;
@@ -1520,6 +1659,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
+                cwd_probes: ai_memory_hooks::CwdProbes::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 profile_notify: Some(profile_notify.clone()),
@@ -1544,6 +1684,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 mid_session_routing: config.routing.mid_session,
                 profile: config.profile.clone(),
+                ingest_drop_list: (*config.ingest.drop_list).clone(),
+                // Benchmark-only escape (docs/benchmarks/README.md), read once
+                // here so the hooks crate keeps making no environment reads.
+                skip_wiki_checkpoints: benchmark_skip_wiki_checkpoints(),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -1557,6 +1701,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let admin = admin_router_with_sweep_tuning(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
+                    // The tool server's own instance, so /admin/metrics reads
+                    // what memory_query records.
+                    mcp_metrics: server.mcp_metrics(),
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),
                     wiki: wiki.clone(),
@@ -1587,6 +1734,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.ledger_retention(),
                 config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
@@ -1738,6 +1886,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_href: &base_href,
                     base_path: &base_path,
                     trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                    // The same embedder and rerank stage `memory_query`
+                    // holds (the stage shares its concurrency gate), so web
+                    // project search ranks like the MCP tool.
+                    recall: ai_memory_web::Recall {
+                        embedder: embedder.clone(),
+                        rerank: server.rerank_stage(),
+                    },
+                    health: Some(Arc::new(ai_memory_web::health::HealthSources {
+                        ingest: ingest_metrics.clone(),
+                        providers: provider_health.clone(),
+                        probe: Arc::new(ServeHealthProbe {
+                            writer: store.writer.clone(),
+                            data_dir: config.data_dir.clone(),
+                        }),
+                    })),
                 },
             )?;
             // HTML navigational 401/403 → builtin login / change-password.
@@ -1771,6 +1934,47 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
                 )));
+            #[cfg(not(feature = "management-ui"))]
+            let management_ui_enabled = false;
+            #[cfg(feature = "management-ui")]
+            let management_ui_enabled = args.enable_management_ui;
+            let router = if args.enable_session_management || management_ui_enabled {
+                router.merge(ai_memory_mcp::session_management::router(
+                    ai_memory_mcp::session_management::SessionManagementState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        wiki: wiki.clone(),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            let router = if args.enable_self_service_keys || management_ui_enabled {
+                router.merge(ai_memory_mcp::self_service_keys::router(
+                    ai_memory_mcp::self_service_keys::SelfServiceKeysState {
+                        reader: store.reader.clone(),
+                        writer: store.writer.clone(),
+                        pepper: config
+                            .auth
+                            .token_pepper
+                            .clone()
+                            .filter(|p| !p.trim().is_empty())
+                            .map(TokenPepper::new),
+                    },
+                    auth_state.clone(),
+                ))
+            } else {
+                router
+            };
+            #[cfg(feature = "management-ui")]
+            let router = if management_ui_enabled {
+                // Delegate forms to the same already-authenticated engine routers.
+                let backend = router.clone();
+                router.merge(ai_memory_web::management::router(&base_path, backend))
+            } else {
+                router
+            };
             let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
@@ -1804,6 +2008,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 human_mode,
                 config.auth.secure_cookie,
                 args.allow_insecure_no_auth,
+                args.allow_insecure_human_auth,
                 running_in_container(),
             )?;
             info!(
@@ -1823,6 +2028,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     "starting unauthenticated plain HTTP on a non-loopback address because \
                      --allow-insecure-no-auth was supplied — anyone on the network can call \
                      destructive MCP tools"
+                );
+            } else if exposure == HttpExposure::InsecureHumanAuthByOverride {
+                tracing::warn!(
+                    %local_addr,
+                    "starting human authentication on non-loopback plain HTTP because \
+                     --allow-insecure-human-auth was supplied — passwords, API credentials, \
+                     session cookies, and memory data cross the network unencrypted"
                 );
             } else if exposure == HttpExposure::UndeterminedInContainer {
                 tracing::warn!(
@@ -1912,12 +2124,39 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     ),
                 }
             }
+            close_store(&store).await;
             if let Some(serve_result) = serve_result {
                 serve_result?;
             }
         }
     }
     Ok(())
+}
+
+/// Checkpoint the WAL and close the store's connections on the way out.
+///
+/// `main` ends the process without joining the store writer (detached tasks
+/// still hold clones of its handle), so the connection is never closed and the
+/// whole `-wal` is left for the next start to replay: 9 minutes for a 17.8 GB
+/// one after a `VACUUM`. Bounded by [`SHUTDOWN_GRACE`] because the close queues
+/// behind whatever the writer is running, and a stuck query must not turn a
+/// stop back into a SIGKILL.
+async fn close_store(store: &Store) {
+    close_store_within(store, SHUTDOWN_GRACE).await;
+}
+
+/// [`close_store`] with the deadline as a parameter, so a test can pin the
+/// bound without waiting out the real one. `true` when the store closed in
+/// time.
+async fn close_store_within(store: &Store, grace: Duration) -> bool {
+    if tokio::time::timeout(grace, store.close()).await.is_err() {
+        tracing::warn!(
+            grace_secs = grace.as_secs(),
+            "store did not close within the shutdown grace period; exiting anyway"
+        );
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1930,10 +2169,13 @@ async fn start_maintenance_scheduler(
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
     decay: crate::config::DecaySettings,
+    sessions: crate::config::SessionsSettings,
     dream: crate::config::DreamSettings,
     activity_clock: ai_memory_consolidate::ActivityClock,
     contradiction_band_min: f32,
     contradiction_band_max: f32,
+    consolidate_on_session_end: bool,
+    has_session_consolidator: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -1996,6 +2238,7 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.ledger_retention(),
                             decay.compact_cold_episodic,
                             decay.cold_cluster_dedup(dedup_embedding),
                         )
@@ -2014,6 +2257,9 @@ async fn start_maintenance_scheduler(
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
+                            ledgers_pruned = outcome.ledgers_pruned,
+                            ledger_bytes_pruned = outcome.ledger_bytes_pruned,
+                            ledgers_undeleted = outcome.ledgers_undeleted,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -2294,6 +2540,92 @@ async fn start_maintenance_scheduler(
         }
     }
 
+    // Idle session auto-end: end the open sessions that never received a
+    // `SessionEnd` (crashed harness, closed terminal, timed-out hook) with
+    // the effects the hook path would have given them — summary page and
+    // consolidation job, never a handoff. Bounded batch every fixed
+    // interval; the scan is stateless and idempotent (the writer-side
+    // `ended_at IS NULL` CAS plus the conditional page write make a double
+    // end impossible), so it needs no persisted cadence state.
+    let idle_end_after_hours = sessions.idle_end_after_hours;
+    if maintenance_enabled && idle_end_after_hours > 0 {
+        let writer = writer.clone();
+        let reader = reader.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                ai_memory_hooks::IDLE_END_INTERVAL_SECS,
+            ));
+            // The first tick fires immediately; let the server come up and
+            // the writer settle before the first scan.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now_us = jiff::Timestamp::now().as_microsecond();
+                // The config load bounds the value to a microsecond-safe
+                // range; the checked arithmetic is the runtime belt (an
+                // overflow would flip the cutoff and mass-end sessions).
+                let Some(cutoff_us) = i64::from(idle_end_after_hours)
+                    .checked_mul(3_600_000_000)
+                    .and_then(|window_us| now_us.checked_sub(window_us))
+                else {
+                    tracing::warn!(
+                        idle_end_after_hours,
+                        "idle session auto-end tick: cutoff arithmetic overflowed; skipping this pass"
+                    );
+                    continue;
+                };
+                // Over-fetch the selection past the active-run sessions:
+                // the tick excludes them (their lifecycle belongs to the
+                // run), and the exclusion must not starve the batch bound
+                // behind a backlog of persistently excluded sessions.
+                let active_runs = match reader
+                    .active_managed_run_native_session_ids()
+                    .await
+                {
+                    Ok(active_runs) => active_runs,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "idle session auto-end run check failed");
+                        continue;
+                    }
+                };
+                let idle = match reader
+                    .idle_open_sessions(
+                        cutoff_us,
+                        ai_memory_hooks::IDLE_END_BATCH
+                            .saturating_add(active_runs.len()),
+                    )
+                    .await
+                {
+                    Ok(idle) => idle,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "idle session auto-end selection failed");
+                        continue;
+                    }
+                };
+                if idle.is_empty() {
+                    continue;
+                }
+                match ai_memory_hooks::run_idle_end_tick(&ai_memory_hooks::IdleEndTickInput {
+                    writer: &writer,
+                    reader: &reader,
+                    wiki: &wiki,
+                    sessions: idle,
+                    now_us: jiff::Timestamp::now().as_microsecond(),
+                    consolidate_on_session_end,
+                    has_consolidator: has_session_consolidator,
+                })
+                .await
+                {
+                    // Success is the tick's own log (idle_end.rs); the
+                    // scheduler only surfaces failures.
+                    Ok(_outcome) => {}
+                    Err(error) => tracing::warn!(error = %error, "idle session auto-end tick failed"),
+                }
+            }
+        }));
+    }
+
     if tasks.is_empty() {
         info!("scheduled maintenance enabled but all intervals are disabled");
     } else {
@@ -2413,6 +2745,9 @@ struct ScheduledSweepTickOutcome {
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
+    ledgers_pruned: usize,
+    ledger_bytes_pruned: u64,
+    ledgers_undeleted: usize,
     errors: usize,
 }
 
@@ -2424,6 +2759,7 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    ledgers: ai_memory_consolidate::LedgerRetention,
     compact_cold_episodic: bool,
     dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
@@ -2434,7 +2770,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match ai_memory_consolidate::run_sweep_with_hygiene(
+        match ai_memory_consolidate::run_sweep_with_ledgers(
             reader,
             writer,
             Some(wiki),
@@ -2445,6 +2781,7 @@ async fn run_scheduled_sweep_tick(
             retention,
             compact_cold_episodic,
             dedup.clone(),
+            ledgers,
             false,
         )
         .await
@@ -2460,6 +2797,9 @@ async fn run_scheduled_sweep_tick(
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
+                outcome.ledgers_pruned += report.ledgers_pruned;
+                outcome.ledger_bytes_pruned += report.ledger_bytes_pruned;
+                outcome.ledgers_undeleted += report.ledgers_undeleted;
             }
             Err(e) => {
                 outcome.errors += 1;
@@ -2624,6 +2964,20 @@ fn auto_improve_review_config_from_settings(
     }
 }
 
+/// The retrieval-benchmark escape hatch (docs/benchmarks/README.md): the
+/// LongMemEval harness replays ~24k session ends through one server, and
+/// each SessionEnd auto-commit walks a wiki tree and object database that
+/// keep growing, which dominates ingest wall clock. `retrieval` never
+/// reads git history, so the harness runs its servers with this variable
+/// set and the commits skipped. Read once at startup; nothing else may
+/// read it, and no product path sets it.
+fn benchmark_skip_wiki_checkpoints() -> bool {
+    matches!(
+        std::env::var("AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 async fn configure_embedder(
     config: &Config,
     store: &Store,
@@ -2639,6 +2993,7 @@ async fn configure_embedder(
         return Ok((wiki, None));
     };
     let provider_name = cfg.provider.name().to_string();
+    let is_local = cfg.provider == ai_memory_llm::EmbedderChoice::Local;
     let model = cfg.model.clone();
     let dim = cfg.dim;
     let defaulted = cfg.defaulted;
@@ -2730,6 +3085,19 @@ async fn configure_embedder(
         "embedder enabled"
     );
     let embedder = provider_health.wrap_embedder(embedder, provider_name, model, dim);
+    let embedder: Arc<dyn Embedder> = if is_local {
+        // all-MiniLM inference parallelizes internally, so capacity bounds
+        // concurrent calls rather than threads. Sizing from the CPU count
+        // recovers the ingest throughput a single background document slot
+        // lost (#1580) while keeping one slot query-reserved; see
+        // `local_capacity` for the halve-and-clamp rationale.
+        let cores = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(4);
+        Arc::new(EmbeddingCapacity::new(embedder, local_capacity(cores))?)
+    } else {
+        embedder
+    };
     Ok((wiki.with_embedder(embedder.clone()), Some(embedder)))
 }
 
@@ -2799,6 +3167,7 @@ fn configure_consolidator(
         model = llm.model(),
         max_input_tokens = config.consolidation.max_input_tokens,
         max_output_tokens = config.consolidation.max_output_tokens,
+        verbatim_residue = config.consolidation.verbatim_residue,
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
     let consolidator = Arc::new(
@@ -2811,6 +3180,7 @@ fn configure_consolidator(
             project_id,
         )
         .with_per_user_slots(config.slots.per_user)
+        .with_verbatim_residue(config.consolidation.verbatim_residue)
         .with_prompt_limits(
             config.consolidation.max_input_tokens,
             config.consolidation.max_output_tokens,
@@ -2835,6 +3205,38 @@ fn configure_consolidator(
         consolidator: Some(consolidator),
         admin_llm: Some(llm),
     })
+}
+
+/// What the web health page reads from this process: the writer queue,
+/// and the hook spool and recovery journal under this server's data
+/// directory (a hook client on another machine spools there, not here).
+struct ServeHealthProbe {
+    writer: ai_memory_store::WriterHandle,
+    data_dir: std::path::PathBuf,
+}
+
+impl ai_memory_web::health::HealthProbe for ServeHealthProbe {
+    fn process_state(&self) -> ai_memory_web::health::ProcessState {
+        use ai_memory_web::health::{JournalState, ProcessState, SpoolState};
+        let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&self.data_dir));
+        let (pending, degraded, finish_failed, error) =
+            super::recovery::journal_summary(&self.data_dir);
+        ProcessState {
+            write_queue: Some(self.writer.queue_depth()),
+            spool: Some(SpoolState {
+                pending: spool.pending,
+                oldest_age_ms: spool.oldest_age_ms,
+                retries_total: spool.retries_total,
+                capacity: spool.capacity,
+            }),
+            journal: Some(JournalState {
+                pending,
+                degraded,
+                finish_failed,
+                unreadable: error.is_some(),
+            }),
+        }
+    }
 }
 
 /// Validate a list of CORS origins before the server binds.
@@ -3221,19 +3623,84 @@ fn host_without_port(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "management-ui")]
+    #[tokio::test]
+    async fn management_ui_rejects_invalid_mounts_before_opening_the_store() {
+        use clap::Parser;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            data_dir: tmp.path().join("unopened"),
+            ..Default::default()
+        };
+        for args in [
+            vec!["ai-memory", "serve", "--enable-management-ui"],
+            vec![
+                "ai-memory",
+                "serve",
+                "--transport",
+                "http",
+                "--enable-management-ui",
+                "--enable-web",
+                "--web-slug",
+                "/manage/",
+            ],
+        ] {
+            let parsed = crate::cli::Cli::try_parse_from(args).unwrap();
+            let crate::cli::Command::Serve(args) = parsed.command else {
+                panic!("serve")
+            };
+            let error = super::run(&config, args).await.unwrap_err();
+            assert!(
+                error.to_string().contains("--transport http")
+                    || error.to_string().contains("reserves /manage")
+            );
+            assert!(!config.data_dir.exists());
+        }
+    }
+
     use super::*;
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
         Sanitized, Sanitizer, SessionId, Tier,
     };
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmError, LlmResult, SyntheticEmbedder};
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
     use secrecy::SecretString;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    /// The shutdown close queues behind whatever the writer is running, so the
+    /// deadline is what keeps a stuck query from turning a stop back into a
+    /// SIGKILL. The writer is made busy for real: another connection holds the
+    /// write lock, so the writer's next command (the close itself, or the
+    /// write queued before it) waits in SQLite's 5s busy handler.
+    #[tokio::test]
+    async fn close_store_returns_within_its_grace_while_the_writer_is_busy() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let blocker = rusqlite::Connection::open(store.db_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = store.writer.clone();
+        let queued = tokio::spawn(async move { writer.get_or_create_workspace("blocked").await });
+
+        let started = std::time::Instant::now();
+        let closed = close_store_within(&store, Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        // Let the writer go before asserting, so a failure does not leave it
+        // parked for the rest of its busy timeout.
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let _ = queued.await;
+        assert!(!closed, "the close cannot finish while the writer is stuck");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "close_store waited {elapsed:?} for a stuck writer instead of giving up"
+        );
+    }
 
     /// An owner-check failure of the startup wiki baseline checkpoint must be
     /// classified as an ERROR-worthy `OwnerFailure`, not the WARN-only
@@ -3438,6 +3905,50 @@ mod tests {
         assert!(validate_api_credential_pepper(false, &missing).is_ok());
     }
 
+    #[tokio::test]
+    async fn api_key_pepper_binding_refuses_a_mismatch_once_credentials_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let original = AuthSettings {
+            token_pepper: Some("original-pepper-with-enough-entropy".into()),
+            ..AuthSettings::default()
+        };
+        let replacement = AuthSettings {
+            token_pepper: Some("replacement-pepper-with-enough-entropy".into()),
+            ..AuthSettings::default()
+        };
+
+        validate_api_credential_pepper_binding(&store, false, &original)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .api_credential_pepper_verifier()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        validate_api_credential_pepper_binding(&store, true, &original)
+            .await
+            .unwrap();
+
+        let mismatch = validate_api_credential_pepper_binding(&store, true, &replacement)
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("does not match"),
+            "unexpected error: {mismatch:#}"
+        );
+
+        validate_api_credential_pepper_binding(&store, false, &replacement)
+            .await
+            .unwrap();
+        validate_api_credential_pepper_binding(&store, true, &replacement)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn unauthenticated_non_loopback_http_requires_explicit_override() {
         let addresses = [
@@ -3464,6 +3975,7 @@ mod tests {
                             false,
                             allow_override,
                             false,
+                            false,
                         )
                         .is_ok(),
                         allowed,
@@ -3477,16 +3989,25 @@ mod tests {
     #[test]
     fn human_auth_non_loopback_requires_secure_cookie_posture() {
         let remote: SocketAddr = "192.168.1.90:49374".parse().unwrap();
-        assert!(validate_http_exposure(remote, true, true, false, false, false).is_err());
-        assert!(validate_http_exposure(remote, true, true, false, true, true).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, false, false, false).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, true, false, true).is_err());
         assert_eq!(
-            validate_http_exposure(remote, true, true, true, false, false).unwrap(),
+            validate_http_exposure(remote, true, true, true, false, false, false).unwrap(),
             HttpExposure::Safe
         );
+        assert_eq!(
+            validate_http_exposure(remote, true, true, false, false, true, false).unwrap(),
+            HttpExposure::InsecureHumanAuthByOverride
+        );
+
+        // The human-auth override must not become a second way to expose a
+        // server with no authentication at all.
+        assert!(validate_http_exposure(remote, false, false, false, false, true, false).is_err());
+        assert!(validate_http_exposure(remote, false, true, false, false, true, false).is_err());
 
         let loopback: SocketAddr = "127.0.0.1:49374".parse().unwrap();
         assert_eq!(
-            validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
+            validate_http_exposure(loopback, true, true, false, false, true, false).unwrap(),
             HttpExposure::Safe
         );
     }
@@ -3507,6 +4028,12 @@ mod tests {
         assert!(override_banner.contains("0.0.0.0:49374"));
         assert!(override_banner.contains("--allow-insecure-no-auth"));
 
+        let human_banner = exposure_banner(HttpExposure::InsecureHumanAuthByOverride, addr)
+            .expect("an insecure human-auth override must be announced");
+        assert!(human_banner.contains("HUMAN AUTHENTICATION"));
+        assert!(human_banner.contains("--allow-insecure-human-auth"));
+        assert!(human_banner.contains("session cookies"));
+
         let container_banner = exposure_banner(HttpExposure::UndeterminedInContainer, addr)
             .expect("an unauthenticated container bind must be announced");
         assert!(container_banner.contains("NO AUTHENTICATION"));
@@ -3523,13 +4050,13 @@ mod tests {
     fn the_quick_start_container_bind_is_announced_not_refused() {
         let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
 
-        let exposure = validate_http_exposure(quick_start, false, false, false, false, true)
+        let exposure = validate_http_exposure(quick_start, false, false, false, false, false, true)
             .expect("must not refuse");
         assert_eq!(exposure, HttpExposure::UndeterminedInContainer);
         assert!(exposure_banner(exposure, quick_start).is_some());
 
         // With a token configured there is nothing to announce.
-        let authed = validate_http_exposure(quick_start, true, false, false, false, true)
+        let authed = validate_http_exposure(quick_start, true, false, false, false, false, true)
             .expect("auth is fine");
         assert_eq!(exposure_banner(authed, quick_start), None);
     }
@@ -3544,19 +4071,21 @@ mod tests {
 
         // The exact Quick Start shape: no token, no override, in a container.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, false, false, true)
+            validate_http_exposure(quick_start, false, false, false, false, false, true)
                 .expect("must not refuse"),
             HttpExposure::UndeterminedInContainer,
         );
 
         // Identical inputs on a host still refuse — the carve-out is scoped
         // to the container case and does not soften the host rule.
-        assert!(validate_http_exposure(quick_start, false, false, false, false, false).is_err());
+        assert!(
+            validate_http_exposure(quick_start, false, false, false, false, false, false).is_err()
+        );
 
         // A container is not a blanket downgrade: with machine auth configured
         // the verdict is Safe, so the operator gets no spurious warning.
         assert_eq!(
-            validate_http_exposure(quick_start, true, false, false, false, true)
+            validate_http_exposure(quick_start, true, false, false, false, false, true)
                 .expect("auth is fine"),
             HttpExposure::Safe,
         );
@@ -3564,7 +4093,7 @@ mod tests {
         // An explicit override still reports as an override, not as the
         // container case, so the startup log keeps naming the real reason.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, false, true, true)
+            validate_http_exposure(quick_start, false, false, false, true, false, true)
                 .expect("override is fine"),
             HttpExposure::InsecureByOverride,
         );
@@ -3572,7 +4101,7 @@ mod tests {
         // Loopback inside a container is plain Safe.
         let loopback: SocketAddr = "127.0.0.1:49374".parse().expect("valid test address");
         assert_eq!(
-            validate_http_exposure(loopback, false, false, false, false, true)
+            validate_http_exposure(loopback, false, false, false, false, false, true)
                 .expect("loopback is fine"),
             HttpExposure::Safe,
         );
@@ -4006,10 +4535,13 @@ mod tests {
             None,
             None,
             crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
             crate::config::DreamSettings::default(),
             ai_memory_consolidate::ActivityClock::default(),
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4056,10 +4588,13 @@ mod tests {
                 None,
                 None,
                 crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings::default(),
                 crate::config::DreamSettings::default(),
                 ai_memory_consolidate::ActivityClock::default(),
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -4067,6 +4602,245 @@ mod tests {
             for task in tasks {
                 task.abort();
             }
+        }
+    }
+
+    /// The idle auto-end task starts only with maintenance enabled AND
+    /// `idle_end_after_hours > 0`; either switch off leaves the task count
+    /// unchanged.
+    #[tokio::test]
+    async fn idle_end_tick_does_not_start_when_disabled_or_maintenance_off() {
+        let baseline = MaintenanceSettings {
+            enabled: true,
+            forget_sweep_interval_secs: 0,
+            lint_interval_secs: 60,
+            embedding_backfill_interval_secs: 0,
+            reconcile_tombstones_deleted_pages: false,
+        };
+        // Key at 0: the baseline task count (one lint job + hollow-project job).
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            baseline.clone(),
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(tasks.len(), 2);
+        for task in tasks {
+            task.abort();
+        }
+
+        // Key on: exactly one extra task — the idle auto-end loop.
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            baseline.clone(),
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(tasks.len(), 3);
+        for task in tasks {
+            task.abort();
+        }
+
+        // Maintenance disabled with the key on: nothing starts.
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: false,
+                ..baseline
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            true,
+            true,
+        )
+        .await;
+        assert!(tasks.is_empty());
+    }
+
+    /// With the key on, the first real pass (one fixed interval after start,
+    /// fast-forwarded with paused `tokio::time`) ends an idle session with
+    /// the page, the watermark, the audit row and the consolidation job —
+    /// no real sleeping.
+    #[tokio::test]
+    async fn idle_end_tick_ends_an_idle_session_on_the_first_pass() {
+        let (_tmp, store, wiki, ws, proj, _second) = two_project_wiki().await;
+        tokio::time::pause();
+        let now = jiff::Timestamp::now().as_microsecond();
+        let last_activity = now - 2 * 3_600_000_000; // two hours ago.
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+                occurred_at: Some(last_activity),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "idle scheduler test".into(),
+                    body: "prompt two hours ago".into(),
+                    importance: 5,
+                    occurred_at: Some(last_activity),
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: true,
+                forget_sweep_interval_secs: 0,
+                lint_interval_secs: 0,
+                embedding_backfill_interval_secs: 0,
+                reconcile_tombstones_deleted_pages: false,
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings {
+                idle_end_after_hours: 1,
+            },
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            true,
+            true,
+        )
+        .await;
+
+        // The settle tick already fired; let the spawned task register its
+        // first real interval timer, then fast-forward one fixed interval so
+        // the first real pass runs.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(
+            ai_memory_hooks::IDLE_END_INTERVAL_SECS,
+        ))
+        .await;
+        // The writer runs on its own OS thread, which the paused clock does
+        // not pace: under a loaded test run the end-session transaction can
+        // still be in flight after any number of virtual advances, so each
+        // poll also yields a little real time, bounded by a real deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline {
+            let disp = store
+                .reader
+                .session_end_disposition(sid, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap();
+            if matches!(disp, ai_memory_store::SessionEndDisposition::AlreadyEnded) {
+                ended = true;
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            })
+            .await
+            .unwrap();
+        }
+        assert!(ended, "the first pass must end the idle session");
+
+        // Page written, tick-clock ended_at (last activity in the audit
+        // detail), audit row, consolidation job.
+        let page = store
+            .reader
+            .latest_page_id_by_ids(ws, proj, format!("sessions/{sid}.md"))
+            .await
+            .unwrap();
+        assert!(page.is_some());
+        let audit = store
+            .reader
+            .list_audit_events(ai_memory_store::AuditLogFilter {
+                op: Some("idle_session_end".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert!(
+            audit[0].at >= now && audit[0].at < now + 60_000_000_000,
+            "ended_at is the tick's clock (the discovery is ordered by ended_at): {}",
+            audit[0].at
+        );
+        assert!(
+            audit[0].detail.contains(&last_activity.to_string()),
+            "the last activity survives in the audit detail: {}",
+            audit[0].detail
+        );
+        // Claim with a fresh clock: the enqueue's `requested_at` is the
+        // tick's wall time, after this test's `now`.
+        let now_after = jiff::Timestamp::now().as_microsecond();
+        let job = store
+            .writer
+            .claim_session_consolidation(now_after + 1_000, now_after - 1_000)
+            .await
+            .unwrap();
+        assert_eq!(job.map(|j| j.session_id()), Some(sid));
+        for task in tasks {
+            task.abort();
         }
     }
 
@@ -4177,6 +4951,7 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -4194,8 +4969,189 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
+        }
+    }
+
+    /// Which fixed failure a [`FailingConsolidationLlm`] surfaces.
+    #[derive(Clone, Copy)]
+    enum ConsolidationFailure {
+        /// The provider's structured JSON did not parse (deterministic).
+        MalformedJson,
+        /// The provider answered with a shape the structured decoder rejects.
+        UnexpectedShape,
+        /// The provider stopped at its output budget before completing JSON.
+        TruncatedResponse,
+        /// The provider returned HTTP 2xx with no usable content.
+        EmptyContent,
+        /// The configured credential is rejected or expired: the same key
+        /// fails identically on every later attempt (deterministic).
+        ExpiredAuth,
+        /// The provider rejected the request itself with a 4xx other than
+        /// `429`, which an unchanged prompt reproduces (deterministic).
+        MalformedRequest,
+        /// The provider is rate-limiting: a later attempt may clear it.
+        RateLimited,
+    }
+
+    /// Structured-output failure fixture: counts calls (proving the prompt
+    /// is never re-sent) and fails every structured completion with the
+    /// fixed error.
+    struct FailingConsolidationLlm {
+        failure: ConsolidationFailure,
+        calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for FailingConsolidationLlm {
+        fn name(&self) -> &'static str {
+            "failing-consolidation"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { panic!("session consolidation uses structured output") })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let calls = self.calls.clone();
+            let failure = self.failure;
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let error = match failure {
+                    ConsolidationFailure::MalformedJson => {
+                        LlmError::Serde("missing field `title`".into())
+                    }
+                    ConsolidationFailure::UnexpectedShape => {
+                        LlmError::UnexpectedShape("no tool block".into())
+                    }
+                    ConsolidationFailure::TruncatedResponse => LlmError::TruncatedResponse {
+                        model: "test-model".into(),
+                        completion_tokens: Some(8000),
+                    },
+                    ConsolidationFailure::EmptyContent => LlmError::EmptyContent {
+                        model: "test-model".into(),
+                    },
+                    ConsolidationFailure::ExpiredAuth => LlmError::Auth("api key expired".into()),
+                    ConsolidationFailure::MalformedRequest => LlmError::Provider {
+                        status: 400,
+                        body: "bad request".into(),
+                        retry_after: None,
+                    },
+                    ConsolidationFailure::RateLimited => LlmError::Provider {
+                        status: 429,
+                        body: "rate limited".into(),
+                        retry_after: None,
+                    },
+                };
+                Err(error)
+            })
+        }
+    }
+
+    // The classifier decides the queue's terminal set by variant, never by
+    // message text, and for an LLM failure it decides it with
+    // `LlmError::is_transient` — the predicate the in-process consolidation
+    // and bootstrap retry loops already use. Every deterministic failure is
+    // terminal at any queue attempt, and every failure a later attempt may
+    // plausibly clear is not.
+    #[tokio::test]
+    async fn is_terminal_session_consolidation_error_classifies_by_variant() {
+        use ai_memory_consolidate::ConsolidatorError;
+
+        let terminal = [
+            ConsolidatorError::Serde("truncated json".into()),
+            ConsolidatorError::Llm(LlmError::Serde("missing field `title`".into())),
+            ConsolidatorError::Llm(LlmError::UnexpectedShape("no tool block".into())),
+            ConsolidatorError::Llm(LlmError::TruncatedResponse {
+                model: "test-model".into(),
+                completion_tokens: Some(8000),
+            }),
+            ConsolidatorError::Llm(LlmError::EmptyContent {
+                model: "test-model".into(),
+            }),
+            // Deterministic provider-side failures the queue must not re-send
+            // either: the credential, the missing configuration, the derived
+            // schema and a malformed-request 4xx all fail identically on the
+            // next attempt.
+            ConsolidatorError::Llm(LlmError::Auth("expired".into())),
+            ConsolidatorError::Llm(LlmError::NotConfigured("no key".into())),
+            ConsolidatorError::Llm(LlmError::Schema("bad".into())),
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 401,
+                body: "invalid api key".into(),
+                retry_after: None,
+            }),
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 400,
+                body: "bad request".into(),
+                retry_after: None,
+            }),
+        ];
+        for error in &terminal {
+            assert!(
+                is_terminal_session_consolidation_error(error),
+                "a deterministic structured-response failure must be terminal: {error:?}"
+            );
+        }
+
+        // A refused connection, built the same way the LLM suite builds one:
+        // a closed loopback port refuses immediately.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let connect = reqwest::get(format!("http://{addr}/v1"))
+            .await
+            .expect_err("a closed loopback port must refuse the connection");
+        assert!(
+            connect.is_connect(),
+            "the fixture must be a pre-send connection failure"
+        );
+
+        // Pre-send and provider-status failures a later attempt may plausibly
+        // clear keep the queue's bounded backoff, whatever the message says.
+        let not_terminal = [
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 429,
+                body: "rate limited".into(),
+                retry_after: None,
+            }),
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 503,
+                body: "capacity".into(),
+                retry_after: None,
+            }),
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 502,
+                body: "bad gateway".into(),
+                retry_after: None,
+            }),
+            ConsolidatorError::Llm(LlmError::Http(connect)),
+        ];
+        for error in &not_terminal {
+            assert!(
+                !is_terminal_session_consolidation_error(error),
+                "a failure a later attempt may clear must keep the queue retrying: {error:?}"
+            );
         }
     }
 
@@ -4687,8 +5643,8 @@ mod tests {
 
     // Mutation captured: persisting the error's `Display` writes the private
     // provider body into the queue row; the worker must persist only the
-    // redacted class/status summary, and a failed first attempt keeps the
-    // queue's scheduled retry instead of flipping terminal.
+    // redacted class/status summary, and a deterministic `400` settles the
+    // job terminal instead of re-sending the same prompt.
     #[tokio::test]
     async fn session_end_worker_persists_redacted_summary_not_provider_body() {
         let tmp = TempDir::new().unwrap();
@@ -4770,10 +5726,10 @@ mod tests {
         // lands.
         let db = rusqlite::Connection::open(store.db_path()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let (state, last_error, next_attempt_at) = loop {
+        let (state, last_error, completed_at) = loop {
             let row = db
                 .query_row(
-                    "SELECT state, last_error, next_attempt_at \
+                    "SELECT state, last_error, completed_at \
                      FROM session_consolidation_jobs WHERE session_id = ?1",
                     rusqlite::params![session_id.as_bytes()],
                     |r| {
@@ -4810,13 +5766,18 @@ mod tests {
             !last_error.contains("SENTINEL_PRIVATE_BODY"),
             "provider body leaked into the queue row: {last_error}"
         );
+        // A malformed-request `400` is deterministic (`LlmError::is_transient`
+        // is false for every 4xx but `429`), so the job settles terminal on
+        // the first attempt rather than re-sending the same prompt. The
+        // terminal update stamps `completed_at` and leaves `state` out of
+        // `pending`, which is what the claim query filters on.
         assert_eq!(
-            state, "pending",
-            "a failed first attempt must keep the queue's retry"
+            state, "failed",
+            "a deterministic 4xx must settle the job terminal"
         );
         assert!(
-            next_attempt_at.is_some(),
-            "the retryable failure must keep a scheduled retry"
+            completed_at.is_some(),
+            "a terminal job must be stamped completed"
         );
     }
 
@@ -5000,6 +5961,273 @@ mod tests {
         assert!(body.contains("Durable worker completed"), "{body}");
     }
 
+    /// What the SessionEnd queue must do with a failure.
+    #[derive(Clone, Copy)]
+    enum QueueOutcome {
+        /// The job settles terminal: no later claim ever returns it again.
+        Terminal,
+        /// The job keeps the bounded backoff: a claim past the first 30s
+        /// backoff returns it as the next attempt.
+        Requeued,
+    }
+
+    /// Run the real SessionEnd worker against a session whose structured LLM
+    /// call fails with `failure`, and prove the queue settles the job as
+    /// `outcome` after exactly `expected_calls` prompts.
+    ///
+    /// For [`QueueOutcome::Terminal`] the job settles with no
+    /// `next_attempt_at` — a claim far enough in the future that a re-queued
+    /// job (first backoff is 30s) would be claimable finds none — and no
+    /// further prompt goes out. The settle window (5 × 100ms) is measured: a
+    /// writer round-trip is millisecond-scale, so probing past it is
+    /// deterministic for a single-row SQLite update. For
+    /// [`QueueOutcome::Requeued`] that same future-clock claim returns the
+    /// job as attempt 2.
+    ///
+    /// Either way the heuristic page the SessionEnd hook wrote before
+    /// enqueuing is untouched.
+    async fn session_end_worker_settles_as(
+        failure: ConsolidationFailure,
+        outcome: QueueOutcome,
+        expected_calls: usize,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "end the session".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        // The SessionEnd hook writes this heuristic page before enqueuing the
+        // LLM job; a terminal failure must leave it exactly in place.
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let path = format!("sessions/{session_id}.md");
+        write_test_page(
+            &wiki,
+            workspace_id,
+            project_id,
+            &path,
+            "heuristic",
+            Tier::Episodic,
+        )
+        .await;
+        let heuristic_body = store
+            .reader
+            .page_body_by_ids(workspace_id, project_id, &path)
+            .await
+            .unwrap()
+            .expect("the heuristic page was written")
+            .body;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(FailingConsolidationLlm {
+                failure,
+                calls: calls.clone(),
+            }),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        // The prompt must go out exactly `expected_calls` times. A transient
+        // failure also spends the consolidator's own bounded inner retries
+        // (2s apart) before the queue ever sees it, so allow for those.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while calls.load(Ordering::SeqCst) < expected_calls {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never finished calling the LLM"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let the writer settle the failure row, then probe with a clock 60s
+        // ahead: a re-queued job (first backoff 30s) is claimable there, a
+        // terminal row never is.
+        match outcome {
+            QueueOutcome::Terminal => {
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let probe_now = jiff::Timestamp::now().as_microsecond() + 60 * 1_000_000;
+                    assert!(
+                        store
+                            .writer
+                            .claim_session_consolidation(probe_now, probe_now - 10 * 60 * 1_000_000)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "the failure must not re-queue the same prompt"
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        expected_calls,
+                        "no immediate replay or queue re-send of the same prompt"
+                    );
+                }
+            }
+            QueueOutcome::Requeued => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let requeued = loop {
+                    let probe_now = jiff::Timestamp::now().as_microsecond() + 60 * 1_000_000;
+                    if let Some(job) = store
+                        .writer
+                        .claim_session_consolidation(probe_now, probe_now - 10 * 60 * 1_000_000)
+                        .await
+                        .unwrap()
+                    {
+                        break job;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a failure a later attempt may clear must stay on the queue",
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+                assert_eq!(
+                    requeued.attempts(),
+                    2,
+                    "the re-queued job must be the second attempt"
+                );
+            }
+        }
+        cancel.cancel();
+        task.await.unwrap();
+        let body = store
+            .reader
+            .page_body_by_ids(workspace_id, project_id, &path)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.map(|page| page.body),
+            Some(heuristic_body.clone()),
+            "the heuristic page must survive a terminal failure untouched"
+        );
+    }
+
+    // Mutation captured: treating a deterministic structured-response failure
+    // like a transient one re-queues the same expensive prompt; the worker
+    // must settle the job terminal after the single send.
+    #[tokio::test]
+    async fn session_end_worker_makes_malformed_json_and_unexpected_shape_terminal() {
+        session_end_worker_settles_as(
+            ConsolidationFailure::MalformedJson,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::UnexpectedShape,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+    }
+
+    // Mutation captured: removing either provider error from the terminal
+    // queue set causes a second claim of the same truncated or empty output.
+    #[tokio::test]
+    async fn session_end_worker_makes_truncated_and_empty_output_terminal() {
+        session_end_worker_settles_as(
+            ConsolidationFailure::TruncatedResponse,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::EmptyContent,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+    }
+
+    /// A rejected credential and a malformed-request 4xx are deterministic:
+    /// the identical prompt fails identically on every later attempt. Before
+    /// the queue gate consulted `LlmError::is_transient` it hand-enumerated
+    /// only the structured-response shapes, so one expired key burned the
+    /// full attempt cap (5 prompts over ~7.5 minutes) per ended session and
+    /// logged "queued for retry" four times on the way.
+    #[tokio::test]
+    async fn session_end_worker_makes_an_expired_key_and_a_4xx_terminal() {
+        session_end_worker_settles_as(ConsolidationFailure::ExpiredAuth, QueueOutcome::Terminal, 1)
+            .await;
+        session_end_worker_settles_as(
+            ConsolidationFailure::MalformedRequest,
+            QueueOutcome::Terminal,
+            1,
+        )
+        .await;
+    }
+
+    /// The other direction, which the polarity of the gate decides: a `429`
+    /// never reached the model, so the queue must keep its bounded,
+    /// backoff-scheduled retry. The consolidator spends its own three inner
+    /// attempts first, then the queue re-queues the job as attempt 2.
+    #[tokio::test]
+    async fn session_end_worker_requeues_a_rate_limited_provider() {
+        session_end_worker_settles_as(ConsolidationFailure::RateLimited, QueueOutcome::Requeued, 3)
+            .await;
+    }
+
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -5076,6 +6304,7 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            ai_memory_consolidate::LedgerRetention::default(),
             false,
             ai_memory_consolidate::ColdClusterDedup::default(),
         )
@@ -5719,6 +6948,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -5821,6 +7052,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -5893,6 +7126,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -5930,8 +7165,10 @@ mod tests {
             .unwrap();
         assert_eq!(json_401.status(), StatusCode::UNAUTHORIZED);
 
-        // Browser navigations redirect to the public login page.
-        let html_redir = router
+        // With a bearer and no human accounts there is no login form that
+        // could succeed, so a browser navigation gets the Basic challenge,
+        // not a redirect to the login page.
+        let html_challenge = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -5944,16 +7181,33 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(html_redir.status(), StatusCode::SEE_OTHER);
-        let location = html_redir
+        assert_eq!(html_challenge.status(), StatusCode::UNAUTHORIZED);
+        assert!(html_challenge.headers().get(header::LOCATION).is_none());
+        let challenge = html_challenge
             .headers()
-            .get(header::LOCATION)
+            .get(header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        assert!(
-            location.starts_with("/web/login?next="),
-            "expected login redirect, got {location}"
-        );
+        assert!(challenge.starts_with("Basic "), "challenge: {challenge}");
+
+        // The token as the Basic password opens the wiki.
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode("root:secret");
+        let signed_in = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .header("Authorization", format!("Basic {basic}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status(), StatusCode::OK);
 
         // Login HTML is public (no auth).
         let login = router
@@ -6039,6 +7293,8 @@ mod tests {
                 base_href: "/web/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();
@@ -6101,6 +7357,8 @@ mod tests {
                 base_href: "/",
                 base_path: "",
                 trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                health: None,
             },
         )
         .unwrap();

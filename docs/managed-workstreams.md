@@ -2,10 +2,19 @@
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
 between Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro
-CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI. Direct agent launches
+CLI v2/v3, OMP, Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
+
+When the server runs with `--enable-web`, root can inspect all managed ledgers
+at `/web/workstreams`. The read-only page shows trusted lifecycle state, the
+latest harness/run, current harness links, event counts, and activity times. It
+does not infer "waiting for input" from captured prose, and it never displays
+checkout paths, fingerprints, lease-owner strings, native session ids, source
+record ids, or transcript content. This cross-project operator view is not a
+discovery API: `ai-memory resume` and normal run selection remain restricted to
+the exact repository/worktree fingerprints described below.
 
 `ai-memory run` is the preferred way to start a harness: if in doubt, run
 with ai-memory. Besides session continuity, the first time it launches a given
@@ -66,21 +75,26 @@ ai-memory run --profile work omp --profile omp-work
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
 and always selects the Claude harness. The exact spelling never changes
 the agent kind, session store, or transcript import.
-Combine that wildcard with `--executable` to launch the right account's
-binary while keeping each account's managed workstream distinguishable in
-your shell history:
+A `claude*` name other than plain `claude` and `claude-code` also picks the
+binary: when no `--executable` is given and an executable with exactly that
+name is on the launch `PATH` (including a `PATH` set with `--env`), `run`
+launches it. Per-account wrapper scripts therefore work without repeating
+yourself:
 
 ```bash
 # ~/bin/claude-corp and ~/bin/claude-personal are wrapper scripts (earlier on
 # PATH than the bare `claude`) that each exec the real claude binary with
 # that account's config/credentials directory.
-ai-memory run claude-corp --executable claude-corp --model opus
-ai-memory run claude-personal --executable claude-personal
+ai-memory run claude-corp --model opus
+ai-memory run claude-personal
 ```
 
-Only the `--executable` value matters for which binary actually runs; the
-positional name is free-form as long as it starts with `claude`, so pick
-whatever reads clearly to you.
+If no executable with that name exists, `run` prints a warning on stderr and
+starts plain `claude`, so a mistyped or missing wrapper cannot silently put you
+on the wrong account. An explicit `--executable` always wins, and `claude` and
+`claude-code` always mean the plain `claude` binary. The name must be a bare
+command name found through `PATH` (a shell alias or function is invisible
+here); to use a binary elsewhere, pass `--executable <path>`.
 
 ```bash
 cd /path/to/project
@@ -102,6 +116,60 @@ ai-memory run kiro --v3
 # or omit the harness and continue the newest usable session automatically
 ai-memory run
 ```
+
+When that second command is a real harness switch, the server returns only the
+previous harness and native session identity. The launcher verifies that
+session against this exact checkout, reads it through the existing read-only
+adapter, and writes its visible normalized history to a private temporary
+Markdown file. The child receives only this local variable:
+
+```text
+AI_MEMORY_PREVIOUS_SESSION_HISTORY=/private/temp/.../history.md
+```
+
+The startup packet tells the receiving agent to read the file when the user
+asks to continue or an exact detail is absent from the bounded portable packet.
+That server-authored directive is outside the packet's untrusted-history fence;
+only the imported transcript evidence is inside the fence. The canonical
+ai-memory routing block provides the same fallback: when all three
+wrapper-owned variables `AI_MEMORY_RUN_ID`, `AI_MEMORY_WORKSTREAM_ID`, and
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY` are present, "continue", "resume", or
+"pick up where we left off" means to read the named file before inferring the
+unfinished task. This covers quota exhaustion and other abrupt exits where the
+outgoing harness cannot prepare a handoff.
+
+Outside a managed run there is no dossier, but the server still sees the cut-off
+session's captured observations. When the newest work in the project belongs to
+another session of the same operator that never ended and left no handoff after
+that work,
+`GET /handoff` adds a metadata-only notice (agent kind, session id, age) that
+tells the agent to read that session with `memory_read_session_observations`,
+newest first. `memory_briefing` (`recent_sessions`) and `memory_handoff_list`
+(`newer_unended_session`) expose the same pointer to clients whose session start
+injects nothing.
+
+The dossier is evidence, not instructions: it is fenced as untrusted history,
+contains no hidden reasoning or unsupported/private records, and disappears
+when the child exits. The remote ai-memory server never receives its path or
+body. A same-harness resume needs no dossier because that harness resumes its
+own native session. If the prior store is missing, unreadable, on another
+machine, or above the adapter's safety bounds, launch continues with the
+portable ledger and handoff and prints one warning.
+
+If a same-machine harness switch has no
+`AI_MEMORY_PREVIOUS_SESSION_HISTORY`, check the executable used by the exact
+shell that launched it:
+
+```bash
+type -a ai-memory
+ai-memory --version
+```
+
+Native-history continuation requires the 3.1.0 or newer host client. A stale
+Cargo or package-manager binary earlier in `PATH` can shadow an updated Docker
+wrapper and its checksum-verified native runner. Upgrade or remove the
+shadowing executable, then restart the managed run; an already-running child
+keeps the environment inherited from its old launcher.
 
 After an interactive managed session exits successfully, `ai-memory run` offers
 the installed harnesses, a way to run the current harness again, and quit.
@@ -133,7 +201,7 @@ ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh] [--force-unlock] [--profile NAME]
               [--env KEY=VALUE]... [--env-file PATH] [--require-server]
-              [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
+              [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity|copilot]
               [native arguments...]
 ```
 
@@ -182,9 +250,11 @@ Probably not at first. Hooks alone already carry most continuity.
   works with nothing but `install-hooks`; no `ai-memory run` involved.
 - Use it when you want the harness's own native resume (`claude
   --resume` / the picker) to survive a switch to another harness. The
-  managed ledger records the visible event stream portably, so `ai-memory
-  continue` can reopen the same workstream in a different agent with
-  the exact tool-call history instead of a summary.
+  managed ledger records the visible event stream portably, while a
+  same-machine harness switch exposes the previous native session's larger
+  local visible-history dossier on demand. `ai-memory continue` can therefore
+  reopen the same workstream in a different agent with more than a summary,
+  without uploading the native transcript to the server.
 
 If you never switch harnesses mid-workstream, the default path is
 simpler and you lose nothing by staying on it.
@@ -340,7 +410,7 @@ takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
-flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
+flavor remains exact. OMP, Grok, Antigravity, and Copilot remain available explicitly
 but are not in the automatic pool. OpenCode's resolved major contributes one
 adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 
@@ -388,7 +458,11 @@ linked id in the harness's native store without modifying it. If the transcript
 was deleted, cleared, or lost with a sandbox overlay, ai-memory starts a fresh
 native session and repoints the same workstream when that session is observed.
 An unreadable or malformed store is reported but is not mistaken for a missing
-session. Use `ai-memory run --fresh <harness>` to deliberately skip the linked
+session. Codex compresses a rollout it has not written for a week to
+`rollout-*.jsonl.zst` and restores the plain file when `codex resume` reopens
+it. The compressed copy counts as the linked session, so the launch resumes it
+and the transcript import reads it like the plain file. Use
+`ai-memory run --fresh <harness>` to deliberately skip the linked
 session and the adoption chooser. `--fresh` cannot be combined with a native
 resume, continue, session, or fork selector.
 
@@ -417,7 +491,13 @@ resume, continue, session, or fork selector.
    an explicit interactive adapter can offer matching local sessions for
    one-time adoption. Otherwise the adapter passes native arguments through in
    order and adds a create/resume selector only when the user did not supply one.
-3. `AI_MEMORY_RUN_ID` marks lifecycle hooks as managed. SessionStart links the
+3. `AI_MEMORY_RUN_ID` marks lifecycle hooks as managed. When preparation
+   selects a different harness from the newest linked one, the run pins that
+   prior harness/session identity before the destination link can change
+   recency. The host revalidates it against the checkout and, when available,
+   exposes a private local visible-history dossier through
+   `AI_MEMORY_PREVIOUS_SESSION_HISTORY`; no path or dossier body is sent to the
+   server. SessionStart then links the
    actual native session and injects only the portable events that session has
    not seen. Crush, which has no SessionStart hook, receives the same bounded
    packet through a temporary `options.global_context_paths` entry. Kimi Code
@@ -440,7 +520,11 @@ resume, continue, session, or fork selector.
    there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
-   excluded and recorded as extraction-loss annotations. The checkout's
+   excluded and recorded as extraction-loss annotations. So is a record over
+   the 1 MiB per-record cap, usually an image in a tool result: it is skipped
+   rather than failing the import, and a note marks the gap. Because the
+   skipped record may have been a tool call, a later result in that turn that
+   carries no call id is treated as having an unknown call. The checkout's
    `[capture] ignore_paths` applies before upload, with the live hook's
    decision table: an excluded tool call and its result never enter the
    ledger, one the policy cannot prove safe keeps only its tool family, and a
@@ -525,21 +609,43 @@ the server first (any HTTP answer counts as reachable, so an older build
 without `/healthz` still passes), prints one loud warning naming the server
 URL and what the degraded run means, and launches the harness anyway:
 
-- **Lost this run**: no workstream lease or cross-harness context packet, no
-  transcript import into the ledger, and no cross-harness handoff delivery.
-  Nothing that needs the server runs: no prepare, lease, link, heartbeat,
-  context fetch, status check, finish, or import.
-- **Still works**: the harness's ai-memory lifecycle hooks (if installed) keep
-  capturing. Events spool locally and drain automatically when the server
-  returns. An existing MCP registration degrades to no-recall for the session
-  instead of blocking it (the same principle as `docs/mcp-install.md`'s
-  optional-mode entries: an unreachable memory server costs you recall, but
-  the session still runs).
+- **Unavailable during the run**: no workstream lease or cross-harness context
+  packet, immediate transcript import, or handoff delivery. Nothing that needs
+  the server runs: no prepare, lease, link, heartbeat, context fetch, status
+  check, finish, or import.
+- **Recovered afterward**: recovery requires both the `ai-memory run` client
+  and server to be upgraded to the release that provides `ai-memory recover`
+  and modern per-item hook acknowledgements. The harness's ai-memory lifecycle
+  hooks (if installed) spool events locally. After the child exits, the launcher
+  discovers its native session and appends only bounded metadata (never
+  transcript content or secrets) to an owner-only local recovery journal. Run
+  `ai-memory recover` when the server returns: under the spool's exclusive
+  drain lock it first quarantines entries correlated to each journaled session,
+  drains unrelated entries, then re-exports the exact native transcript and
+  replays session start, content, and session end through the existing
+  sanitized `/hook/batch` backfill path. A successful replay deletes the
+  quarantine; failure restores it. Antigravity's native store has no supported
+  transcript exporter, so its degraded launch is still journaled explicitly as
+  spool-only and recovery never invokes its exporter. Its correlated entries
+  are quarantined and the journal clears as `recovered-via-spool` only after
+  their durable delivery was confirmed.
+  An empty spool, a correlated prior drop, or a launch with no hook evidence
+  stays journaled with a manual-repair status. Stable recovery ingest keys retain the
+  exact session, agent, event kind, and sanitized event identity until
+  session/project deletion; an ordinary writer cannot preclaim one for another
+  event. Ordinary hook keys still expire after 30 days. An existing MCP
+  registration still degrades to no-recall during the outage rather than
+  blocking the session.
 - **Sessions**: because no lease exists there is no mutual exclusion against
   another launcher in the same checkout, so a degraded launch never adopts or
-  resumes a session implicitly. An explicit native session selector
-  (`claude --resume <id>`, `codex continue`, …) still resumes, because you named
-  the session; everything else starts a fresh session.
+  resumes a session implicitly. An explicit native session selector still
+  resumes the named session; before such a resume the launcher persists the
+  native adapter's exact pre-launch cursor, and recovery exports only records
+  after it. If that cursor cannot be proven, the launch remains usable but is
+  not journaled for automatic replay. Otherwise the launcher snapshots
+  checkout-local candidates before spawn and journals only when exactly one new
+  session appears. Ambiguous concurrent launches are not journaled and print
+  the manual `backfill --force --session <id>` recovery action.
 - **Auto-wire**: the first-launch hook install still happens (it is local and
   idempotent, and capture must spool offline), but no MCP entry is registered
   for the now-unreachable server and no completion sentinel is written, so the
@@ -552,17 +658,39 @@ URL and what the degraded run means, and launches the harness anyway:
   not an error.
 
 When the child exits, the launcher prints that the run was not recorded on the
-server and how many hook events remain spooled locally (oldest first by age).
-Spooled events are bounded: they are dropped after the configured number of
-failed drain passes (8 by default), 7 days of age, or the 10,000-file spool
-cap. For a planned outage set `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0` to disable
-only the attempt-count drops (see `docs/install.md`).
+server, how many hook events remain spooled locally, and that the run was
+journaled for `ai-memory recover`. The journal is capped at 256 entries;
+once full it refuses new entries with an actionable warning instead of evicting
+unrecovered work. It is written atomically as owner-only local state; Unix lock opens use
+`O_NOFOLLOW` and the atomic replacement rechecks the destination immediately
+before rename. Windows applies an owner-only ACL and rejects observed symlinks,
+but reparse-point race hardening still requires the PR `windows` CI lane before
+merge. Spooled events remain separately
+bounded: they are dropped after the configured number of failed drain passes
+(8 by default), 7 days of age, or the 10,000-file spool cap. For a planned
+outage set `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0` to disable only the
+attempt-count drops (see `docs/install.md`).
 
 If the server dies *during* a run, after the lease was acquired, the exit
-code is still preserved: the unimported transcript is reported as a warning
-with the exact `ai-memory finalize-session` command that repairs the record
-once the server is back, and the orphaned lease expires on its own within 90
-seconds.
+code is still preserved. The journal records the original run id, native
+session locator, absolute store path, and exit code; repository branch and path
+state are not persisted. Recovery retries validate the exact ordered semantic
+transcript interval and native identity, and omit a regenerated checkpoint, so
+repository changes during downtime are not claimed as the failed run's state and
+a successful finish cannot create a second checkpoint event.
+`ai-memory recover` uses the owner-authorized `/recover/finish` route to resume
+an expired original run only when no newer run superseded it; ordering is the
+explicit `(started_at, SQLite insertion order)` tuple, so timestamp ties cannot
+revive an older run. Another operator, a superseded run, and any finished-run
+payload that is not an exact replay of already indexed events/cursor/exit state
+remain refused.
+Successful entries are removed, while failed entries remain with a bounded
+sanitized reason. Each journal request and the whole journal pass have time
+budgets. A spool pass that drops anything is reported incomplete and keeps all
+journal entries; correlated entries are quarantined before that pass and can
+only be deleted after a later clean pass and exact transcript replay. If the
+server is still unreachable, `recover` exits successfully
+and prints the remaining spool/journal counts and startup guidance.
 
 To restore the strict behavior (fail with the usual "could not reach …"
 diagnosis and never start the agent), pass `--require-server`, set
@@ -604,7 +732,7 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Harness | Fresh native session | Returning native session | Read-only source |
 |---|---|---|---|
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
-| Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
+| Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl`, or the `rollout-*.jsonl.zst` copy Codex keeps of a rollout idle for a week (the plain file wins when both exist) |
 | OpenCode V1 | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only; selected when the exact launch executable reports major 1 |
 | OpenCode V2 | native default creation | `--session <id>` | same `opencode.db` filename, using the `session_v2`/`session_message` tables; selected when the exact launch executable reports major 2 |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
@@ -615,7 +743,8 @@ change does not add an atomic disk/SQL seal or change lease/retry policy.
 | Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
 | OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`, or the XDG session directory described below |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
-| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts only from `~/.gemini/antigravity-cli/history.jsonl` (assistant and tool steps come from lifecycle-hook capture) |
+| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts from `history.jsonl`, falling back to that conversation's bounded `brain/<id>/.system_generated/logs/transcript{,_full}.jsonl` for print mode (assistant and tool steps come from lifecycle-hook capture) |
+| GitHub Copilot CLI | generated `--session-id` | `--resume=<id>` | `$COPILOT_HOME/session-state/<uuid>/events.jsonl` (`COPILOT_HOME` defaults to `~/.copilot`) |
 
 OMP's agent directory is `~/.omp/agent` for the default profile and
 `~/.omp/profiles/<name>/agent` for a named profile. `PI_CONFIG_DIR` changes the
@@ -639,7 +768,8 @@ The default executable is `command-code` on Unix and `cmdc` on native Windows;
 The experimental unsandboxed Mod API is not used.
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
-Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
+Codex's `resume`, Antigravity's `--conversation` / `--continue`, or Copilot's
+`--resume` / `--continue` / `--session-id` / `--connect` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
 
@@ -769,14 +899,15 @@ the harness's native dangerous mode. The translation is Claude Code
 `--dangerously-bypass-approvals-and-sandbox`, OpenCode `--auto`, Pi `--approve`,
 Crush `--yolo`, Kimi Code `--yolo`, Command Code `--yolo`, Kiro CLI v2
 `--trust-all-tools`, Grok Build CLI `--yolo` (equivalent to its
-`--always-approve` option), and Antigravity CLI
-`--dangerously-skip-permissions`. Kiro v3 replaced the trust-all flag with
+`--always-approve` option), Antigravity CLI
+`--dangerously-skip-permissions`, and GitHub Copilot CLI `--yolo` (equivalent
+to its `--allow-all` option). Kiro v3 replaced the trust-all flag with
 `permissions.yaml`, so ai-memory prints a notice and adds no unverified flag.
 OMP currently needs no added flag. ai-memory does not add a duplicate when the
 translated native flag is already present.
 
 Managed support is intentionally narrower than the general integration matrix.
-Gemini CLI, Devin CLI, Cursor, and other agents may
+IBM Bob, Gemini CLI, Devin CLI, Cursor, and other agents may
 have MCP or lifecycle-hook support without native managed resume. Contributors
 adding another managed harness must follow the [managed-harness contribution
 protocol](managed-harness-contributions.md), including read-only extraction,
@@ -927,6 +1058,36 @@ fails with a message saying so. The managed launcher accepts `antigravity`,
 Antigravity CLI v1.1.7. Antigravity is not part of the no-argument
 auto-detection set; name it explicitly.
 
+GitHub Copilot CLI keeps each session in
+`$COPILOT_HOME/session-state/<session-id>/` (`COPILOT_HOME` defaults to
+`~/.copilot`). Copilot officially accepts a caller-chosen UUID through
+`--session-id`, so a fresh launch generates one; a linked resume passes
+`--resume=<id>`, in the `=` form because `--resume` takes an optional value and
+would otherwise consume the next argument. A user-supplied `--resume`, `-r`,
+`--continue`, `--session-id`, or `--connect` is an explicit choice and is never
+overridden; a resume by session name or id prefix is resolved by Copilot and
+linked after the fact. Discovery reads the first `events.jsonl` record,
+`session.start`, and requires its `sessionId` to match the UUID directory name
+and its `context.cwd` to match the checkout. Export imports the typed
+`user.message` text (not the `transformedContent` copy carrying injected
+datetime and context), visible `assistant.message` text and `toolRequests`,
+the model-visible output of each `tool.execution_complete` (or the error
+message of a failed call), and successful `session.compaction_complete`
+summaries. System prompts, hidden reasoning (`reasoningText`,
+`reasoningOpaque`, `reasoningBlocks`), model message snapshots, hook output
+(where ai-memory's own startup packet is recorded), permission prompts, and
+session telemetry are excluded. The journal stayed append-only across resume
+and compaction in testing, but that is not documented, so the cursor stores a
+prefix hash and replays with content-hash event ids if the file is ever
+rewritten. Context is delivered by Copilot's existing SessionStart hook through
+its top-level `additionalContext`. `--yolo` maps to Copilot's native `--yolo`;
+an existing `--yolo` or `--allow-all` is not duplicated. The managed launcher
+accepts `copilot` and `copilot-cli`: `run` launches only command-line
+harnesses, so the bare name means the CLI here, while `install-mcp --client
+copilot` keeps meaning VS Code Copilot. The native contract was verified
+against GitHub Copilot CLI 1.0.92. Copilot is not part of the no-argument
+auto-detection set; name it explicitly.
+
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the global Crush JSON the launch
 would read (`$CRUSH_GLOBAL_CONFIG/crush.json`, else
@@ -1027,6 +1188,19 @@ If the outage exceeds one lease window, the original launcher may renew its run
 only while no newer launcher has claimed the workstream. A replacement prepare,
 cancel, finish, or destructive operation remains terminal for the old run.
 
+The outage wording is reserved for a server the launcher could not reach. When
+the server answers a heartbeat and rejects it, the notice carries the server's
+own reason instead. A lapsed timestamp alone is not that case: `heartbeat`
+renews any run whose state is still `active`, so the original launcher recovers
+its own lease after an outage or a host suspend. The rejection arrives once the
+run stops being active, because it was finished, cancelled, or expired by a
+later prepare. That last one is the common path on a workstation, since the
+first statement of every prepare expires each active run whose lease has
+already passed. A launcher that was suspended past its lease keeps renewing
+until any other `run` prepares a workstream, and then reads `managed run lease
+is not active` from a server that is reachable and idle. Reporting that as an
+outage would send the operator looking for a server that never went away.
+
 If the client is terminated without cleanup, such as with `kill -9`, its lease
 expires within 90 seconds. A later managed run starts from the last committed
 adapter cursor, so already linked native sessions can import the missing tail
@@ -1068,7 +1242,7 @@ atomic operation.
 
 
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
-Kimi Code, Command Code, Kiro, OMP, Grok, or Antigravity private stores. The
+Kimi Code, Command Code, Kiro, OMP, Grok, Antigravity, or Copilot private stores. The
 launched harness retains normal ownership of its own session writes. Adapters read only
 documented or observed local session formats. Provider credentials, encrypted
 content, system/developer prompt records, and hidden reasoning are not copied. The
@@ -1087,8 +1261,9 @@ checkout, or native harness session. If the source checkout path itself is
 renamed, absolute-path session locators used by Claude Code, Codex, OpenCode,
 Pi, Kimi Code (`state.json`'s `cwd` or legacy `workDir`), Command Code (v3
 header `cwd`), Kiro v2
-(`<uuid>.json`'s `cwd`), Kiro v3 (`session.json`'s `workspacePaths`), OMP, and
-Antigravity may still reference the old path; Crush's project-local `.crush`
+(`<uuid>.json`'s `cwd`), Kiro v3 (`session.json`'s `workspacePaths`), OMP,
+Antigravity, and Copilot (`session.start`'s `context.cwd`) may still reference
+the old path; Crush's project-local `.crush`
 database moves with the checkout.
 
 There is no portable, supported API that rewrites every harness's private
@@ -1105,7 +1280,7 @@ checkout to match exactly.
 
 The opt-in acceptance runner exercises launcher edge cases and then orchestrates
 the locally installed Claude, Codex, OpenCode, Pi, Crush, OMP, Kimi, Command
-Code, Grok, and Antigravity CLIs through one real workstream:
+Code, Grok, Antigravity, and Copilot CLIs through one real workstream:
 
 ```bash
 scripts/managed-workstream-acceptance.sh
@@ -1120,11 +1295,13 @@ copied settings. Crush uses its existing global provider configuration and an
 isolated project database. Kimi Code runs with an isolated `$KIMI_CODE_HOME`
 seeded with the operator's provider configuration. Command Code runs with an
 isolated `HOME` seeded only with `auth.json` and `config.json`. Antigravity runs
-with an isolated `HOME` seeded only with the operator's OAuth and settings files. The
+with an isolated `HOME` seeded only with the operator's OAuth and settings files.
+Copilot runs with an isolated `$COPILOT_HOME` seeded only with `config.json`. The
 deterministic phase also covers first-run adoption, bare-mode selection and
 empty-directory failure, wrapper `--yolo`, lease exclusion, Crush context
 cleanup, fake-mode Kimi and Command Code store/resume/import round trips, an
-Antigravity hook/link/resume round trip, a fake-mode Kiro v2
+Antigravity hook/link/resume round trip, a fake-mode Copilot
+store/hook/resume/import round trip, a fake-mode Kiro v2
 store/resume/import round trip,
 the equivalent Kiro v3 nested-store round trip with transparent engine recovery,
 private-trajectory exclusion, and the
@@ -1159,7 +1336,7 @@ report that exact endpoint as `sync_through` with `context_delivered = 1`. It
 does not require the model to quote a prior sentinel: Claude Code may
 externalize a large hook result to a file, and whether a model chooses to read
 that file is not a deterministic continuity signal. The deterministic fake
-Grok and Antigravity cross-harness fixtures exercise the same assertion helper
+Grok, Antigravity, and Copilot cross-harness fixtures exercise the same assertion helper
 without credentials or model calls.
 
 Set

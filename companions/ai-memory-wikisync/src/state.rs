@@ -50,6 +50,69 @@ pub struct PageState {
     /// Server ETag captured at that write, for `If-None-Match` revalidation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    /// Server version id (`/api/v1` `id`) at that write. Absent in state
+    /// written before conditional writes existed, which still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
+}
+
+/// Which server scope a baseline was recorded from (#1708).
+///
+/// The page map alone cannot say that a destination belongs to one project:
+/// pointing the same `--dest` at another project made every page of the first
+/// one look "deleted on the server", and `--propagate-deletes --apply` then
+/// removed those files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncScope {
+    /// Server origin the baseline was exported from.
+    pub server: String,
+    /// Workspace the baseline was exported from.
+    pub workspace: String,
+    /// Project the baseline was exported from.
+    pub project: String,
+}
+
+impl SyncScope {
+    /// Derive the scope of a run. The server origin is normalised the way the
+    /// client normalises it, so `http://host:49374/` and `http://host:49374`
+    /// are one scope.
+    #[must_use]
+    pub fn of(server: &str, workspace: &str, project: &str) -> Self {
+        Self {
+            server: server.trim_end_matches('/').to_owned(),
+            workspace: workspace.to_owned(),
+            project: project.to_owned(),
+        }
+    }
+}
+
+/// What a baseline says about the run asking to use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeCheck {
+    /// The baseline belongs to this run's scope.
+    Match,
+    /// The baseline predates scope recording (or is empty) and is taken over
+    /// by this run, which stamps its scope on the next save.
+    Adopted,
+    /// The baseline belongs to another scope. Reusing it would read that
+    /// scope's pages as deletions here.
+    Mismatch { recorded: SyncScope },
+}
+
+/// Compare a baseline with the run's scope.
+#[must_use]
+pub fn check_scope(state: &SyncState, scope: &SyncScope) -> ScopeCheck {
+    match &state.scope {
+        Some(recorded) if recorded != scope => ScopeCheck::Mismatch {
+            recorded: recorded.clone(),
+        },
+        Some(_) => ScopeCheck::Match,
+        // A file written before scopes existed carries no origin. With no
+        // pages it is empty and cannot mislead; with pages, the origin is
+        // unknown and taking it over is the behaviour every existing export
+        // already had, so it is adopted with a warning rather than refused.
+        None => ScopeCheck::Adopted,
+    }
 }
 
 /// The whole state file. `version` guards against silently misreading a
@@ -57,6 +120,10 @@ pub struct PageState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncState {
     pub version: u32,
+    /// Server scope this baseline was recorded from. Absent in state written
+    /// before #1708, which still loads and is adopted by the next save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<SyncScope>,
     pub pages: BTreeMap<String, PageState>,
 }
 
@@ -64,6 +131,7 @@ impl Default for SyncState {
     fn default() -> Self {
         Self {
             version: STATE_VERSION,
+            scope: None,
             pages: BTreeMap::new(),
         }
     }
@@ -193,6 +261,7 @@ mod tests {
         PageState {
             hash: hash.to_string(),
             etag: etag.map(str::to_owned),
+            page_id: None,
         }
     }
 
@@ -218,6 +287,25 @@ mod tests {
             names,
             vec![".gitignore".to_string(), "state.json".to_string()]
         );
+    }
+
+    #[test]
+    fn state_without_page_ids_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        fs::write(
+            state_path(&root),
+            r#"{"version":1,"pages":{"notes/a.md":{"hash":"h","etag":"\"e\""}}}"#,
+        )
+        .unwrap();
+        let state = load(&root).unwrap();
+        assert_eq!(state.pages["notes/a.md"].page_id, None);
+
+        let mut with_id = state.clone();
+        with_id.pages.get_mut("notes/a.md").unwrap().page_id = Some("v1".to_string());
+        save(&root, &with_id).unwrap();
+        assert_eq!(load(&root).unwrap(), with_id);
     }
 
     #[test]
@@ -249,11 +337,67 @@ mod tests {
 
         let future = SyncState {
             version: 99,
-            pages: BTreeMap::new(),
+            ..SyncState::default()
         };
         fs::write(state_path(&root), serde_json::to_string(&future).unwrap()).unwrap();
         let err = load(&root).unwrap_err().to_string();
         assert!(err.contains("version"), "{err}");
+    }
+
+    #[test]
+    fn a_baseline_records_its_scope_and_refuses_another_one() {
+        let scope = SyncScope::of("http://host:49374", "demo", "a");
+        let mut state = SyncState::default();
+        assert_eq!(check_scope(&state, &scope), ScopeCheck::Adopted);
+
+        state.scope = Some(scope.clone());
+        state.pages.insert("notes/a.md".into(), page("hash", None));
+        assert_eq!(check_scope(&state, &scope), ScopeCheck::Match);
+        // A trailing slash is the same server.
+        assert_eq!(
+            check_scope(&state, &SyncScope::of("http://host:49374/", "demo", "a")),
+            ScopeCheck::Match
+        );
+
+        // Another project on the same server is a different scope (#1708).
+        let other = SyncScope::of("http://host:49374", "demo", "b");
+        assert_eq!(
+            check_scope(&state, &other),
+            ScopeCheck::Mismatch {
+                recorded: scope.clone()
+            }
+        );
+        // So is another server with the same names.
+        let elsewhere = SyncScope::of("http://other:49374", "demo", "a");
+        assert!(matches!(
+            check_scope(&state, &elsewhere),
+            ScopeCheck::Mismatch { .. }
+        ));
+    }
+
+    /// A state file written before scopes existed still loads, and the next
+    /// save stamps the scope so the window closes after one run.
+    #[test]
+    fn legacy_state_loads_and_is_stamped_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        fs::write(
+            state_path(&root),
+            r#"{"version":1,"pages":{"notes/a.md":{"hash":"h"}}}"#,
+        )
+        .unwrap();
+
+        let mut state = load(&root).unwrap();
+        assert!(state.scope.is_none());
+        let scope = SyncScope::of("http://host:49374", "demo", "a");
+        assert_eq!(check_scope(&state, &scope), ScopeCheck::Adopted);
+
+        state.scope = Some(scope.clone());
+        save(&root, &state).unwrap();
+        let reloaded = load(&root).unwrap();
+        assert_eq!(reloaded.scope.as_ref(), Some(&scope));
+        assert_eq!(check_scope(&reloaded, &scope), ScopeCheck::Match);
     }
 
     #[test]

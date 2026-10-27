@@ -3,8 +3,11 @@
 > Moved verbatim from the README front page; the scenarios and walkthroughs are unchanged.
 
 - **"Quit Claude Code and continue the same work in Codex."** Use the optional
-  managed launcher when you want native session resume plus the portable visible
-  history, not only a summary handoff:
+  managed launcher when you want native session resume plus portable visible
+  history, not only a summary handoff. On a real harness switch the launcher
+  also gives the receiving child a private local history dossier through
+  `AI_MEMORY_PREVIOUS_SESSION_HISTORY`, so "continue from where we left off"
+  can recover exact visible details omitted by the bounded startup packet:
 
   ```bash
   cd /path/to/project
@@ -38,6 +41,13 @@
   # `memory_handoff_cancel` needs to clear a stale one.
   ai-memory handoffs
   ```
+
+  The dossier is produced by the previous harness's checkout-validated,
+  read-only adapter, is marked as untrusted historical data, and is deleted
+  when the managed child exits. Its path and contents never go to the server.
+  Hidden reasoning and unsupported/private native records remain excluded. If
+  the prior native store lives on another machine or was removed, the portable
+  server ledger and handoff remain the fallback.
 
 - **"Pick the project instead of remembering where it lives."** Start from a
   directory containing your checkouts and choose the checkout before the
@@ -82,7 +92,7 @@
   ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
   that recovery for one harness. Managed mode currently covers Claude Code,
   Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP,
-  Grok Build CLI, and Antigravity CLI; direct harness launches remain unchanged. See
+  Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI; direct harness launches remain unchanged. See
   [Managed cross-harness workstreams](managed-workstreams.md).
 - **"Just put me back where I was."** From any directory, with no name to
   type and no list to read:
@@ -117,15 +127,22 @@
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
-  cannot show that text before the first prompt. The first tool's
-  `PostToolUse` hook adds it as `additionalContext`. If the session never
-  calls a tool, ask Grok to call `memory_handoff_accept`. Zero still must
-  call `memory_handoff_accept`.
+  cannot show that text before the first prompt: the first-turn rule
+  `install-hooks --agent grok` installs has it call `memory_handoff_list`
+  first, and that tool's `PostToolUse` hook adds the handoff as
+  `additionalContext`. Without the rule, ask Grok to list and then accept the
+  handoff. Zero still must call `memory_handoff_list` then
+  `memory_handoff_accept`.
+- **"What changed in this project recently?"** From a shell, `ai-memory recent`
+  lists the newest wiki pages, with RFC 3339 timestamps and relative ages.
+  Add `--global` to cover every project, or `--json` for a machine-readable
+  list. The agent's `memory_recent` tool is the same recency listing inside a
+  session.
 - **"What did we decide about X six weeks ago?"** Use `memory_query X` from
   the agent for FTS5 fused with entity matches and linked-page expansion (plus
   vector similarity when an embedder is configured). For a quick terminal-only
-  FTS5 lookup, use `ai-memory search X`; that admin command does not run the
-  hybrid streams. Pages are
+  FTS5 lookup, use `ai-memory search X` (add `--global` to search every
+  project); that admin command does not run the hybrid streams. Pages are
   LLM-consolidated, so the hit is a coherent decision page, not a raw
   chat log. Pass `explain: true` to see why each hit ranked where it
   did in project or explicit-scope retrieval. Cross-project

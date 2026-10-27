@@ -26,7 +26,7 @@ use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 /// points at the `_global` project in the default workspace. Wikilinks
 /// inside fenced code blocks and inline code are left as literal text.
 #[must_use]
-pub fn render(body: &str, workspace: &str, project: &str) -> String {
+pub fn render_document(body: &str, workspace: &str, project: &str) -> Rendered {
     // Rewrite `[[wikilinks]]` into ordinary markdown links BEFORE parsing.
     // pulldown-cmark consumes `[...]` as reference-link syntax, so the brackets
     // never survive as a single text node — preprocessing the source is the
@@ -35,11 +35,40 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
     let body = preprocess_wikilinks(body, workspace, project);
 
     let parser = Parser::new_ext(&body, options());
-    let with_headings = HeadingIdAssigner::new(parser);
-    let sanitized = with_headings.map(|event| sanitize_event(event, workspace, project));
+    let mut with_headings = HeadingIdAssigner::new(parser);
+    let sanitized = with_headings
+        .by_ref()
+        .map(|event| sanitize_event(event, workspace, project));
     let mut out = String::with_capacity(body.len() + body.len() / 4);
     html::push_html(&mut out, sanitized);
-    out
+    Rendered {
+        html: out,
+        outline: with_headings.outline,
+    }
+}
+
+/// [`render_document`] without the outline.
+#[cfg(test)]
+fn render(body: &str, workspace: &str, project: &str) -> String {
+    render_document(body, workspace, project).html
+}
+
+/// A rendered page body and the headings it contains.
+pub struct Rendered {
+    /// The sanitized HTML.
+    pub html: String,
+    /// Every heading in document order, with the `id` the HTML carries.
+    pub outline: Vec<OutlineEntry>,
+}
+
+/// One heading of a rendered page.
+pub struct OutlineEntry {
+    /// Heading level, 1 to 6.
+    pub level: u8,
+    /// Plain text of the heading.
+    pub text: String,
+    /// The `id` attribute rendered on the heading.
+    pub id: String,
 }
 
 /// The GFM-ish parser options the page renders with. The wikilink
@@ -85,10 +114,22 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
         Some(i) => (&trimmed[..i], &trimmed[i..]),
         None => (trimmed, ""),
     };
-    if path_part.is_empty() || path_part.contains("..") {
-        return dest; // don't rewrite traversal; safe_url/router will reject
+    let Some(decoded) = ai_memory_wiki::decode_markdown_destination_path(path_part) else {
+        return CowStr::Borrowed("#");
+    };
+    let decoded_path = decoded.as_ref();
+    if decoded_path.is_empty()
+        || decoded_path.contains("..")
+        || decoded_path.starts_with('/')
+        || decoded_path.contains(['\\', ':'])
+    {
+        return if decoded_path == path_part {
+            dest
+        } else {
+            CowStr::Borrowed("#")
+        };
     }
-    let mut path_part = path_part.trim_end_matches('/');
+    let mut path_part = decoded_path.trim_end_matches('/');
     while let Some(rest) = path_part.strip_prefix("./") {
         path_part = rest;
     }
@@ -240,11 +281,18 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     // Reject non-page extensions, normalise the `.md` suffix, then rely on
     // the canonical page-path validator for traversal, absolute paths,
     // Windows prefixes, backslashes, and empty segments.
+    //
+    // A directory target (trailing slash, empty last segment) and a
+    // stem-less `.md` cannot name a page; leaving them as literal text
+    // aligns web rendering with the wiki link extractor.
     let path = path_part.trim();
     if path.is_empty() {
         return None;
     }
     let last_segment = path.rsplit('/').next().unwrap_or("");
+    if last_segment.is_empty() || last_segment == ".md" {
+        return None;
+    }
     let path = if last_segment.contains('.') {
         if !path.ends_with(".md") {
             return None;
@@ -351,6 +399,7 @@ struct HeadingIdAssigner<'a, I> {
     iter: I,
     slugger: HeadingSlugger,
     queue: VecDeque<Event<'a>>,
+    outline: Vec<OutlineEntry>,
 }
 
 impl<'a, I: Iterator<Item = Event<'a>>> HeadingIdAssigner<'a, I> {
@@ -359,6 +408,7 @@ impl<'a, I: Iterator<Item = Event<'a>>> HeadingIdAssigner<'a, I> {
             iter,
             slugger: HeadingSlugger::default(),
             queue: VecDeque::new(),
+            outline: Vec::new(),
         }
     }
 }
@@ -415,6 +465,11 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
                     Some(custom) => self.slugger.deduplicate(custom.as_ref()),
                     None => self.slugger.slugify(&text),
                 };
+                self.outline.push(OutlineEntry {
+                    level: level as u8,
+                    text: text.trim().to_owned(),
+                    id: id_str.clone(),
+                });
                 self.queue.push_back(Event::Start(Tag::Heading {
                     level,
                     id: Some(CowStr::Boxed(id_str.into_boxed_str())),
@@ -654,28 +709,14 @@ fn has_external_or_unsafe_scheme(target: &str) -> bool {
         || lower.starts_with("file:")
 }
 
-/// Escape text for insertion into an HTML template while preserving the
-/// fixed `<mark>` tags emitted by SQLite FTS snippets.
+/// Escape an internal FTS snippet for insertion into an HTML template.
+///
+/// SQLite wraps matches in control delimiters that the durable sanitizer
+/// forbids in page content. Only those unforgeable delimiters become
+/// `<mark>` tags; literal markup from a page is always escaped.
 #[must_use]
 pub fn escape_snippet(snippet: &str) -> String {
-    escape_html(snippet)
-        .replace("&lt;mark&gt;", "<mark>")
-        .replace("&lt;/mark&gt;", "</mark>")
-}
-
-fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
+    ai_memory_store::highlighted_snippet_html(snippet)
 }
 
 /// Drop the leading H1 from a markdown body when it repeats `title`.
@@ -856,9 +897,43 @@ mod tests {
 
     #[test]
     fn escapes_search_snippet_but_keeps_marks() {
-        let out = escape_snippet("<script>x</script> <mark>hit</mark>");
+        let out = escape_snippet(&format!(
+            "<script>x</script> {}hit{}",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        ));
         assert!(out.contains("&lt;script&gt;x&lt;/script&gt;"));
         assert!(out.contains("<mark>hit</mark>"));
+    }
+
+    #[test]
+    fn a_literal_mark_tag_in_page_text_stays_text() {
+        assert_eq!(
+            escape_snippet("use <mark> here <mark>hit</mark>"),
+            "use &lt;mark&gt; here &lt;mark&gt;hit&lt;/mark&gt;"
+        );
+        assert_eq!(escape_snippet("see <mark> here"), "see &lt;mark&gt; here");
+        assert_eq!(escape_snippet("a </mark> b"), "a &lt;/mark&gt; b");
+        let highlighted = format!(
+            "{}a{} x {}b{}",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END,
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        );
+        assert_eq!(
+            escape_snippet(&highlighted),
+            "<mark>a</mark> x <mark>b</mark>"
+        );
+        let escaped_inside = format!(
+            "{}a&b{} <script>",
+            ai_memory_store::FTS_HIGHLIGHT_START,
+            ai_memory_store::FTS_HIGHLIGHT_END
+        );
+        assert_eq!(
+            escape_snippet(&escaped_inside),
+            "<mark>a&amp;b</mark> &lt;script&gt;"
+        );
     }
 
     #[test]
@@ -935,6 +1010,53 @@ mod tests {
         assert_eq!(strip_leading_h1("Title\n=====", "Title"), "");
         assert_eq!(strip_leading_h1("Title\r\n=====\r", "Title"), "");
         assert_eq!(strip_leading_h1("\r\n\r\nTitle\r\n=====", "Title"), "");
+    }
+
+    #[test]
+    fn markdown_url_destinations_are_decoded_once_before_route_encoding() {
+        let html = render(
+            "[space](notes/my%20note.md#part) [literal percent](notes/my%2520note.md) \
+             [separator](notes%2Fmy%20note.md) [unicode](notes/%E6%97%A5%E6%9C%AC.md)",
+            "default",
+            "scratch",
+        );
+        for href in [
+            "w/default/scratch/p/notes/my%20note.md#part",
+            "w/default/scratch/p/notes/my%2520note.md",
+            "w/default/scratch/p/notes/%E6%97%A5%E6%9C%AC.md",
+        ] {
+            assert!(html.contains(href), "{html}");
+        }
+        let wiki = render("[[notes/my%20note.md]]", "default", "scratch");
+        assert!(
+            wiki.contains("w/default/scratch/p/notes/my%2520note.md"),
+            "{wiki}"
+        );
+    }
+
+    #[test]
+    fn decoded_markdown_destinations_cannot_change_the_web_scope() {
+        for destination in [
+            "%2e%2e/secret.md",
+            "%2Fadmin/backup",
+            "notes%5Csecret.md",
+            "other%3Anotes/secret.md",
+            "%68ttps%3A%2F%2Fexample.com/secret.md",
+            "notes/%FF.md",
+            "notes/%00.md",
+        ] {
+            let html = render(&format!("[note](<{destination}>)"), "default", "scratch");
+            assert!(html.contains("href=\"#\""), "{destination}: {html}");
+        }
+        let html = render(
+            "[note](%77/foreign/project/p/secret.md)",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains("w/default/scratch/p/w/foreign/project/p/secret.md"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1111,6 +1233,23 @@ mod tests {
             "scratch",
         );
         assert!(!d.contains("<a href"), "invalid page path: {d}");
+    }
+
+    #[test]
+    fn wikilink_directory_and_stemless_targets_stay_literal() {
+        // A trailing slash (directory target) or a stem-less `.md` cannot
+        // name a page; rewrite must not emit broken 404 links.
+        let html = render(
+            "[[notes/]] [[notes/.md]] [[.md]] [[other:notes/]] [[notes/|Folder]]",
+            "default",
+            "scratch",
+        );
+        assert!(!html.contains("<a href"), "no linkified targets: {html}");
+        assert!(html.contains("[[notes/]]"));
+        assert!(html.contains("[[notes/.md]]"));
+        assert!(html.contains("[[.md]]"));
+        assert!(html.contains("[[other:notes/]]"));
+        assert!(html.contains("[[notes/|Folder]]"));
     }
 
     /// A `~~~` fence must NOT be closed by a `` ``` `` line and vice
@@ -1384,6 +1523,24 @@ mod tests {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
             "heading id must match ^[a-z0-9_-]+$, got: {id}"
         );
+    }
+
+    #[test]
+    fn outline_ids_are_the_ids_rendered_on_the_headings() {
+        let md = "## Intro\n\ntext\n\n### Intro\n\n## Intro\n\n## `Code` & more";
+        let rendered = render_document(md, "default", "scratch");
+        let ids: Vec<&str> = rendered.outline.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["intro", "intro-1", "intro-2", "code-more"]);
+        let levels: Vec<u8> = rendered.outline.iter().map(|h| h.level).collect();
+        assert_eq!(levels, [2, 3, 2, 2]);
+        assert_eq!(rendered.outline[3].text, "Code & more");
+        for id in ids {
+            assert!(
+                rendered.html.contains(&format!(r#" id="{id}">"#)),
+                "id {id} missing: {}",
+                rendered.html
+            );
+        }
     }
 
     #[test]

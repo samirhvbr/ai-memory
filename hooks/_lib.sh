@@ -61,11 +61,18 @@ ai_memory_find_marker() {
 # tables). Returns the first match or nothing. Ignores comments and
 # blank lines by construction (the regex only matches the `key = "..."`
 # shape).
+ai_memory_strip_utf8_bom() {
+    # Byte spelling keeps this portable across GNU/BSD sed and the awk images
+    # used in CI; LC_ALL=C makes the three bytes ordinary pattern characters.
+    LC_ALL=C sed "1s/^$(printf '\357\273\277')//"
+}
+
 ai_memory_parse_toml_key() {
     file="$1"; key="$2"
     [ -f "$file" ] || return 0
-    sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" \
-        "$file" | head -n 1
+    ai_memory_strip_utf8_bom <"$file" \
+        | sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" \
+        | head -n 1
 }
 
 # Like ai_memory_parse_toml_key but also accepts a BARE value
@@ -76,8 +83,9 @@ ai_memory_parse_toml_key() {
 ai_memory_parse_toml_flag() {
     file="$1"; key="$2"
     [ -f "$file" ] || return 0
-    sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?.*/\1/p" \
-        "$file" | head -n 1 | sed 's/[[:space:]]*$//'
+    ai_memory_strip_utf8_bom <"$file" \
+        | sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*)\"?.*/\1/p" \
+        | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
@@ -104,7 +112,8 @@ ai_memory_marker_declares_settings() {
     for key in workspace project project_strategy drop_subagent_captures identity identity_style; do
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
-    LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' "$file" && return 0
+    ai_memory_strip_utf8_bom <"$file" \
+        | LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' && return 0
     ai_memory_marker_declares_server "$file" && return 0
     for key in default_global inject_on_session_start max_chars contribute consume; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
@@ -276,6 +285,45 @@ ai_memory_extract_session_id() {
             return 0
         fi
     done
+}
+
+# True when the payload claims to be a subagent/child session: a known marker
+# key at the TOP LEVEL holding a non-empty string. Parity with the native
+# router (`commands/hook.rs::payload_is_subagent`) and the PowerShell
+# `Test-AiMemorySubagentPayload`, both of which read keyed values. The depth
+# walk is what makes it a payload check rather than a text search: tool input
+# and tool output routinely quote these key names (reading a source file that
+# names them is enough), and a session must not lose its handoff over that.
+ai_memory_payload_is_subagent() {
+    printf '%s' "${1:-$(cat)}" | LC_ALL=C awk '
+        { buf = buf $0 "\n" }
+        END {
+            split("subagentType subagent_type agent_type agent_id parentSessionId", names, " ")
+            for (n in names) marker[names[n]] = 1
+            len = length(buf)
+            depth = 0
+            want = "key"
+            for (i = 1; i <= len; i++) {
+                c = substr(buf, i, 1)
+                if (c == "{" || c == "[") { depth++; if (depth == 1) want = "key"; continue }
+                if (c == "}" || c == "]") { depth--; continue }
+                if (c == ",") { if (depth == 1) want = "key"; continue }
+                if (c != "\"") continue
+                tok = ""
+                for (i++; i <= len; i++) {
+                    c = substr(buf, i, 1)
+                    if (c == "\\") { tok = tok substr(buf, i, 2); i++; continue }
+                    if (c == "\"") break
+                    tok = tok c
+                }
+                if (depth != 1) continue
+                if (want == "key") { key = tok; want = "value"; continue }
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", tok)
+                if (marker[key] && tok != "") exit 0
+                want = "key"
+            }
+            exit 1
+        }'
 }
 
 # Antigravity's PreInvocation hook fires before every model call. Only the
@@ -549,7 +597,7 @@ ai_memory_aliases_json_value() {
 
 ai_memory_aliases_json() {
     [ -f "$1" ] || return 0
-    _ai_alias_body=$(LC_ALL=C awk '
+    _ai_alias_body=$(ai_memory_strip_utf8_bom <"$1" | LC_ALL=C awk '
         BEGIN { table = 0; count = 0; bad = 0 }
         {
             line = $0
@@ -572,7 +620,7 @@ ai_memory_aliases_json() {
             if (bad) print "invalid"
             else if (count == 1) print body
         }
-    ' "$1")
+    ')
     [ "$_ai_alias_body" = "invalid" ] && { printf 'invalid'; return 0; }
     [ -n "$_ai_alias_body" ] || return 0
     _ai_alias_trimmed=$(printf '%s' "$_ai_alias_body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -823,7 +871,10 @@ ai_memory_state_dir() {
     elif [ -n "${XDG_DATA_HOME:-}" ]; then
         printf '%s/ai-memory' "$XDG_DATA_HOME"
     elif [ -n "${HOME:-}" ]; then
-        printf '%s/.local/share/ai-memory' "$HOME"
+        case "$(uname -s 2>/dev/null || printf '')" in
+            Darwin) printf '%s/Library/Application Support/ai-memory' "$HOME" ;;
+            *) printf '%s/.local/share/ai-memory' "$HOME" ;;
+        esac
     else
         printf '.ai-memory'
     fi
@@ -877,7 +928,7 @@ ai_memory_clear_session_id() {
 # Path of the `Authorization:` header file `install-hooks --apply` writes
 # (0600, inside the 0700 data dir). Printed only when readable.
 ai_memory_auth_header_file() {
-    _amhf="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ai-memory}/auth-header"
+    _amhf="$(ai_memory_state_dir)/auth-header"
     [ -r "$_amhf" ] && printf '%s' "$_amhf"
 }
 
@@ -924,7 +975,7 @@ ai_memory_post_hook() {
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --noproxy '*' --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
@@ -932,13 +983,13 @@ ai_memory_post_hook() {
     elif [ -n "$_amhdr" ]; then
         # `-H @file`: curl reads the header from disk, so the bearer never
         # appears in curl's argv the way an inline `-H` would (#552).
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --noproxy '*' --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             -H @"$_amhdr" \
             --data-binary @- 2>/dev/null) || _amcode=000
     else
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --noproxy '*' --max-time 0.2 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
             -w '%{http_code}' -X POST "$_amurl" \
             -H "Content-Type: application/json" \
             --data-binary @- 2>/dev/null) || _amcode=000
@@ -961,18 +1012,27 @@ ai_memory_post_hook() {
 # Every request in this bundle sends `X-AI-Memory-Client`: an unauthenticated
 # server reached through a non-loopback host name refuses a handoff fetch
 # without it, because a web page cannot add that header to a request it makes.
+#
+# The GET claims the newest open handoff in whatever project the server
+# resolves. `ai_memory_marker_qs` adds `&cwd=` whenever the payload named a
+# directory, so a URL without it names no project: the server would fall back
+# to its default or the caller's last active project, and the claim could
+# consume another repository's handoff. Fetch nothing then; the handoff stays
+# open for memory_handoff_accept (parity with the native hook).
 ai_memory_get_handoff() {
     case "$1" in
         *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) return 0 ;;
+        *'&cwd='*) ;;
+        *) return 0 ;;
     esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
+        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
     elif [ -n "$_amhdr" ]; then
-        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
+        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
     else
-        curl -s --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
+        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
     fi
 }
 
@@ -1190,13 +1250,13 @@ ai_memory_drain_spool() {
         if [ -n "$_amdtok" ]; then
             _amdhdr="$_amddir/.drain-header.$$"
             (umask 077; printf 'Authorization: Bearer %s\n' "$_amdtok" >"$_amdhdr") 2>/dev/null || continue
-            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --noproxy '*' --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
                 -w '%{http_code}' -X POST "$_amdurl" \
                 -H "Content-Type: application/json" -H @"$_amdhdr" \
                 --data-binary @- 2>/dev/null) || _amdcode=000
             rm -f "$_amdhdr" 2>/dev/null || true
         else
-            _amdcode=$(printf '%s' "$_amdbody" | curl -s --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
+            _amdcode=$(printf '%s' "$_amdbody" | curl -s --noproxy '*' --max-time 2.0 -H "X-AI-Memory-Client: hook-sh" -o /dev/null \
                 -w '%{http_code}' -X POST "$_amdurl" \
                 -H "Content-Type: application/json" \
                 --data-binary @- 2>/dev/null) || _amdcode=000

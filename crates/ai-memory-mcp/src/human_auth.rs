@@ -328,6 +328,14 @@ fn json_err(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
+fn internal_err(error: impl std::fmt::Display) -> Response {
+    tracing::error!(error = %error, "human authentication request failed");
+    json_err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "authentication unavailable",
+    )
+}
+
 fn peer_ip(headers: &HeaderMap, extensions: &axum::http::Extensions, cidrs: &[Cidr]) -> IpAddr {
     let peer = extensions
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -391,14 +399,8 @@ fn legacy_basic_password(headers: &HeaderMap) -> Option<String> {
     Some(password.to_string())
 }
 
-fn legacy_browser_credential(headers: &HeaderMap) -> Option<(String, bool)> {
-    legacy_basic_password(headers)
-        .map(|token| (token, true))
-        .or_else(|| cookie_value(headers, LEGACY_AUTH_COOKIE).map(|token| (token, false)))
-}
-
-fn legacy_cookie(token: &str, secure: bool) -> String {
-    set_cookie(LEGACY_AUTH_COOKIE, token, true, 2_592_000, secure)
+fn legacy_browser_credential(headers: &HeaderMap) -> Option<String> {
+    legacy_basic_password(headers).or_else(|| cookie_value(headers, LEGACY_AUTH_COOKIE))
 }
 
 fn unauthorized_legacy_browser() -> Response {
@@ -420,7 +422,7 @@ async fn human_auth_configured(state: &AuthState) -> Result<bool, Response> {
         .reader
         .bootstrap_completed()
         .await
-        .map_err(|error| json_err(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?
+        .map_err(internal_err)?
     {
         return Ok(true);
     }
@@ -428,7 +430,7 @@ async fn human_auth_configured(state: &AuthState) -> Result<bool, Response> {
         .reader
         .any_password_hash()
         .await
-        .map_err(|error| json_err(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))
+        .map_err(internal_err)
 }
 
 fn set_cookie(name: &str, value: &str, http_only: bool, max_age: i64, secure: bool) -> String {
@@ -528,7 +530,7 @@ async fn password_collides_with_api_key(
         .reader
         .token_hash_exists(hash)
         .await
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
+        .map_err(internal_err)
 }
 
 async fn issue_cookies(
@@ -538,10 +540,8 @@ async fn issue_cookies(
     expected_role: UserRole,
     expected_must_change: bool,
 ) -> Result<(String, String, i64), Response> {
-    let secret = ai_memory_store::web_sessions::generate_session_secret()
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    let csrf = ai_memory_store::web_sessions::generate_csrf_secret()
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let secret = ai_memory_store::web_sessions::generate_session_secret().map_err(internal_err)?;
+    let csrf = ai_memory_store::web_sessions::generate_csrf_secret().map_err(internal_err)?;
     let session_hash = hash_session_secret(&secret);
     let csrf_hash = hash_session_secret(&csrf);
     let issued = runtime
@@ -649,7 +649,7 @@ async fn handle_login(
         .await
     {
         Ok(v) => v,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
 
     let fail = || {
@@ -671,7 +671,7 @@ async fn handle_login(
         Err(ai_memory_store::StoreError::InvalidState(msg)) if msg.contains("saturated") => {
             return json_err(StatusCode::TOO_MANY_REQUESTS, "kdf saturated");
         }
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if !ok {
         return fail();
@@ -766,7 +766,7 @@ async fn handle_recovery(
         Err(ai_memory_store::StoreError::InvalidState(msg)) if msg.contains("saturated") => {
             return json_err(StatusCode::TOO_MANY_REQUESTS, "kdf saturated");
         }
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if let Err(e) = runtime
         .writer
@@ -778,7 +778,7 @@ async fn handle_recovery(
         )
         .await
     {
-        return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        return internal_err(e);
     }
     tracing::info!(username = %runtime.root_username, "root recovered via break-glass");
     let mut resp = StatusCode::NO_CONTENT.into_response();
@@ -860,7 +860,7 @@ async fn handle_change_password(
     {
         Ok(Some(u)) => u,
         Ok(None) => return json_err(StatusCode::UNAUTHORIZED, "auth required"),
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let Some(phc) = login.password_hash.clone() else {
         return json_err(StatusCode::UNAUTHORIZED, "auth required");
@@ -869,7 +869,7 @@ async fn handle_change_password(
         .await
     {
         Ok(v) => v,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if !ok {
         return json_err(StatusCode::UNAUTHORIZED, "invalid credentials");
@@ -881,15 +881,15 @@ async fn handle_change_password(
     }
     let new_phc = match ai_memory_store::password::hash_password(body.new_password).await {
         Ok(h) => h,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let secret = match ai_memory_store::web_sessions::generate_session_secret() {
         Ok(s) => s,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let csrf = match ai_memory_store::web_sessions::generate_csrf_secret() {
         Ok(s) => s,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     if let Err(e) = runtime
         .writer
@@ -903,7 +903,8 @@ async fn handle_change_password(
         )
         .await
     {
-        return json_err(StatusCode::CONFLICT, &e.to_string());
+        tracing::warn!(error = %e, user_id = %session.user.id, "password change lost its concurrency check");
+        return json_err(StatusCode::CONFLICT, "credentials changed; retry");
     }
     let mut resp = StatusCode::NO_CONTENT.into_response();
     append_session_cookies(
@@ -967,7 +968,7 @@ async fn handle_session_introspect(
     let hash = hash_session_secret(&body.session);
     let live = match runtime.reader.find_live_session_by_hash(hash).await {
         Ok(v) => v,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_err(e),
     };
     let Some(live) = live else {
         return Json(IntrospectResponse {
@@ -1083,21 +1084,20 @@ pub async fn require_dual_auth(
         if req.method() != Method::GET {
             return crate::auth::unauthorized_bearer();
         }
-        let had_legacy_cookie = cookie_value(req.headers(), LEGACY_AUTH_COOKIE).is_some();
-        let Some((provided, from_basic)) = legacy_browser_credential(req.headers()) else {
+        // A Basic sign-in mints no cookie: the browser resends the cached
+        // Basic credentials on every same-origin request by itself, and a
+        // persistent cookie would park the raw root bearer on disk for 30
+        // days, sent over plain HTTP off loopback. A cookie an older build
+        // set is still accepted until human auth retires it.
+        let Some(provided) = legacy_browser_credential(req.headers()) else {
             return unauthorized_legacy_browser();
         };
         match crate::auth::authenticate_token(&state, &mut req, &provided, false).await {
             Ok(crate::auth::BearerAuth::Authenticated) => {
                 req.extensions_mut().insert(state.clone());
-                let mut response = next.run(req).await;
-                if from_basic
-                    && !had_legacy_cookie
-                    && let Ok(cookie) = legacy_cookie(&provided, state.secure_cookie()).parse()
-                {
-                    response.headers_mut().append(header::SET_COOKIE, cookie);
-                }
-                return response;
+                req.extensions_mut()
+                    .insert(ai_memory_core::LegacyBrowserAuth);
+                return next.run(req).await;
             }
             Err(response) => return response,
             Ok(crate::auth::BearerAuth::Absent | crate::auth::BearerAuth::Rejected) => {
@@ -1164,7 +1164,7 @@ async fn load_session(
         .reader
         .find_live_session_by_hash(hash)
         .await
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .map_err(internal_err)?
         .ok_or_else(|| json_err(StatusCode::UNAUTHORIZED, "auth required"))?;
     if live.user.disabled_at.is_some() {
         return Err(json_err(StatusCode::UNAUTHORIZED, "auth required"));
@@ -1564,6 +1564,122 @@ mod tests {
         (tmp, state, writer)
     }
 
+    /// A fresh bearer-only server signs a browser in through Basic. That
+    /// sign-in must not park the root bearer in a cookie: none was needed
+    /// (the browser resends Basic itself), and the old 30-day cookie held the
+    /// raw token, `Secure` only when `secure_cookie` was on. Control: the
+    /// Basic GET is still served, and the bearer still authenticates.
+    #[tokio::test]
+    async fn a_basic_sign_in_mints_no_cookie_holding_the_root_bearer() {
+        let (_tmp, state, _writer) = legacy_transition_fixture().await;
+        let router = dual_router(state);
+
+        let basic = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", legacy_basic("legacy-root-token"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(basic.status(), StatusCode::OK, "Basic sign-in is served");
+        for value in basic.headers().get_all(header::SET_COOKIE) {
+            let value = value.to_str().unwrap();
+            assert!(
+                !value.contains("legacy-root-token"),
+                "no cookie may carry the root bearer: {value}"
+            );
+        }
+        assert!(set_cookie_value(basic.headers(), LEGACY_AUTH_COOKIE).is_none());
+
+        let bearer = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", "Bearer legacy-root-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bearer.status(),
+            StatusCode::OK,
+            "the bearer API still works"
+        );
+    }
+
+    /// Only the legacy browser path is marked read-only, so `/web/pending`
+    /// can hide controls that would post and fail. The marker never widens
+    /// that path: a Basic POST is still refused. Control: the root bearer is
+    /// not marked, because a POST with it succeeds.
+    #[tokio::test]
+    async fn only_a_legacy_browser_credential_is_marked_read_only() {
+        async fn echo_marker(
+            marker: Option<axum::Extension<ai_memory_core::LegacyBrowserAuth>>,
+        ) -> &'static str {
+            if marker.is_some() {
+                "legacy"
+            } else {
+                "unmarked"
+            }
+        }
+        let (_tmp, state, _writer) = legacy_transition_fixture().await;
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(echo_marker).post(echo_marker))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state,
+                require_dual_auth,
+            ));
+        let send = |method: Method, header: (&'static str, String)| {
+            let router = router.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri("/probe")
+                            .header(header.0, header.1)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+
+        let basic = ("authorization", legacy_basic("legacy-root-token"));
+        let cookie = ("cookie", format!("{LEGACY_AUTH_COOKIE}=legacy-root-token"));
+        let bearer = ("authorization", "Bearer legacy-root-token".to_owned());
+
+        assert_eq!(
+            send(Method::GET, basic.clone()).await,
+            (StatusCode::OK, "legacy".into())
+        );
+        assert_eq!(
+            send(Method::GET, cookie).await,
+            (StatusCode::OK, "legacy".into())
+        );
+        assert_eq!(
+            send(Method::GET, bearer.clone()).await,
+            (StatusCode::OK, "unmarked".into())
+        );
+        assert_eq!(
+            send(Method::POST, bearer).await,
+            (StatusCode::OK, "unmarked".into())
+        );
+        let (status, _) = send(Method::POST, basic).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "Basic stays GET-only");
+    }
+
     #[tokio::test]
     async fn legacy_browser_credentials_stop_when_human_bootstrap_completes() {
         let (_tmp, state, writer) = legacy_transition_fixture().await;
@@ -1581,8 +1697,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(basic.status(), StatusCode::OK);
-        let legacy_cookie = set_cookie_value(basic.headers(), LEGACY_AUTH_COOKIE)
-            .expect("successful Basic auth must persist the legacy browser cookie");
+        // A cookie an older build minted still works until bootstrap.
+        let legacy_cookie = "legacy-root-token";
 
         let cookie = router
             .clone()
@@ -1844,6 +1960,50 @@ mod tests {
             assert_eq!(
                 json_error(resp).await,
                 serde_json::json!({"error": "invalid credentials"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn login_store_failure_answers_without_its_cause() {
+        let (tmp, state, password) = human_fixture(None).await;
+
+        // Legitimate control: the same credentials work while the store is
+        // healthy, so a blanket refusal cannot satisfy this regression.
+        let _ = login_cookies(state.clone(), &password).await;
+
+        let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+        conn.execute_batch("ALTER TABLE users RENAME TO unavailable_users;")
+            .unwrap();
+        let resp = public_auth_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "root",
+                            "password": password
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json_error(resp).await;
+        assert_eq!(
+            error,
+            serde_json::json!({"error": "authentication unavailable"})
+        );
+        let rendered = error.to_string().to_ascii_lowercase();
+        for internal in ["sqlite", "users", "no such table"] {
+            assert!(
+                !rendered.contains(internal),
+                "leaked {internal}: {rendered}"
             );
         }
     }

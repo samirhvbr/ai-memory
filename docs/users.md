@@ -56,8 +56,8 @@ Every HTTP request is resolved to one of four authentication tiers:
 
 | Rung | Trigger | What the request gets |
 |---|---|---|
-| **0 — Anonymous** | No `[auth].bearer_token` set. | Allowed, no identity. Same as pre-multi-user defaults. |
-| **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
+| **0 — Anonymous** | No root bearer configured (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token` or `[auth].bearer_token_file`). | Allowed, no identity. Same as pre-multi-user defaults. A fresh `ai-memory init` skips this rung by minting a root bearer; an older install stays here until `ai-memory auth enable`. |
+| **1 — Root** | Bearer matches the root bearer (`AI_MEMORY_AUTH_TOKEN`, `[auth].bearer_token`, or the token in `[auth].bearer_token_file`). | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
 | **1b — Proxy-asserted user** | Bearer matches the distinct `[auth].actor_proxy_bearer_token`. | Identity is taken from trusted `X-Memory-Actor-*` headers. The request is a **user** unless its OIDC issuer/subject pair exactly matches the configured root pair. Missing or malformed identity is rejected. |
 | **2 — DB user** | Bearer doesn't match root, matches an active `api_credentials.token_hash` (SHA-256 of the secret + `[auth].token_pepper`). Native keys use the `aim_` prefix. | Allowed as **that user** for normal read/write APIs. Native keys always resolve as `AuthLevel::User`, even when the owning identity is `role=root`. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
 | **3 — 401** | Bearer present but matches nothing. | Rejected. This closes the bypass: unknown bearers can't slip through as anonymous. |
@@ -70,6 +70,10 @@ collision.
 Human password login is **not** a bearer rung. A browser session cookie never
 authenticates `/mcp`, `/hook`, `/handoff`, or `/workstream/*`, and a password
 never authenticates as `Authorization: Bearer`.
+
+The optional [management console](management-ui.md) exposes existing user
+administration and adds authorized self-service session deletion and personal
+API-key management in the browser.
 
 ## Human login (password + web session)
 
@@ -133,10 +137,13 @@ root_subject = "<root-subject>"
   root bearer is absent.
 - Only set it when the server is reachable *only* through that proxy.
 - `secure_cookie` is independent of proxy identity. Human auth requires it on
-  every non-loopback listener; ai-memory treats it as the explicit signal that
-  a trusted reverse proxy terminates HTTPS for `/web` and never trusts
-  forwarded protocol headers to infer that fact. Direct HTTP browsers will not
-  send a Secure cookie.
+  every non-loopback listener by default; ai-memory treats it as the explicit
+  signal that a trusted reverse proxy terminates HTTPS for `/web` and never
+  trusts forwarded protocol headers to infer that fact. Direct HTTP browsers
+  will not send a Secure cookie. `serve --allow-insecure-human-auth` (or
+  `AI_MEMORY_ALLOW_INSECURE_HUMAN_AUTH=true`) is the explicit, dangerous
+  exception for a private LAN whose operator accepts that passwords,
+  credentials, cookies, and memory data travel unencrypted.
 - **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
   setting its own.** Use a directive that *replaces* the header rather than
   appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`).
@@ -261,6 +268,13 @@ distinct labels and folds additional labels into `other`. The endpoint takes
 no workspace or project because many MCP-only clients do not provide reliable
 per-call scope. Like every `/admin/*` route, it is root-only when the deployment
 distinguishes operators.
+
+`GET /admin/metrics` exposes the same read/write split as process-lifetime
+totals in Prometheus text format (`ai_memory_mcp_tool_calls_total{kind=...}`),
+next to the hook counters and the `/hook` and `memory_query` latency
+histograms. It carries no client name: a client label is caller-supplied text,
+and no metric label is ever drawn from a request. It is root-only under the same
+rule.
 
 ## Per-operator memory slots
 
@@ -408,8 +422,15 @@ passwords and sessions do not use it.
 sessions can operate without a machine-root bearer; native API-key lookup
 still requires the original pepper. If `api_credentials` contains rows and
 the pepper is missing or blank, `serve` refuses startup before applying
-human bootstrap. Restore the original pepper from configuration backup
-rather than deleting identities or keys.
+human bootstrap. Current databases also keep an Argon2id verifier and refuse
+a different pepper instead of starting with keys that can only return 401.
+Restore the original pepper from a separately protected configuration backup
+rather than deleting identities or keys: `ai-memory backup` includes only a
+`config.toml` inside the data dir, while packaged systemd units load one from
+outside it. A restore of a snapshot created before the verifier existed fails
+closed when keys are present. Load the original pepper and explicitly confirm
+it with `ai-memory restore --accept-legacy-api-key-pepper`; the staged database
+is sealed before it replaces live data.
 
 ### 2. Add another human
 
@@ -445,13 +466,13 @@ alice     Alice Smith  user  must-change
 bob       -            user  active
 carol     -            user  disabled
 dave      -            user  active
-erin      -            user  expired
 ```
 
-An `active` row without a password can be a deprecated 1.x compatibility-token
-identity. Grant human login with `user reset-password`; that does not reveal or
-rotate the machine secret. The list never surfaces passwords, hashes, or API
-secrets.
+An `active` row without a password is an API-only identity, such as a user the
+removed 1.x `user add` created. Its token is an API key now: `ai-memory api-key
+list` shows it with the label `legacy-user-token`. Grant human login with
+`user reset-password`; that does not reveal or rotate the API key. The list
+never surfaces passwords, hashes, or API secrets.
 
 ### 4. Disable human login (without losing attribution history)
 
@@ -500,12 +521,17 @@ the data dir, both `0600` (the data dir itself is `0700`):
 
 | file | read by |
 |---|---|
-| `<data_dir>/auth-token` | the native `ai-memory hook` command |
+| `<data_dir>/auth-token` | the native `ai-memory hook` command, and `ai-memory mcp-bridge` when no bearer is configured (ahead of a discovered loopback root token) |
 | `<data_dir>/auth-header` | the shell hooks, via `curl -H @<file>` |
 
+`install-mcp --apply --auth-token …` writes the same pair for a Claude Code
+(`--session-aware`) or Muse bridge entry and leaves the key out of that entry,
+unless a different key is already stored there or the hooks sign in with OIDC.
+
 `ai-memory uninstall` deletes both files when it removes the hooks (a full
-uninstall or `--only hooks`); `--only mcp`, `--only instructions` and `--only
-skills` keep them for the hooks still installed.
+uninstall, or `--only hooks` while no Claude Code or Muse bridge entry
+remains); `--only mcp`, `--only instructions` and `--only skills` keep them for
+the hooks still installed.
 
 It is deliberately **not** written into the agent's own config any more. Before
 #552 it went onto the hook's command line (`--auth-token <token>` for native
@@ -538,6 +564,12 @@ just failed.
 Until you re-run `install-hooks`, the hooks still hold the old token and there
 is nothing newer to retry with, so those events stay queued and age out on the
 normal retry budget rather than blocking the rest of the spool (#493).
+
+The same re-run rotates the MCP bridge's key when the bridge reads the stored
+file, which is the case for an entry written without a key. An entry that still
+carries the old key in `AI_MEMORY_AUTH_TOKEN` (written by the print path, or by
+`install-mcp` before the key moved to the data dir) keeps sending it: re-run
+`install-mcp --apply` without `--auth-token` to drop it.
 
 ## Running for a team
 
@@ -577,20 +609,25 @@ If you're upgrading a machine-bearer-only install:
 - **No immediate action is required.** Existing
   `[auth].bearer_token` authentication continues to work as before.
   Configure human bootstrap/recovery only when enabling password login.
-- Migration V52 extends the existing `users` table with human role/password
-  state and creates `web_sessions`; V53 copies every valid legacy
+- Migration V54 extends the existing `users` table with human role/password
+  state and creates `web_sessions`; V55 copies every valid legacy
   `users.token_hash` into `api_credentials` without changing its digest or
-  owner id.
-- Deprecated 1.x `user add`, `user expire`, `user revive`, and
-  `user rotate-token` commands remain available for compatibility. They manage
-  the migrated `legacy-user-token` credential; new automation should use
-  `api-key` commands, and new people should use `user add-human`.
-  The V53 mirror triggers are load-bearing for those shims and remain until the
-  shims are removed in 3.0. Credentials they created keep authenticating after
-  that, as ordinary API keys managed with `api-key`.
+  owner id. The copy is labelled `legacy-user-token`, and its credential id is
+  the user's id.
+- 3.0 removed the 1.x `user add`, `user expire`, `user revive`, and
+  `user rotate-token` commands and their `/admin/users` endpoints (`POST
+  /admin/users` and `POST /admin/users/{name}/expire|revive|rotate-token`).
+  Migration V79 drops the `users.token_hash` and `users.token_expired_at`
+  columns and the V55 triggers that mirrored them into `api_credentials`;
+  nothing else wrote or read them. Tokens those commands issued keep
+  authenticating as ordinary API keys: list them with `api-key list`, replace
+  one with `api-key rotate <id>` and retire one with `api-key revoke <id>`. A
+  token that was expired before the upgrade stays refused. Add people with
+  `user add-human` and machine credentials with `api-key add`.
 - Before any human password or completed bootstrap exists, GET-only browser
-  routes continue to accept the root bearer through HTTP Basic and the
-  HttpOnly `ai_memory_auth` cookie. Human activation disables that path
+  routes continue to accept the root bearer through HTTP Basic, and an
+  HttpOnly `ai_memory_auth` cookie an older build set (a Basic sign-in no
+  longer sets one). Human activation disables that path
   immediately, without a restart. Machine routes remain Bearer-only.
 - Native API credentials require `[auth].token_pepper`. Human user creation,
   password reset, disable/enable, and session login do not create or depend
@@ -606,7 +643,7 @@ finds. To populate `token_pepper` without losing your current
 config:
 
 1. **Back up the existing config** (`cp config.toml config.toml.bak`).
-2. **Generate a pepper**: `ai-memory generate-auth-token 32`. This
+2. **Generate a pepper**: `ai-memory generate-auth-token --bytes 32`. This
    prints a hex string of the same shape `init` would have
    generated.
 3. **Add the `[auth]` block** to your `config.toml`:
@@ -647,8 +684,9 @@ into `web_sessions`. The cookie is `HttpOnly`, `SameSite=Strict`,
 hash.
 
 Brownfield `users.token_hash` values were copied losslessly into
-`api_credentials` (same 32-byte digest, label `legacy-user-token`).
-Runtime lookup no longer reads the old columns.
+`api_credentials` (same 32-byte digest, label `legacy-user-token`), and V79
+dropped the old columns. A copied token has no `aim_` prefix; the lookup
+hashes whatever bearer it gets, so it authenticates like any other key.
 
 ## Where attribution shows up
 
@@ -656,7 +694,7 @@ Runtime lookup no longer reads the old columns.
 |---|---|
 | Auth middleware injects `Extension<ActorContext>` on every request | ✓ P1.3 |
 | All `/admin/*` routes gate on `Extension<AuthLevel>::Root` in multi-user mode | ✓ P1.4 |
-| `ai-memory user add-human/list/reset-password/disable/enable/patch`, deprecated `user add/expire/revive/rotate-token`, and `ai-memory api-key add/list/rotate/revoke` | ✓ |
+| `ai-memory user add-human/list/reset-password/disable/enable/patch` and `ai-memory api-key add/list/rotate/revoke` | ✓ |
 | `pages.author_id` populated, frontmatter `last_modified_by` block | ✓ P1.6 |
 | `/api/v1` page responses include `author: { username, name?, email? }` | ✓ P1.7 |
 | ETag invalidation on author change (so caches refresh attribution) | ✓ P1.7 |
@@ -695,6 +733,11 @@ operator honest, not to enforce.
 Without `--as-user`, hooks install the same way they always have:
 the bearer authenticates and attribution flows from the token's owner
 (root user or DB user) at write time.
+
+The MCP side needs no second copy of the key. `ai-memory install-mcp
+--client claude-code --session-aware --apply` on the same data dir writes a
+bridge entry without a key, and the bridge sends the key the hooks hold, so
+MCP calls and captured events attribute to the same user.
 
 ## Per-project access
 
@@ -772,9 +815,7 @@ ones who should keep access; nothing is granted automatically.
   multi-user collaboration is a core capability. `pages.author_id` is
   attribution, never a read filter.
 - **Native keys are not passwords.** `user add-human` never issues an `aim_`
-  secret; `api-key add` never issues a login session. The deprecated `user add`
-  command is the exception: it issues one compatibility token backed by the
-  reserved `legacy-user-token` credential. Disable/reset of a human leaves API
+  secret; `api-key add` never issues a login session. Disable/reset of a human leaves API
   credentials untouched, and revoke/rotate of a native key leaves the
   password/session untouched. One identity may hold several native keys with
   distinct labels.
@@ -792,3 +833,21 @@ ones who should keep access; nothing is granted automatically.
   authenticates as, like any other. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.
+- **Self-issued keys outlive a password reset or a disable.** A key a user
+  issued through the self-service routes is an ordinary native key. Resetting
+  that user's password or disabling the account ends their browser sessions
+  but leaves every key they issued active; revoke those keys separately
+  (`ai-memory api-key revoke`, or the self-service revoke route while the user
+  can still sign in).
+
+### Opt-in browser surfaces
+
+Two HTTP surfaces reuse the browser sign-in and are off unless `serve` is
+started with their runtime flag. Both need `--transport http`; machine bearers
+and sessions that still owe a password change are refused, and every mutation
+needs the CSRF cookie/header pair.
+
+| Flag | Environment variable | What it serves |
+|---|---|---|
+| `--enable-session-management` | `AI_MEMORY_ENABLE_SESSION_MANAGEMENT=true` | Session inspection and purging of sessions the user owns. See [session-management.md](session-management.md). |
+| `--enable-self-service-keys` | `AI_MEMORY_ENABLE_SELF_SERVICE_KEYS=true` | Each user issues, lists and revokes their own `aim_` keys, up to 20 active keys, labels of 1 to 128 characters. See [self-service-keys.md](self-service-keys.md). |

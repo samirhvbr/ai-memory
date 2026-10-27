@@ -97,12 +97,33 @@ cargo run --release -p ai-memory-eval -- retrieval --candidate-embeddings local
 cargo run --release -p ai-memory-eval -- retrieval --candidate
 ```
 
+### Observation stream (3.0)
+
+The full-set A/B for the 3.0 observation stream (stream off → on, zero-LLM
+FTS, 470 scored) is published with its provenance in
+[`longmemeval-s-decomposition-2026-10-12.md`](longmemeval-s-decomposition-2026-10-12.md#what-the-observation-stream-recovered):
+`hit@5` 0.662 → 0.951, hit@1 0.511 → 0.857, hit@10 0.687 → 0.972, 139
+questions gained and 3 lost; local embeddings 0.800 → 0.945 on the full set
+(corrected harness, 2026-10-13). The stream is on by default in 3.0, so a baseline run
+of the 2.4 configuration on a 3.0 build needs
+`--server-env AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false`.
+
+The apparent stream-off local-embedding drop from the published 2.4 number
+(`0.815`) to the corrected 3.0 number (`0.800`) was investigated in #1263.
+The 19 questions whose hit@5 result differed between the stored pre-3.0 run
+and the corrected 3.0 stream-off run were replayed through the current harness
+with the checksum-verified v2.6.7 release binary. v2.6.7 and 3.0 matched on 18
+of 19; 3.0 gained the remaining hit. In particular, all apparent 3.0 losses
+were also losses on v2.6.7 once sessions were replayed under per-question ids.
+The delta came from the harness correction in `85eb1723`, not a regression in
+the stream-off ranking path, so no product change was warranted.
+
 ### Illustrative sample-20 run (triple + QA-accuracy, NOT a baseline)
 
 Recorded to show the triple + QA columns on a real run. **`--sample 20`, 20
 LongMemEval-S questions: illustrative, NOT the full-500 baseline.** The
-published baseline stays 0.823 hit@5 (local) / 0.668 zero-LLM in
-[README.md](README.md); do not cite the numbers below as a baseline.
+published baselines are in [README.md](README.md); do not cite the numbers
+below as a baseline.
 
 Retrieval (zero-LLM):
 

@@ -11,6 +11,15 @@
 //! safety net, decided in `take_staging`. The repository stays open
 //! between commits: reopening it dropped libgit2's index tree cache, so
 //! every commit rebuilt every directory tree.
+//!
+//! The raw hook event ledgers (`log.md`, `log-YYYY-MM.md`) are never staged.
+//! They are append-only logs that reach hundreds of megabytes, git stores each
+//! new version as a whole blob, and nothing reads them back from git; see
+//! [`is_ledger_file`].
+//!
+//! Every repository handle turns on libgit2's fsync for `.git` through a
+//! config file only libgit2 reads, so a crash cannot leave a ref naming an
+//! object whose bytes never reached disk; see [`attach_libgit2_config`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -18,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::{WikiError, WikiResult};
 
@@ -170,6 +179,7 @@ fn open_validated_repository(root: &Path) -> Result<Repository, OpenRepositoryEr
             reason: "wiki repository metadata escapes the in-root .git directory",
         }));
     }
+    attach_libgit2_config(&repo).map_err(OpenRepositoryError::Git)?;
     Ok(repo)
 }
 
@@ -180,15 +190,135 @@ fn map_open_error(error: OpenRepositoryError) -> WikiError {
     }
 }
 
-fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<()> {
+/// The validated repository, or `None` when libgit2 cannot open it and the
+/// Windows git CLI fallback will serve it instead.
+fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<Option<Repository>> {
     match open_validated_repository(root) {
-        Ok(_) => Ok(()),
+        Ok(repo) => Ok(Some(repo)),
         Err(OpenRepositoryError::Git(error))
             if cfg!(windows) && should_try_commit_cli_fallback(&error) =>
         {
-            validate_cli_fallback_root(root)
+            validate_cli_fallback_root(root).map(|()| None)
         }
         Err(error) => Err(map_open_error(error)),
+    }
+}
+
+/// The config key that makes libgit2 fsync each loose object, ref and reflog
+/// (and the directory it lands in) before renaming it into place.
+const FSYNC_OBJECT_FILES: &str = "core.fsyncObjectFiles";
+
+/// Config file in the wiki's `.git` that only libgit2 reads: git looks for
+/// `config` (and `config.worktree`) there, never for this name.
+const LIBGIT2_CONFIG_FILE: &str = "ai-memory.gitconfig";
+
+const LIBGIT2_CONFIG: &str = "\
+# Written by ai-memory and read only by its libgit2 handles (#1511).
+[core]
+\tfsyncObjectFiles = true
+";
+
+/// Write [`LIBGIT2_CONFIG_FILE`] into the wiki's `.git` unless it already
+/// holds [`LIBGIT2_CONFIG`]. Runs once per adapter, at startup.
+fn write_libgit2_config(git_dir: &Path) -> WikiResult<()> {
+    let path = git_dir.join(LIBGIT2_CONFIG_FILE);
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == LIBGIT2_CONFIG.as_bytes()) {
+        return Ok(());
+    }
+    // Inside `.git`, which a commit never stages, so there is nothing to report.
+    #[allow(clippy::disallowed_methods)]
+    crate::atomic::write_atomic(&path, LIBGIT2_CONFIG.as_bytes())?;
+    Ok(())
+}
+
+/// Give this handle libgit2's fsync for `.git`, unless the repository's own
+/// config turns it off.
+///
+/// libgit2 writes objects and refs to a temp file and renames it, without
+/// fsync by default. After a crash the rename, and the ref update that names
+/// the new commit, can survive while the object's bytes never reached disk:
+/// zero-length loose objects and a HEAD that no longer reads, so every later
+/// checkpoint fails (#1511). The process-wide `GIT_OPT_ENABLE_FSYNC_GITDIR`
+/// covers the same writes, but git2 has no safe wrapper for it and the
+/// workspace forbids `unsafe`. Writing the key to `.git/config` would make the
+/// git CLI warn that it is deprecated on every command an operator runs in the
+/// wiki, so it goes in [`LIBGIT2_CONFIG_FILE`], added to this handle's live
+/// config at the app level.
+///
+/// Why this reaches the fsync decision (vendored libgit2 1.9.3):
+/// `Repository::config` returns the handle's own config object, not a
+/// snapshot, and libgit2 reads `core.fsyncObjectFiles` from that object
+/// through the configmap cache when it first loads the object database
+/// (`git_odb__set_caps`) and the refdb (`refdb_fs` backend). Opening a
+/// repository loads neither, so the cached value is still unset here; this
+/// runs before any caller touches the handle.
+///
+/// The app level outranks every file git itself reads, so an explicit
+/// `false` in `.git/config` is checked first and kept. The app backend also
+/// becomes the handle's preferred writer; ai-memory never writes config
+/// through a handle.
+fn attach_libgit2_config(repo: &Repository) -> Result<(), git2::Error> {
+    let mut config = repo.config()?;
+    let local = match config.open_level(git2::ConfigLevel::Local) {
+        Ok(local) => local.get_bool(FSYNC_OBJECT_FILES).ok(),
+        Err(error) if error.code() == ErrorCode::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if local == Some(false) {
+        return Ok(());
+    }
+    config.add_file(
+        &repo.path().join(LIBGIT2_CONFIG_FILE),
+        git2::ConfigLevel::App,
+        false,
+    )
+}
+
+/// `Ok` when HEAD is unborn (a fresh repository) or resolves to a commit
+/// whose tree reads back; the error otherwise, such as libgit2's
+/// "failed to parse loose object" for an object a crash left empty.
+fn readable_head(repo: &Repository) -> Result<(), git2::Error> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    head.peel_to_commit()?.tree()?;
+    Ok(())
+}
+
+/// Startup checks on the wiki repository. Neither fails the server: the
+/// markdown on disk is the source of truth and keeps being served, but a
+/// history that cannot take a commit is reported once, loudly, instead of
+/// only as a warning from each checkpoint that fails.
+fn check_repository_durability(root: &Path, repo: &Repository) {
+    match repo
+        .config()
+        .and_then(|config| config.get_bool(FSYNC_OBJECT_FILES))
+    {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            root = %root.display(),
+            "{FSYNC_OBJECT_FILES} is false in the wiki repository's config; a crash can leave \
+             its history with empty objects"
+        ),
+        Err(error) => warn!(
+            root = %root.display(),
+            %error,
+            "could not read the wiki repository's fsync setting; a crash can leave its history \
+             with empty objects"
+        ),
+    }
+    if let Err(error) = readable_head(repo) {
+        error!(
+            root = %root.display(),
+            %error,
+            "wiki git history is unreadable: HEAD does not resolve to a readable commit, so \
+             every checkpoint will fail until it is repaired. Pages on disk are not affected. \
+             See \"Wiki git history unreadable after a crash\" in docs/lifecycle-ops.md"
+        );
     }
 }
 
@@ -280,18 +410,17 @@ impl GitAdapter {
     /// Propagates any underlying libgit2 error.
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
         crate::confinement::initialize_root(root)?;
-        let git_dir = root.join(".git");
-        match std::fs::symlink_metadata(&git_dir) {
-            Ok(_) => {
-                validate_repository_or_allow_cli_fallback(root)?;
-                debug!(root = %root.display(), "wiki repo already initialised");
-            }
+        match std::fs::symlink_metadata(root.join(".git")) {
+            Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 debug!(root = %root.display(), "initialising wiki repo");
                 init_repo(root)?;
-                validate_repository_or_allow_cli_fallback(root)?;
             }
             Err(error) => return Err(error.into()),
+        }
+        write_libgit2_config(&crate::confinement::inspect_git_directory(root)?)?;
+        if let Some(repo) = validate_repository_or_allow_cli_fallback(root)? {
+            check_repository_durability(root, &repo);
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -538,7 +667,12 @@ impl GitAdapter {
         // and hash every file again, once.
         let touched = match staging {
             Staging::Everything => {
-                let walked = stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+                let walked =
+                    stage_working_tree(&self.root, &mut index).map_err(CommitGit2Error::Other)?;
+                // The walk only skips ledgers it would add or update; one a
+                // past version already tracks, and that has not changed, is
+                // not offered to it at all.
+                untrack_ledgers(&self.root, &mut index, None).map_err(CommitGit2Error::Other)?;
                 self.record_walk(&walked);
                 walked.len()
             }
@@ -559,7 +693,7 @@ impl GitAdapter {
                     "index could not be written as a tree; re-hashing the working tree (#594)"
                 );
                 index.clear().map_err(CommitGit2Error::Other)?;
-                stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+                stage_working_tree(&self.root, &mut index).map_err(CommitGit2Error::Other)?;
                 index.write().map_err(CommitGit2Error::Other)?;
                 index.write_tree().map_err(CommitGit2Error::Other)?
             }
@@ -674,6 +808,62 @@ impl GitAdapter {
                     .to_string(),
                 time: commit.time().seconds(),
             });
+        }
+        Ok(out)
+    }
+
+    /// Return up to `limit` commits, newest first, that changed the file at
+    /// `path` (relative to the repo root), including the commit that deleted
+    /// it. At most `max_walk` commits are inspected, so a page untouched for a
+    /// long history costs a bounded walk rather than the whole repository.
+    ///
+    /// # Errors
+    /// Propagates any underlying libgit2 error.
+    pub fn path_checkpoints(
+        &self,
+        path: &Path,
+        limit: usize,
+        max_walk: usize,
+    ) -> WikiResult<Vec<Checkpoint>> {
+        let repo = open_validated_repository(&self.root).map_err(|error| match error {
+            OpenRepositoryError::Git(error) => map_git_err(error),
+            OpenRepositoryError::Wiki(error) => error,
+        })?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut walk = repo.revwalk().map_err(map_git_err)?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+        let blob_at = |commit: &git2::Commit<'_>| {
+            commit
+                .tree()
+                .ok()
+                .and_then(|tree| tree.get_path(path).ok())
+                .map(|entry| entry.id())
+        };
+        let mut out = Vec::new();
+        for oid in walk.take(max_walk) {
+            let oid = oid.map_err(map_git_err)?;
+            let commit = repo.find_commit(oid).map_err(map_git_err)?;
+            let parent_blob = commit.parent(0).ok().and_then(|p| blob_at(&p));
+            if blob_at(&commit) == parent_blob {
+                continue;
+            }
+            out.push(Checkpoint {
+                oid: oid.to_string(),
+                summary: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or("(no summary)")
+                    .to_string(),
+                time: commit.time().seconds(),
+            });
+            if out.len() >= limit {
+                break;
+            }
         }
         Ok(out)
     }
@@ -847,17 +1037,100 @@ pub(crate) fn slash_path(rel: &Path) -> String {
 /// entries, drop deleted ones, add untracked files. libgit2 does all three
 /// from one index-to-workdir diff. Returns the paths touched; does not
 /// write the index file.
-fn stage_working_tree(index: &mut git2::Index) -> Result<Vec<PathBuf>, git2::Error> {
+///
+/// Ledgers are skipped: a positive return from the callback leaves that path
+/// alone, neither added nor refreshed.
+fn stage_working_tree(root: &Path, index: &mut git2::Index) -> Result<Vec<PathBuf>, git2::Error> {
     let mut touched = Vec::new();
     index.add_all(
         ["*"].iter(),
         IndexAddOption::DEFAULT,
         Some(&mut |path: &Path, _: &[u8]| {
+            if is_ledger_file(root, path) || is_in_flight_write(path) {
+                return 1;
+            }
             touched.push(path.to_path_buf());
             0
         }),
     )?;
     Ok(touched)
+}
+
+/// True when `rel`'s basename belongs to a write still in flight: a
+/// `.ai-memory-tmp.` staging file or a `.ai-memory-delete.` parked page.
+///
+/// These exist only between a write starting and its rename, so committing one
+/// records a page body that may never be installed. `Wiki::apply_batch` holds
+/// one staging file per page across an `await`, and `commit_all` takes only the
+/// commit lock, never the mutation lock, so a checkpoint can land in that
+/// window. A parked page is also reported by name: `rename_checked` marks the
+/// `.ai-memory-delete.` quarantine and the `.ai-memory-tmp.move-session.` name
+/// written, so the reported-file branch of [`stage_paths`] checks this too.
+/// The watcher drops both for its own reasons: `is_tempfile` matches the
+/// `.ai-memory-tmp.` prefix, and a quarantine name carries no `.md` suffix.
+fn is_in_flight_write(rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(".ai-memory-tmp.") || name.starts_with(".ai-memory-delete.")
+        })
+}
+
+/// True when `rel` (relative to the wiki root) is a raw hook event ledger:
+/// a `log.md` / `log-YYYY-MM.md` file whose content also opens with a hook log
+/// entry.
+///
+/// Both halves are needed, as everywhere else a ledger is recognized
+/// ([`crate::ledger`]): an ordinary page may be named `log-2026-09.md`, and it
+/// must stay versioned. The content half reads at most
+/// `GATE_PREFIX_BYTES` from the file, so a ledger of any size costs one small
+/// read per commit.
+///
+/// Why this is not a `.gitignore` or `info/exclude` entry: those match names,
+/// so one entry would also hide an ordinary page that wears a ledger's name,
+/// and the entry would outlive the file's being a ledger.
+fn is_ledger_file(root: &Path, rel: &Path) -> bool {
+    rel.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(ai_memory_core::log_ledger::is_log_ledger_path)
+        && crate::ledger::opens_with_log_ledger(&root.join(rel))
+}
+
+/// Drop ledgers that earlier versions committed from the index, under the
+/// directory `under` (a `/`-separated path) or everywhere when it is `None`.
+/// The files stay on disk: only the index entry goes, so the next commit's tree
+/// no longer names them and they stop growing the repository. Their old blobs
+/// remain in history. Returns how many entries were dropped.
+fn untrack_ledgers(
+    root: &Path,
+    index: &mut git2::Index,
+    under: Option<&str>,
+) -> Result<usize, git2::Error> {
+    let prefix = under.map(|dir| format!("{}/", dir.trim_end_matches('/')));
+    let tracked: Vec<PathBuf> = index
+        .iter()
+        .filter_map(|entry| String::from_utf8(entry.path).ok())
+        .filter(|path| prefix.as_ref().is_none_or(|p| path.starts_with(p)))
+        .filter(|path| {
+            // The shape test is a string compare; only a shape match pays for
+            // the file read.
+            path.rsplit('/')
+                .next()
+                .is_some_and(ai_memory_core::log_ledger::is_log_ledger_path)
+        })
+        .map(PathBuf::from)
+        .filter(|path| is_ledger_file(root, path))
+        .collect();
+    for path in &tracked {
+        index.remove_path(path)?;
+    }
+    if !tracked.is_empty() {
+        debug!(
+            count = tracked.len(),
+            "hook event ledgers dropped from the index; the files stay on disk"
+        );
+    }
+    Ok(tracked.len())
 }
 /// Stage only `paths`: a file by path, a directory with its subtree, a
 /// gone path by removing its entries. Does not write the index file.
@@ -880,10 +1153,19 @@ fn stage_paths(
             index.add_all(
                 [spec.as_str()].iter(),
                 IndexAddOption::DISABLE_PATHSPEC_MATCH,
-                None,
+                Some(&mut |path: &Path, _: &[u8]| {
+                    i32::from(is_ledger_file(root, path) || is_in_flight_write(path))
+                }),
             )?;
+            untrack_ledgers(root, index, Some(&spec))?;
         } else if abs.is_file() {
-            index.add_path(rel)?;
+            if is_ledger_file(root, rel) {
+                if index.get_path(rel, 0).is_some() {
+                    index.remove_path(rel)?;
+                }
+            } else if !is_in_flight_write(rel) {
+                index.add_path(rel)?;
+            }
         } else if index.get_path(rel, 0).is_some() {
             index.remove_path(rel)?;
         } else {
@@ -932,7 +1214,7 @@ fn commit_all_fallback(
 ) -> WikiResult<Option<git2::Oid>> {
     validate_cli_fallback_root(root)?;
     warn!(error = %original, root = %root.display(), "libgit2 commit failed; trying git CLI fallback");
-    run_git(root, ["add", "-A"])?;
+    stage_all_except_ledgers_cli(root)?;
     let diff = git_command(root)
         .args(["diff", "--cached", "--quiet", "--exit-code"])
         .status()
@@ -1084,6 +1366,103 @@ fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<()> {
         .args(args)
         .status()
         .map_err(|error| WikiError::Io(std::io::Error::other(error.to_string())))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(WikiError::Io(std::io::Error::other(format!(
+            "git fallback exited with status {status}"
+        ))))
+    }
+}
+
+/// `git add -A` for the CLI fallback, leaving the hook event ledgers out the
+/// way [`stage_working_tree`] does for libgit2.
+///
+/// Ledgers a past version committed are dropped from the index first, then
+/// everything else is added with the ledgers as `exclude` pathspecs, so git
+/// never reads a ledger into a blob. Pathspecs go through stdin because a
+/// project with a ledger per month can name more files than a Windows command
+/// line holds.
+#[cfg(windows)]
+fn stage_all_except_ledgers_cli(root: &Path) -> WikiResult<()> {
+    let mut ledgers = Vec::new();
+    collect_ledger_files(root, root, &mut ledgers)?;
+    if ledgers.is_empty() {
+        return run_git(root, ["add", "-A"]);
+    }
+    let pathspecs = |prefix: &str, first: &str| -> Vec<u8> {
+        let mut input = first.as_bytes().to_vec();
+        for ledger in &ledgers {
+            input.extend_from_slice(prefix.as_bytes());
+            input.extend_from_slice(slash_path(ledger).as_bytes());
+            input.push(0);
+        }
+        input
+    };
+    run_git_with_stdin(
+        root,
+        [
+            "rm",
+            "--cached",
+            // Without `--force` git refuses an entry whose staged content
+            // matches neither HEAD nor the file (an old version staged an
+            // append and never committed it), and that refusal would abort
+            // the whole checkpoint. Only paths already validated as ledgers
+            // are listed, and only their index entries go.
+            "--force",
+            "-q",
+            "--ignore-unmatch",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        &pathspecs(":(literal)", ""),
+    )?;
+    run_git_with_stdin(
+        root,
+        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        &pathspecs(":(exclude,literal)", ".\0"),
+    )
+}
+
+/// Every ledger file under `dir`, relative to `root`, skipping `.git` and
+/// symlinks.
+#[cfg(windows)]
+fn collect_ledger_files(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) -> WikiResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if entry.file_name() != ".git" {
+                collect_ledger_files(root, &path, found)?;
+            }
+        } else if file_type.is_file()
+            && let Ok(rel) = path.strip_prefix(root)
+            && is_ledger_file(root, rel)
+        {
+            found.push(rel.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_git_with_stdin<const N: usize>(
+    root: &Path,
+    args: [&str; N],
+    input: &[u8],
+) -> WikiResult<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = git_command(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| WikiError::Io(std::io::Error::other(error.to_string())))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input)?;
+    }
+    let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {
@@ -1562,6 +1941,47 @@ mod tests {
     }
 
     #[test]
+    fn path_checkpoints_lists_changes_and_deletion_and_stops_at_the_walk_cap() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        std::fs::write(root.join("page.md"), "v1").unwrap();
+        adapter.commit_all("write v1").unwrap();
+        std::fs::write(root.join("page.md"), "v2").unwrap();
+        adapter.commit_all("write v2").unwrap();
+        std::fs::remove_file(root.join("page.md")).unwrap();
+        adapter.commit_all("delete").unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join("other.md"), format!("o{i}")).unwrap();
+            adapter.commit_all("unrelated").unwrap();
+        }
+        let summaries = |hits: Vec<Checkpoint>| -> Vec<String> {
+            hits.into_iter().map(|c| c.summary).collect()
+        };
+
+        let all = adapter
+            .path_checkpoints(Path::new("page.md"), 10, 100)
+            .unwrap();
+        assert_eq!(summaries(all), ["delete", "write v2", "write v1"]);
+        let limited = adapter
+            .path_checkpoints(Path::new("page.md"), 1, 100)
+            .unwrap();
+        assert_eq!(summaries(limited), ["delete"]);
+        // Three unrelated commits sit on top: a walk of four sees only the
+        // delete, a walk of three sees nothing.
+        let capped = adapter
+            .path_checkpoints(Path::new("page.md"), 10, 4)
+            .unwrap();
+        assert_eq!(summaries(capped), ["delete"]);
+        assert!(
+            adapter
+                .path_checkpoints(Path::new("page.md"), 10, 3)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn commit_all_returns_none_when_clean_some_when_dirty() {
         let tmp = tempdir();
         let root = tmp.path().join("wiki");
@@ -1633,7 +2053,7 @@ mod tests {
         let staged = |root: &Path| {
             let repo = Repository::open(root).unwrap();
             let mut index = repo.index().unwrap();
-            let touched = stage_working_tree(&mut index).unwrap().len();
+            let touched = stage_working_tree(root, &mut index).unwrap().len();
             index.write().unwrap();
             touched
         };
@@ -1670,6 +2090,80 @@ mod tests {
         }
         adapter.commit_all("initial").unwrap();
         (tmp, root, adapter)
+    }
+
+    /// `apply_batch` keeps one `.ai-memory-tmp.*` staging file per page on disk
+    /// across an await, and `commit_all` takes only the commit lock — so a
+    /// sweep landing in that window must not capture a write in flight.
+    #[test]
+    fn a_sweep_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/b.md", "b");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.aB3x9Q",
+            "a body still being written",
+        );
+        write(
+            &root,
+            "ws/proj/.ai-memory-delete.b.md",
+            "a page parked for deletion",
+        );
+
+        assert!(
+            adapter
+                .commit_all("sweep with writes in flight")
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(head_blob(&adapter, "ws/proj/b.md").as_deref(), Some("b"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.aB3x9Q"), None);
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-delete.b.md"), None);
+    }
+
+    /// The same for a path-scoped commit, whose directory pathspec reaches
+    /// `stage_paths`' own `add_all` rather than the sweep's.
+    #[test]
+    fn a_path_scoped_commit_never_stages_an_in_flight_atomic_write() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        write(&root, "ws/proj/c.md", "c");
+        write(
+            &root,
+            "ws/proj/.ai-memory-tmp.cD4y0R",
+            "a body still being written",
+        );
+        adapter.mark_written(&root.join("ws/proj"));
+
+        adapter.commit_all("scoped with a write in flight").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        assert_eq!(head_blob(&adapter, "ws/proj/.ai-memory-tmp.cD4y0R"), None);
+    }
+
+    /// `quarantine_file` and `move_session_page` park a page under a staging
+    /// name with `rename_checked`, which reports that exact path, so the
+    /// reported-file branch of `stage_paths` must skip it as well.
+    #[test]
+    fn a_reported_staging_file_is_never_staged() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        let parked = [
+            "ws/proj/.ai-memory-delete.Xy12Ab",
+            "ws/proj/.ai-memory-tmp.move-session.s1.md",
+        ];
+        for rel in parked {
+            write(&root, rel, "a page between two renames");
+            adapter.mark_written(&root.join(rel));
+        }
+        write(&root, "ws/proj/c.md", "c");
+        adapter.mark_written(&root.join("ws/proj/c.md"));
+
+        adapter.commit_all("scoped with pages parked").unwrap();
+
+        assert_eq!(head_blob(&adapter, "ws/proj/c.md").as_deref(), Some("c"));
+        for rel in parked {
+            assert_eq!(head_blob(&adapter, rel), None, "{rel} was committed");
+        }
     }
 
     #[test]
@@ -1725,6 +2219,221 @@ mod tests {
         adapter.mark_written(&root.join("ws/proj/.git/hooks/pre-commit"));
         adapter.mark_written(Path::new("ws/proj/git~1/config"));
         assert!(adapter.written_paths().is_empty());
+    }
+
+    const LEDGER_BODY: &str = "## [2026-09-05T00:00:00Z] tool Bash: cargo test\n";
+    const PROSE_BODY: &str = "# Log\n\nAn ordinary page named like a ledger.\n";
+
+    /// Whether the index names `rel`, from a fresh read of the index file.
+    fn indexed(root: &Path, rel: &str) -> bool {
+        let repo = Repository::open(root).unwrap();
+        let index = repo.index().unwrap();
+        index.get_path(Path::new(rel), 0).is_some()
+    }
+
+    /// Path-scoped staging (the commit after the first walk): a ledger a past
+    /// version tracked is dropped from the index when it is reported, by file
+    /// or through its directory, and the file stays on disk. Ordinary files in
+    /// the same call, including a page wearing a ledger's name, are staged.
+    #[test]
+    fn path_staging_untracks_a_ledger_and_keeps_a_page_wearing_its_name() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        write(&root, "p/log-2026-09.md", LEDGER_BODY);
+        write(&root, "q/log-2026-09.md", LEDGER_BODY);
+        write(&root, "r/log-2026-09.md", PROSE_BODY);
+        let repo = Repository::open(&root).unwrap();
+        let mut index = repo.index().unwrap();
+        for rel in ["p/log-2026-09.md", "q/log-2026-09.md", "r/log-2026-09.md"] {
+            index.add_path(Path::new(rel)).unwrap();
+        }
+        index.write().unwrap();
+        drop(adapter);
+
+        write(
+            &root,
+            "p/log-2026-09.md",
+            &format!("{LEDGER_BODY}{LEDGER_BODY}"),
+        );
+        write(&root, "r/log-2026-09.md", &format!("{PROSE_BODY}edited\n"));
+        write(&root, "q/other.md", "page\n");
+        // Never tracked, reported through its directory: it must not even be
+        // read into a blob.
+        let fresh = format!("{LEDGER_BODY}## [2026-09-06T00:00:00Z] stop\n");
+        write(&root, "s/log-2026-08.md", &fresh);
+        let mut index = repo.index().unwrap();
+        // `p` is reported by file, `q` and `s` through their directories.
+        let paths: BTreeSet<PathBuf> = ["p/log-2026-09.md", "q", "r/log-2026-09.md", "s"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        stage_paths(&root, &mut index, &paths).unwrap();
+        index.write().unwrap();
+
+        assert!(!indexed(&root, "p/log-2026-09.md"), "file report");
+        assert!(!indexed(&root, "q/log-2026-09.md"), "directory report");
+        assert!(
+            !indexed(&root, "s/log-2026-08.md"),
+            "untracked, by directory"
+        );
+        assert!(
+            !repo
+                .odb()
+                .unwrap()
+                .exists(git2::Oid::hash_object(ObjectType::Blob, fresh.as_bytes()).unwrap()),
+            "a ledger under a reported directory was hashed into git"
+        );
+        assert!(indexed(&root, "q/other.md"), "control: the page beside it");
+        assert!(indexed(&root, "r/log-2026-09.md"), "control: a page");
+        assert_eq!(
+            std::fs::read_to_string(root.join("p/log-2026-09.md")).unwrap(),
+            format!("{LEDGER_BODY}{LEDGER_BODY}"),
+            "the file on disk is untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("q/log-2026-09.md")).unwrap(),
+            LEDGER_BODY
+        );
+    }
+
+    /// The CLI fallback (Windows only, when libgit2 cannot open the repo)
+    /// must leave ledgers out as well, and must never read one into a blob.
+    #[cfg(windows)]
+    #[test]
+    fn cli_fallback_commit_leaves_ledgers_out_and_untracks_a_tracked_one() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        // A repo-local setting beats a contributor's global `commit.gpgsign`.
+        Repository::open(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        write(&root, "p/log-2026-07.md", LEDGER_BODY);
+        run_git(&root, ["add", "p/log-2026-07.md"]).unwrap();
+        run_git(
+            &root,
+            [
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@local",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "fixture: tracked by an earlier version",
+            ],
+        )
+        .unwrap();
+        // Content no other file or commit holds, so a blob for it can only come
+        // from staging this file.
+        let new_ledger = format!("{LEDGER_BODY}## [2026-09-06T00:00:00Z] stop\n");
+        write(&root, "p/log-2026-09.md", &new_ledger);
+        write(&root, "p/log.md", PROSE_BODY);
+        write(&root, "p/page.md", "page\n");
+
+        let oid = commit_all_fallback(&root, "fallback", git2::Error::from_str("forced"))
+            .unwrap()
+            .expect("the page is new");
+
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.find_commit(oid).unwrap().tree().unwrap();
+        assert!(tree.get_path(Path::new("p/page.md")).is_ok());
+        assert!(tree.get_path(Path::new("p/log.md")).is_ok(), "a page");
+        assert!(tree.get_path(Path::new("p/log-2026-09.md")).is_err());
+        assert!(
+            tree.get_path(Path::new("p/log-2026-07.md")).is_err(),
+            "the tracked ledger was untracked"
+        );
+        assert!(root.join("p/log-2026-07.md").is_file(), "and kept on disk");
+        let unseen = git2::Oid::hash_object(ObjectType::Blob, new_ledger.as_bytes()).unwrap();
+        assert!(
+            !repo.odb().unwrap().exists(unseen),
+            "git read the new ledger into a blob"
+        );
+        drop(adapter);
+    }
+
+    /// The state an older version could leave behind: it staged an append to a
+    /// ledger and never committed it, and the hook appended again after that.
+    /// HEAD, the index and the file then hold three different contents, which
+    /// plain `git rm --cached` refuses; that refusal must not abort the
+    /// checkpoint, which still has ordinary pages to save.
+    #[cfg(windows)]
+    #[test]
+    fn cli_fallback_untracks_a_ledger_whose_index_matches_neither_head_nor_disk() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        Repository::open(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        let ledger = "p/log-2026-09.md";
+        let version_a = LEDGER_BODY.to_string();
+        let version_b = format!(
+            "{version_a}## [2026-09-06T00:00:00Z] stop
+"
+        );
+        let version_c = format!(
+            "{version_b}## [2026-09-07T00:00:00Z] start
+"
+        );
+
+        write(&root, ledger, &version_a);
+        run_git(&root, ["add", ledger]).unwrap();
+        run_git(
+            &root,
+            [
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@local",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "fixture: HEAD holds version A",
+            ],
+        )
+        .unwrap();
+        write(&root, ledger, &version_b);
+        run_git(&root, ["add", ledger]).unwrap();
+        write(&root, ledger, &version_c);
+        write(
+            &root,
+            "p/page.md",
+            "page
+",
+        );
+
+        let oid = commit_all_fallback(&root, "fallback", git2::Error::from_str("forced"))
+            .expect("the unforced removal aborted the whole checkpoint")
+            .expect("the page is new");
+
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.find_commit(oid).unwrap().tree().unwrap();
+        assert!(
+            tree.get_path(Path::new("p/page.md")).is_ok(),
+            "the ordinary page was not committed"
+        );
+        assert!(
+            tree.get_path(Path::new(ledger)).is_err(),
+            "the ledger is still in the commit"
+        );
+        assert!(!indexed(&root, ledger), "the ledger is still in the index");
+        assert_eq!(
+            std::fs::read_to_string(root.join(ledger)).unwrap(),
+            version_c,
+            "the file on disk was changed"
+        );
+        drop(adapter);
     }
 
     #[test]
@@ -2205,5 +2914,113 @@ mod tests {
             .file_at_rev(&first.to_string(), Path::new("a.md"))
             .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "one");
+    }
+
+    fn local_fsync_setting(root: &Path) -> Option<bool> {
+        Repository::open(root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .get_bool(FSYNC_OBJECT_FILES)
+            .ok()
+    }
+
+    fn fsync_setting(repo: &Repository) -> Option<bool> {
+        repo.config().unwrap().get_bool(FSYNC_OBJECT_FILES).ok()
+    }
+
+    /// What the git CLI prints for `status`, or `None` without git on PATH.
+    fn git_status_stderr(root: &Path) -> Option<String> {
+        let output = git_command(root).arg("status").output().ok()?;
+        assert!(output.status.success(), "git status failed: {output:?}");
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    /// #1511: without it libgit2 renames objects and refs into place unsynced,
+    /// and a crash left a ref naming an empty commit object. The setting lives
+    /// on ai-memory's handles only, never in `.git/config`, where git warns
+    /// that the key is deprecated on every command.
+    #[test]
+    fn every_wiki_handle_turns_on_git_object_fsync_without_touching_git_config() {
+        let tmp = tempdir();
+        let fresh = tmp.path().join("fresh");
+        let existing = tmp.path().join("existing");
+        // A repository an older version created gets it on the next open.
+        Repository::init(&existing).unwrap();
+
+        for root in [&fresh, &existing] {
+            let adapter = GitAdapter::open_or_init(root).unwrap();
+            write(root, "page.md", "page");
+            adapter.commit_all("checkpoint").unwrap().unwrap();
+
+            let slot = adapter.writing();
+            let kept = &slot.as_ref().expect("the commit keeps its handle").repo;
+            assert_eq!(fsync_setting(kept), Some(true));
+            drop(slot);
+            let validated = open_validated_repository(root).ok().unwrap();
+            assert_eq!(fsync_setting(&validated), Some(true));
+
+            assert_eq!(local_fsync_setting(root), None);
+            assert_eq!(fsync_setting(&Repository::open(root).unwrap()), None);
+            let git_config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+            assert!(!git_config.to_ascii_lowercase().contains("fsyncobjectfiles"));
+            if let Some(stderr) = git_status_stderr(root) {
+                assert!(
+                    !stderr.contains("deprecated"),
+                    "git status warned: {stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_fsync_opt_out_in_git_config_is_kept() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        Repository::init(&root)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool(FSYNC_OBJECT_FILES, false)
+            .unwrap();
+
+        GitAdapter::open_or_init(&root).unwrap();
+
+        let validated = open_validated_repository(&root).ok().unwrap();
+        assert_eq!(fsync_setting(&validated), Some(false));
+        assert_eq!(local_fsync_setting(&root), Some(false));
+    }
+
+    /// The crash shape from #1511: HEAD names a commit whose loose object is
+    /// empty. Startup still opens the wiki, the check reports it, and a
+    /// checkpoint returns the error instead of passing for a clean tree.
+    #[test]
+    fn an_empty_head_commit_object_is_reported_not_swallowed() {
+        let (_tmp, root, _adapter) = committed(&[("page.md", "page")]);
+        let repo = Repository::open(&root).unwrap();
+        readable_head(&repo).unwrap();
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let object = root.join(".git/objects").join(&head[..2]).join(&head[2..]);
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&object, permissions).unwrap();
+        std::fs::write(&object, b"").unwrap();
+        drop(repo);
+
+        let reopened = GitAdapter::open_or_init(&root).unwrap();
+        assert!(readable_head(&Repository::open(&root).unwrap()).is_err());
+        write(&root, "page.md", "page, edited after the crash");
+        assert!(reopened.commit_all("after the crash").is_err());
+    }
+
+    #[test]
+    fn a_fresh_repository_has_a_readable_head() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        GitAdapter::open_or_init(&root).unwrap();
+        readable_head(&Repository::open(&root).unwrap()).unwrap();
     }
 }

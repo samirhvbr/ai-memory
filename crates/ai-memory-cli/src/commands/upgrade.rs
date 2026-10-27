@@ -72,6 +72,7 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
     let base = release_base_url(config);
     let tag = resolve_tag(&fetcher, &base, args.version.as_deref()).await?;
     if skip_when_current(&tag, args.force) {
+        refresh_plugins(config, &super::user_service::SystemRunner);
         return Ok(());
     }
 
@@ -80,6 +81,7 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
 
     // Sync FS after await is intentional for this CLI one-shot path.
     refresh_staged_hooks(config)?;
+    refresh_plugins(config, &super::user_service::SystemRunner);
     warn_remote_server(config);
     println!("✓ upgraded to {tag}");
     info!(%tag, path = %exe.display(), "native upgrade complete");
@@ -802,6 +804,41 @@ fn refresh_staged_hooks(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Keep the marketplace plugins in step with the binary (#1166). Claude Code
+/// does not auto-update a third-party marketplace unless the user turned that
+/// on, so the Claude Code plugin is updated here. Codex is only told what to
+/// run: its hooks must be re-trusted only when a command changes, and the
+/// operator should see that happen in Codex itself.
+fn refresh_plugins(config: &Config, runner: &dyn super::user_service::CommandRunner) {
+    use super::agent_plugins::{self, PluginHarness};
+    let Some(home) = super::run::native_home(config) else {
+        return;
+    };
+    let env = |name: &str| {
+        config
+            .runtime_env
+            .process_env()
+            .iter()
+            .find(|(key, _)| key.as_os_str() == name)
+            .map(|(_, value)| value.clone())
+    };
+    for plugin in agent_plugins::installed(&home, &env) {
+        match plugin.harness {
+            PluginHarness::ClaudeCode => {
+                println!("→ updating the ai-memory Claude Code plugin");
+                for line in agent_plugins::update_claude_code(runner) {
+                    println!("    {line}");
+                }
+            }
+            PluginHarness::Codex => println!(
+                "→ the ai-memory Codex plugin is installed: run `codex plugin marketplace upgrade \
+                 ai-memory` and `codex plugin add {}` to update it",
+                agent_plugins::PLUGIN_ID
+            ),
+        }
+    }
+}
+
 fn staged_hooks_root(config: &Config) -> PathBuf {
     install_hooks::hook_staging_root(
         &config.data_dir,
@@ -899,7 +936,7 @@ fn warn_remote_server(config: &Config) {
     if !config.server_url_configured() {
         return;
     }
-    if is_loopback_url(&config.server_url) {
+    if is_local_server_url(&config.server_url) {
         return;
     }
     eprintln!(
@@ -909,12 +946,11 @@ fn warn_remote_server(config: &Config) {
     );
 }
 
-fn is_loopback_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains("127.0.0.1")
-        || lower.contains("localhost")
-        || lower.contains("[::1]")
-        || lower.contains("0.0.0.0")
+/// Loopback, or the `0.0.0.0` bind address a local server is often reached
+/// through. Only decides whether to print the remote-server note.
+fn is_local_server_url(url: &str) -> bool {
+    crate::http_client::is_loopback_url(url)
+        || reqwest::Url::parse(url).is_ok_and(|parsed| parsed.host_str() == Some("0.0.0.0"))
 }
 
 struct ReqwestFetcher {
@@ -1040,6 +1076,37 @@ mod tests {
     use tar::Header;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+
+    /// `upgrade` keeps an installed Claude Code plugin in step with the
+    /// binary: marketplace update, then plugin update. Without the plugin,
+    /// and for the Codex plugin, it runs nothing.
+    #[test]
+    fn upgrade_updates_an_installed_claude_code_plugin_only() {
+        use crate::commands::agent_plugins::test_support::{
+            RecordingRunner, install_claude_plugin, install_codex_plugin,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            home_dir: Some(home.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+
+        let runner = RecordingRunner::new(None);
+        refresh_plugins(&config, &runner);
+        install_codex_plugin(home.path());
+        refresh_plugins(&config, &runner);
+        assert!(runner.calls.borrow().is_empty(), "{:?}", runner.calls);
+
+        install_claude_plugin(home.path(), "0.0.1", true);
+        refresh_plugins(&config, &runner);
+        assert_eq!(
+            *runner.calls.borrow(),
+            vec![
+                "claude plugin marketplace update ai-memory",
+                "claude plugin update ai-memory@ai-memory"
+            ]
+        );
+    }
 
     #[test]
     fn release_asset_name_for_covers_unix_and_windows_matrix() {
@@ -1714,10 +1781,14 @@ mod tests {
     }
 
     #[test]
-    fn is_loopback_detects_common_forms() {
-        assert!(is_loopback_url("http://127.0.0.1:49374"));
-        assert!(is_loopback_url("http://localhost:49374"));
-        assert!(!is_loopback_url("http://192.168.1.10:49374"));
+    fn local_server_url_detects_common_forms() {
+        assert!(is_local_server_url("http://127.0.0.1:49374"));
+        assert!(is_local_server_url("http://localhost:49374"));
+        assert!(is_local_server_url("http://0.0.0.0:49374"));
+        assert!(!is_local_server_url("http://192.168.1.10:49374"));
+        // A host that merely contains a loopback name is remote.
+        assert!(!is_local_server_url("http://localhost.example.com:49374"));
+        assert!(!is_local_server_url("http://127.0.0.1.example.com"));
     }
 
     #[test]

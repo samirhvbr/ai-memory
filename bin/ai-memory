@@ -498,6 +498,15 @@ native_host_binary() {
   case "$(uname -s 2>/dev/null || true)" in
     Linux) os="linux" ;;
     Darwin) os="macos" ;;
+    MINGW* | MSYS* | CYGWIN*)
+      # Git Bash on native Windows: no Linux/macOS release client exists, and
+      # the helper container cannot run host harnesses anyway. Point at the
+      # two supported paths instead of a bare refusal (#1545).
+      echo "ai-memory: the POSIX container wrapper cannot run host commands on native Windows" >&2
+      echo "use the PowerShell wrapper (bin/ai-memory.ps1) or install the native Windows client:" >&2
+      echo "  irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex" >&2
+      return 1
+      ;;
     *)
       echo "ai-memory: the container wrapper cannot provide native host commands on this OS" >&2
       echo "install the native release binary to use managed launches or native lifecycle hooks" >&2
@@ -582,19 +591,117 @@ native_host_binary() {
   printf '%s\n' "${binary}"
 }
 
+# A server initialized on the named volume keeps its root bearer there
+# (/data/auth-tokens/default, named by `[auth].bearer_token_file`). The host
+# commands below run the native client against the host data dir, which cannot
+# see the volume, so the token is copied to an owner-only host file and the
+# client is pointed at it with AI_MEMORY_AUTH__BEARER_TOKEN_FILE. The client
+# then treats it as a token file: it authenticates with it, persists it for
+# hooks, and never writes it into a harness config. The token crosses only the
+# helper's stdout and a 0600 file, never an argv. A bind-mounted
+# AI_MEMORY_DATA_DIR needs none of this (the client reads the same files), and
+# an explicit token wins.
+VOLUME_TOKEN_FILE="${NATIVE_RUNNER_DIR}/server-token"
+
+volume_token_applies() {
+  [ -z "${AI_MEMORY_AUTH_TOKEN:-}" ] || return 1
+  [ -z "${AI_MEMORY_AUTH__BEARER_TOKEN_FILE:-}" ] || return 1
+  if [ -n "${AI_MEMORY_DATA_DIR:-}" ] && [ -d "${AI_MEMORY_DATA_DIR}" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Point the native client at the host copy, when there is one.
+use_volume_token() {
+  volume_token_applies || return 0
+  [ -s "${VOLUME_TOKEN_FILE}" ] || return 0
+  export AI_MEMORY_AUTH__BEARER_TOKEN_FILE="${VOLUME_TOKEN_FILE}"
+}
+
+# Refresh the host copy from the volume, then use it. Only `install-hooks`,
+# the setup step, does this: the managed host commands (`run`, `show`, ...)
+# and `mcp-bridge`, which starts with every agent session, never enter the
+# container engine, so they read the copy it leaves behind. A volume that
+# answers with no token (auth turned off, the token file renamed or gone)
+# removes the copy, so a rotated-away bearer does not linger on the host; an
+# engine that cannot answer at all leaves the copy as it was.
+refresh_volume_token() {
+  volume_token_applies || return 0
+  local token
+  if ! token="$("${DOCKER}" run --rm -v "${DATA_VOLUME}:/data:ro" --entrypoint /bin/sh "${IMAGE}" -c \
+    'if grep -qs "^[[:space:]]*bearer_token_file[[:space:]]*=[[:space:]]*\"auth-tokens/default\"" /data/config.toml; then cat /data/auth-tokens/default 2>/dev/null; fi; exit 0' \
+    2>/dev/null)"; then
+    use_volume_token
+    return 0
+  fi
+  token="$(printf '%s' "${token}" | tr -d '\r\n')"
+  if [ -z "${token}" ]; then
+    rm -f "${VOLUME_TOKEN_FILE}"
+  else
+    (
+      umask 077
+      mkdir -p "${NATIVE_RUNNER_DIR}" \
+        && printf '%s\n' "${token}" >"${VOLUME_TOKEN_FILE}.tmp.$$" \
+        && mv -f "${VOLUME_TOKEN_FILE}.tmp.$$" "${VOLUME_TOKEN_FILE}"
+    ) 2>/dev/null || true
+  fi
+  use_volume_token
+}
+
 # ---- intercept wrapper-only subcommands ----------------------------------
 
-case "${1:-}" in
+# Resolve the command once for host interception and container URL routing.
+# Keep the original argv intact: the native client parses the same global options.
+WRAPPER_SUBCOMMAND=""
+EXPLICIT_HOST_CONFIG=0
+WRAPPER_ARGS=("$@")
+idx=0
+while [ "${idx}" -lt "${#WRAPPER_ARGS[@]}" ]; do
+  arg="${WRAPPER_ARGS[$idx]}"
+  case "${arg}" in
+    --config= | --data-dir=)
+      break
+      ;;
+    --config)
+      [ "$((idx + 1))" -lt "${#WRAPPER_ARGS[@]}" ] || break
+      case "${WRAPPER_ARGS[$((idx + 1))]}" in "" | -?*) break ;; esac
+      EXPLICIT_HOST_CONFIG=1
+      idx=$((idx + 2))
+      ;;
+    --config=*)
+      EXPLICIT_HOST_CONFIG=1
+      idx=$((idx + 1))
+      ;;
+    --data-dir)
+      [ "$((idx + 1))" -lt "${#WRAPPER_ARGS[@]}" ] || break
+      case "${WRAPPER_ARGS[$((idx + 1))]}" in "" | -?*) break ;; esac
+      idx=$((idx + 2))
+      ;;
+    --data-dir=*)
+      idx=$((idx + 1))
+      ;;
+    --*)
+      # Help, version and invalid options belong to the CLI parser. In
+      # particular, none may accidentally trigger the wrapper's upgrade.
+      break
+      ;;
+    *)
+      WRAPPER_SUBCOMMAND="${arg}"
+      break
+      ;;
+  esac
+done
+
+case "${WRAPPER_SUBCOMMAND}" in
   upgrade)
-    shift
     cmd_upgrade
     exit 0
     ;;
   run | show | continue | resume | workstreams | rename-workstream)
-    NATIVE_HOST_COMMAND=$1
-    shift
     NATIVE_HOST_BIN=$(native_host_binary)
-    exec "${NATIVE_HOST_BIN}" "${NATIVE_HOST_COMMAND}" "$@"
+    use_volume_token
+    exec "${NATIVE_HOST_BIN}" "$@"
     ;;
   install-hooks)
     # Capture exclusions and allowlist mode are client-side privacy controls.
@@ -605,6 +712,7 @@ case "${1:-}" in
       posix | windows) ;;
       *)
         NATIVE_HOST_BIN=$(native_host_binary)
+        refresh_volume_token
         exec "${NATIVE_HOST_BIN}" "$@"
         ;;
     esac
@@ -616,6 +724,7 @@ case "${1:-}" in
     # has no host networking), so the bridge must run on the host through
     # the same checksum-verified native client install-hooks uses.
     NATIVE_HOST_BIN=$(native_host_binary)
+    use_volume_token
     exec "${NATIVE_HOST_BIN}" "$@"
     ;;
   hook | hook-drain)
@@ -672,6 +781,7 @@ for var in \
   AI_MEMORY_HOOKS_HOST_ROOT \
   CLAUDE_CONFIG_DIR \
   CLAUDE_CODE_SESSION_ID \
+  MUSE_SESSION_ID \
   ANTHROPIC_API_KEY \
   ANTHROPIC_OAUTH_TOKEN \
   CLAUDE_CODE_OAUTH_TOKEN \
@@ -725,36 +835,6 @@ USER_ARGS=(-u "$(id -u):$(id -g)")
 # a host-reachable URL for config vs. a container-reachable URL for HTTP.
 # (issue #107)
 RENDERS_HOST_CONFIG=0
-WRAPPER_SUBCOMMAND=""
-EXPLICIT_HOST_CONFIG=0
-WRAPPER_ARGS=("$@")
-idx=0
-while [ "${idx}" -lt "${#WRAPPER_ARGS[@]}" ]; do
-  arg="${WRAPPER_ARGS[$idx]}"
-  case "${arg}" in
-    --config)
-      EXPLICIT_HOST_CONFIG=1
-      idx=$((idx + 2))
-      ;;
-    --config=*)
-      EXPLICIT_HOST_CONFIG=1
-      idx=$((idx + 1))
-      ;;
-    --data-dir)
-      idx=$((idx + 2))
-      ;;
-    --data-dir=*)
-      idx=$((idx + 1))
-      ;;
-    --*)
-      idx=$((idx + 1))
-      ;;
-    *)
-      WRAPPER_SUBCOMMAND="${arg}"
-      break
-      ;;
-  esac
-done
 WRITES_HOST_FILES=0
 case "${WRAPPER_SUBCOMMAND}" in
     install-mcp | install-hooks | setup-agent)
@@ -769,6 +849,29 @@ case "${WRAPPER_SUBCOMMAND}" in
       WRITES_HOST_FILES=1
       ;;
 esac
+# A full `uninstall --apply` unwires every hook and MCP entry that reads the
+# host copy of the volume's root bearer, so the copy goes too once the
+# container reports success. A dry run or an `--only` subset keeps it, and so
+# does an interactive run without `--yes`: uninstall then asks for
+# confirmation, and declining prints "aborted." and still exits 0, with
+# nothing removed.
+DROPS_VOLUME_TOKEN=0
+if [ "${WRAPPER_SUBCOMMAND}" = "uninstall" ]; then
+  uninstall_apply=0
+  uninstall_only=0
+  uninstall_yes=0
+  for arg in ${WRAPPER_ARGS[@]+"${WRAPPER_ARGS[@]:$((idx + 1))}"}; do
+    case "${arg}" in
+      --apply) uninstall_apply=1 ;;
+      --only | --only=*) uninstall_only=1 ;;
+      --yes) uninstall_yes=1 ;;
+    esac
+  done
+  if [ "${uninstall_apply}" -eq 1 ] && [ "${uninstall_only}" -eq 0 ] \
+    && { [ "${uninstall_yes}" -eq 1 ] || [ ! -t 0 ]; }; then
+    DROPS_VOLUME_TOKEN=1
+  fi
+fi
 # bootstrap only *reads* host files — the repo bind-mounted at /work and the
 # `.ai-memory.toml` markers under $HOME — but an unmapped UID and a confined
 # SELinux label block reads exactly as hard as writes. The failure is
@@ -993,6 +1096,15 @@ if [ "${WRAPPER_SUBCOMMAND}" = "completions" ]; then
   trap - EXIT
   [ "${OUTPUT_STATUS}" -eq 141 ] && exit 0
   exit "${OUTPUT_STATUS}"
+fi
+
+if [ "${DROPS_VOLUME_TOKEN}" -eq 1 ]; then
+  if "${DOCKER}" "${HELPER_ARGS[@]}"; then
+    rm -f "${VOLUME_TOKEN_FILE}"
+    exit 0
+  else
+    exit $?
+  fi
 fi
 
 exec "${DOCKER}" "${HELPER_ARGS[@]}"

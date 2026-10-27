@@ -150,7 +150,12 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
                 return Err(error).with_context(|| format!("inspecting {}", target_path.display()));
             }
         };
-        let identical = exists && files_have_same_digest(&target_path, staged)?;
+        let identical = exists
+            && files_have_same_digest(&target_path, staged)?
+            && entry
+                .mode
+                .zip(portable_mode(&target_path)?)
+                .is_none_or(|(expected, actual)| expected == actual);
         if identical {
             identical_count += 1;
         } else {
@@ -616,6 +621,7 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".openclaw/",
                 ".commandcode/",
                 ".kimi/",
+                ".qwen/",
             ];
             let allowed = rel_path == ".claude.json"
                 || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
@@ -631,6 +637,7 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 "CLAUDE.md",
                 "AGENTS.md",
                 "GEMINI.md",
+                "QWEN.md",
                 ".cursorrules",
                 "opencode.json",
                 "opencode.jsonc",

@@ -12,7 +12,8 @@ use ai_memory_core::{
     Sanitizer, WorkstreamEventKind,
 };
 use anyhow::{Context as _, Result, anyhow};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
+use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -22,6 +23,13 @@ use crate::{ManagedHarness, clean_path};
 
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
+const MAX_SESSION_HEADER_BYTES: usize = 128 * 1024;
+const MAX_SOURCE_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_EXPORTED_EVENTS: usize = 4_096;
+const MAX_EXPORTED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SOURCE_RECORDS: usize = 32_768;
+const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SESSION_METADATA_BYTES: u64 = 1024 * 1024;
 /// `agy` cuts `display` near 8 KiB; 4-byte UTF-8 and JSON escaping stay well
 /// under this.
 const MAX_ANTIGRAVITY_HISTORY_LINE_BYTES: usize = 64 * 1024;
@@ -32,6 +40,15 @@ const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed wor
 /// Event metadata key holding the working directory the event's own record
 /// was written in, when the harness records one per record.
 pub const RECORD_CWD_KEY: &str = "cwd";
+/// Prefix of the loss recorded for each JSONL record skipped for exceeding
+/// the per-record byte cap, so importers can count and report them.
+pub const OVERSIZED_RECORD_LOSS: &str = "oversized JSONL record skipped";
+/// Metadata flag on the annotation event that stands in for a skipped
+/// record, so the import's capture policy can tell its turn has a gap.
+pub const SKIPPED_RECORD_KEY: &str = "skipped_record";
+/// Part of the marker's event id seed: rewording it gives a replayed journal's
+/// markers new ids, so keep it stable.
+const SKIPPED_RECORD_NOTE: &str = "a transcript record over the per-record size cap was skipped";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +72,27 @@ pub struct ExportedTranscript {
     pub losses: Vec<String>,
 }
 
+/// Ordered semantic identity for a bounded transcript interval.
+#[must_use]
+pub fn transcript_interval_digests(events: &[NewWorkstreamEvent]) -> Vec<String> {
+    events.iter().map(transcript_event_digest).collect()
+}
+
+fn transcript_event_digest(event: &NewWorkstreamEvent) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        event.event_id.as_str(),
+        event.kind.as_str(),
+        event.role.as_deref().unwrap_or_default(),
+        event.occurred_at.as_deref().unwrap_or_default(),
+        event.content.as_str(),
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileCursor {
     path: String,
@@ -66,10 +104,10 @@ struct FileCursor {
     flavor: Option<FileFlavor>,
     /// Hash of every committed byte through `offset`. Kimi Code and Grok can
     /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
-    /// on rewind); Kiro's append-only behavior is not documented; `agy` may
-    /// trim its shared Antigravity history. Those adapters validate this
-    /// prefix before trusting the byte offset. Other JSONL adapters remain
-    /// offset-only.
+    /// on rewind); Kiro's and Copilot's append-only behavior is not
+    /// documented; `agy` may trim its shared Antigravity history. Those
+    /// adapters validate this prefix before trusting the byte offset. Other
+    /// JSONL adapters remain offset-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefix_sha256: Option<String>,
 }
@@ -105,7 +143,11 @@ const fn file_flavor(harness: ManagedHarness) -> Option<FileFlavor> {
 const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
     matches!(
         harness,
-        ManagedHarness::Kimi | ManagedHarness::Kiro | ManagedHarness::KiroV3 | ManagedHarness::Grok
+        ManagedHarness::Kimi
+            | ManagedHarness::Kiro
+            | ManagedHarness::KiroV3
+            | ManagedHarness::Grok
+            | ManagedHarness::Copilot
     )
 }
 
@@ -124,21 +166,450 @@ pub async fn export_transcript(
     native_session_id: &str,
     source_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
-    if harness == ManagedHarness::OpenCode {
-        return export_opencode(home, session_dir, native_session_id, source_cursor);
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    let source_cursor = source_cursor.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        export_transcript_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            source_cursor.as_deref(),
+            None,
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript reader failed: {error}"))?
+}
+
+fn export_transcript_blocking(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    let transcript = if harness == ManagedHarness::OpenCode {
+        export_opencode_range(
+            home,
+            session_dir,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    } else if harness == ManagedHarness::OpenCode2 {
+        export_opencode2_range(
+            home,
+            session_dir,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    } else if harness == ManagedHarness::Crush {
+        export_crush_range(
+            home,
+            cwd,
+            session_dir,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    } else if harness == ManagedHarness::Antigravity {
+        // Only user prompts are importable (from `agy`'s history.jsonl); a
+        // bounded recovery range is not supported for this harness.
+        if final_cursor.is_some() {
+            return Err(anyhow!(
+                "antigravity transcripts support no bounded recovery range; this session's events come from hook capture"
+            ));
+        }
+        export_antigravity(home, cwd, session_dir, native_session_id, source_cursor)?
+    } else {
+        let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
+            .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
+        export_jsonl_range(
+            harness,
+            &path,
+            native_session_id,
+            source_cursor,
+            final_cursor,
+        )?
+    };
+    validate_export_bounds(transcript)
+}
+
+/// Export only records inside an exact previously captured cursor range.
+/// Both cursor identities are validated against the adapter/session, and rows
+/// or bytes appended after `final_cursor` are never read.
+pub async fn export_transcript_range(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: Option<&str>,
+    final_cursor: &str,
+) -> Result<ExportedTranscript> {
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    let source_cursor = source_cursor.map(str::to_owned);
+    let final_cursor = final_cursor.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if let Some(source_cursor) = source_cursor.as_deref() {
+            validate_transcript_cursor(
+                harness,
+                &home,
+                &cwd,
+                session_dir.as_deref(),
+                &native_session_id,
+                source_cursor,
+            )?;
+        }
+        validate_transcript_cursor(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            &final_cursor,
+        )?;
+        validate_cursor_range(harness, source_cursor.as_deref(), &final_cursor)?;
+        export_transcript_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            source_cursor.as_deref(),
+            Some(&final_cursor),
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript range reader failed: {error}"))?
+}
+
+/// Export only records after a cursor previously returned for this exact
+/// adapter/session. Invalid or stale cursors fail closed instead of replaying
+/// the complete transcript.
+pub async fn export_transcript_delta(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: &str,
+) -> Result<ExportedTranscript> {
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    let source_cursor = source_cursor.to_owned();
+    tokio::task::spawn_blocking(move || {
+        validate_transcript_cursor(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            &source_cursor,
+        )?;
+        export_transcript_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+            Some(&source_cursor),
+            None,
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript delta reader failed: {error}"))?
+}
+
+fn validate_cursor_range(
+    harness: ManagedHarness,
+    source_cursor: Option<&str>,
+    final_cursor: &str,
+) -> Result<()> {
+    if matches!(
+        harness,
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush
+    ) {
+        let start = source_cursor
+            .map(serde_json::from_str::<SqlCursor>)
+            .transpose()
+            .context("invalid native transcript SQL cursor")?
+            .unwrap_or_default();
+        let end: SqlCursor = serde_json::from_str(final_cursor)
+            .context("invalid native transcript final SQL cursor")?;
+        if (end.updated, end.id.as_str()) < (start.updated, start.id.as_str()) {
+            return Err(anyhow!(
+                "native transcript final cursor precedes its start cursor"
+            ));
+        }
+    } else if let Some(source_cursor) = source_cursor {
+        let start: FileCursor =
+            serde_json::from_str(source_cursor).context("invalid native transcript file cursor")?;
+        let end: FileCursor = serde_json::from_str(final_cursor)
+            .context("invalid native transcript final file cursor")?;
+        if start.path != end.path || start.flavor != end.flavor || end.offset < start.offset {
+            return Err(anyhow!(
+                "native transcript final cursor precedes or changes its start cursor"
+            ));
+        }
     }
-    if harness == ManagedHarness::OpenCode2 {
-        return export_opencode2(home, session_dir, native_session_id, source_cursor);
+    Ok(())
+}
+
+fn validate_transcript_cursor(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    source_cursor: &str,
+) -> Result<()> {
+    if matches!(
+        harness,
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush
+    ) {
+        serde_json::from_str::<SqlCursor>(source_cursor)
+            .context("invalid native transcript SQL cursor")?;
+        return Ok(());
     }
-    if harness == ManagedHarness::Crush {
-        return export_crush(home, cwd, session_dir, native_session_id, source_cursor);
-    }
-    if harness == ManagedHarness::Antigravity {
-        return export_antigravity(home, cwd, session_dir, native_session_id, source_cursor);
-    }
+    let cursor: FileCursor =
+        serde_json::from_str(source_cursor).context("invalid native transcript file cursor")?;
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
         .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
-    export_jsonl(harness, &path, native_session_id, source_cursor)
+    if Path::new(&cursor.path) != cursor_path(harness, &path)
+        || cursor.flavor != file_flavor(harness)
+    {
+        return Err(anyhow!(
+            "native transcript cursor does not match this adapter session"
+        ));
+    }
+    if !transcript_reaches(harness, &path, cursor.offset)? {
+        return Err(anyhow!(
+            "native transcript cursor is past the current transcript end"
+        ));
+    }
+    if journal_rewrites_in_place(harness) {
+        let expected = cursor
+            .prefix_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow!("native transcript cursor has no prefix identity"))?;
+        let mut file = File::open(path)?;
+        let actual = hash_file_prefix(&mut file, cursor.offset)?
+            .map(|hasher| format!("{:x}", hasher.finalize()))
+            .ok_or_else(|| anyhow!("native transcript cursor prefix is incomplete"))?;
+        if actual != expected {
+            return Err(anyhow!(
+                "native transcript changed before the recovery cursor"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_export_bounds(transcript: ExportedTranscript) -> Result<ExportedTranscript> {
+    if transcript.events.len() > MAX_EXPORTED_EVENTS {
+        return Err(anyhow!(
+            "native transcript exceeds the {MAX_EXPORTED_EVENTS} event recovery limit"
+        ));
+    }
+    let mut bytes = 0_usize;
+    for event in &transcript.events {
+        bytes = bytes.saturating_add(serde_json::to_vec(event)?.len());
+        if bytes > MAX_EXPORTED_BYTES {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_EXPORTED_BYTES} byte recovery limit"
+            ));
+        }
+    }
+    Ok(transcript)
+}
+
+fn enforce_parse_bounds(
+    events: &[NewWorkstreamEvent],
+    checked_events: &mut usize,
+    event_bytes: &mut usize,
+    source_bytes: &mut usize,
+    source_record_bytes: usize,
+) -> Result<()> {
+    *source_bytes = source_bytes.saturating_add(source_record_bytes);
+    if *source_bytes > MAX_SOURCE_BYTES {
+        return Err(anyhow!(
+            "native transcript exceeds the {MAX_SOURCE_BYTES} source-byte limit"
+        ));
+    }
+    if events.len() > MAX_EXPORTED_EVENTS {
+        return Err(anyhow!(
+            "native transcript exceeds the {MAX_EXPORTED_EVENTS} event recovery limit"
+        ));
+    }
+    for event in &events[*checked_events..] {
+        *event_bytes = event_bytes.saturating_add(serde_json::to_vec(event)?.len());
+        if *event_bytes > MAX_EXPORTED_BYTES {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_EXPORTED_BYTES} byte recovery limit"
+            ));
+        }
+    }
+    *checked_events = events.len();
+    Ok(())
+}
+
+/// Capture the exact adapter cursor at the current end of one native session.
+/// Recovery may use it only for that same session and adapter.
+pub async fn transcript_baseline(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<String> {
+    let home = home.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    let session_dir = session_dir.map(Path::to_path_buf);
+    let native_session_id = native_session_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        transcript_baseline_blocking(
+            harness,
+            &home,
+            &cwd,
+            session_dir.as_deref(),
+            &native_session_id,
+        )
+    })
+    .await
+    .map_err(|error| anyhow!("native transcript baseline reader failed: {error}"))?
+}
+
+fn transcript_baseline_blocking(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<String> {
+    let sql_cursor = |db: PathBuf, sql: &str| -> Result<String> {
+        let connection = Connection::open_with_flags(
+            &db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let cursor = connection
+            .query_row(sql, params![native_session_id], |row| {
+                Ok(SqlCursor {
+                    updated: row.get(0)?,
+                    id: row.get(1)?,
+                })
+            })
+            .optional()?
+            .unwrap_or_default();
+        Ok(serde_json::to_string(&cursor)?)
+    };
+    match harness {
+        ManagedHarness::OpenCode => sql_cursor(
+            opencode_db(home, session_dir),
+            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
+        ),
+        ManagedHarness::OpenCode2 => sql_cursor(
+            opencode_db(home, session_dir),
+            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 ORDER BY time_updated DESC, id DESC LIMIT 1",
+        ),
+        ManagedHarness::Crush => sql_cursor(
+            crush_db(home, cwd, session_dir),
+            "SELECT updated_at, id FROM messages WHERE session_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1",
+        ),
+        ManagedHarness::Antigravity => Err(anyhow!(
+            "{} does not expose a reliable transcript cursor",
+            harness.as_str()
+        )),
+        _ => {
+            let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
+                .ok_or_else(|| {
+                    anyhow!("native transcript for {native_session_id} was not found")
+                })?;
+            let mut reader = open_transcript(harness, &path)?;
+            let mut offset = 0_u64;
+            let mut committed_offset = 0_u64;
+            let mut prefix_hasher = Sha256::new();
+            let mut line = Vec::new();
+            let mut records = 0_usize;
+            loop {
+                line.clear();
+                let read = std::io::Read::by_ref(&mut reader)
+                    .take((MAX_SOURCE_RECORD_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut line)?;
+                if read == 0 {
+                    break;
+                }
+                records += 1;
+                if records > MAX_SOURCE_RECORDS {
+                    return Err(anyhow!(
+                        "native transcript baseline exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+                    ));
+                }
+                let mut record_bytes = read as u64;
+                let mut complete = line.ends_with(b"\n");
+                // An oversized record is consumed exactly as `export_jsonl_range`
+                // skips it, so this cursor lands where an export would resume.
+                // Only harnesses that rewrite in place carry the prefix hash,
+                // so the others skip hashing a record that can reach 64 MiB.
+                let mut oversized_hasher = None;
+                if read > MAX_SOURCE_RECORD_BYTES {
+                    let rewrites = journal_rewrites_in_place(harness);
+                    let mut record_hasher = prefix_hasher.clone();
+                    let mut feed = |chunk: &[u8]| {
+                        if rewrites {
+                            record_hasher.update(chunk);
+                        }
+                    };
+                    feed(&line);
+                    if !complete {
+                        let budget = (MAX_SOURCE_BYTES as u64)
+                            .saturating_sub(offset.saturating_add(record_bytes));
+                        let (tail, newline) = discard_through_newline(
+                            &mut std::io::Read::by_ref(&mut reader).take(budget + 1),
+                            &mut feed,
+                        )?;
+                        record_bytes += tail;
+                        complete = newline;
+                    }
+                    oversized_hasher = Some(record_hasher);
+                }
+                offset = offset.saturating_add(record_bytes);
+                if offset > MAX_SOURCE_BYTES as u64 {
+                    return Err(anyhow!(
+                        "native transcript baseline exceeds the {MAX_SOURCE_BYTES} source-byte limit"
+                    ));
+                }
+                if !complete {
+                    break;
+                }
+                match oversized_hasher {
+                    Some(record_hasher) => prefix_hasher = record_hasher,
+                    None => prefix_hasher.update(&line),
+                }
+                committed_offset = offset;
+            }
+            Ok(serde_json::to_string(&FileCursor {
+                path: cursor_path(harness, &path).to_string_lossy().into_owned(),
+                offset: committed_offset,
+                flavor: file_flavor(harness),
+                prefix_sha256: journal_rewrites_in_place(harness)
+                    .then(|| format!("{:x}", prefix_hasher.finalize())),
+            })?)
+        }
+    }
 }
 
 /// New sessions appeared in a store that records no launch identity and none
@@ -475,6 +946,9 @@ pub async fn list_native_sessions(
 /// file's own recorded `cwd` until one matches — and returns that file's
 /// parent directory, which is correct on any platform by construction.
 ///
+/// Antigravity CLI keeps Knowledge Items under `<home>/.gemini/antigravity-cli/knowledge/`
+/// beside its `conversations/` directory.
+///
 /// Callers should pass the checkout's **repository root**, not an arbitrary
 /// subdirectory: Claude Code keys this store by repository root, so a
 /// worktree or a subdirectory shares the root's `memory/` directory. This
@@ -493,7 +967,7 @@ pub fn native_memory_dir(
     cwd: &Path,
     session_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    if harness != ManagedHarness::Claude {
+    if harness != ManagedHarness::Claude && harness != ManagedHarness::Antigravity {
         return None;
     }
     let mut files = collect_session_files(harness, home, session_dir).ok()?;
@@ -507,7 +981,11 @@ pub fn native_memory_dir(
             continue;
         };
         if same_path(&recorded_cwd, cwd) {
-            let memory_dir = path.parent()?.join("memory");
+            let memory_dir = match harness {
+                ManagedHarness::Claude => path.parent()?.join("memory"),
+                ManagedHarness::Antigravity => path.parent()?.parent()?.join("knowledge"),
+                _ => return None,
+            };
             return memory_dir.is_dir().then_some(memory_dir);
         }
     }
@@ -632,21 +1110,64 @@ pub async fn wait_for_transcript_flush(
     Ok(())
 }
 
+#[cfg(test)]
 fn export_jsonl(
     harness: ManagedHarness,
     path: &Path,
     native_session_id: &str,
     source_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
+    export_jsonl_range(harness, path, native_session_id, source_cursor, None)
+}
+
+fn export_jsonl_range(
+    harness: ManagedHarness,
+    path: &Path,
+    native_session_id: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
     let flavor = file_flavor(harness);
+    let compressed = compressed_codex_rollout(harness, path);
+    let named_path = cursor_path(harness, path);
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<FileCursor>(raw).ok())
         .filter(|cursor| {
-            Path::new(&cursor.path) == path && (cursor.flavor.is_none() || cursor.flavor == flavor)
+            Path::new(&cursor.path) == named_path
+                && (cursor.flavor.is_none() || cursor.flavor == flavor)
         });
+    let final_cursor = final_cursor
+        .map(serde_json::from_str::<FileCursor>)
+        .transpose()
+        .context("invalid native transcript final file cursor")?;
+    if final_cursor
+        .as_ref()
+        .is_some_and(|cursor| Path::new(&cursor.path) != named_path || cursor.flavor != flavor)
+    {
+        return Err(anyhow!(
+            "native transcript final cursor does not match this adapter session"
+        ));
+    }
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
-    let len = file.metadata()?.len();
+    // The file length of a compressed rollout says nothing about its content,
+    // and this reader does not trust the frame's optional content size: a
+    // final cursor is checked by decoding up to it, and otherwise the read
+    // below stops at the end of the stream or the source-byte budget.
+    let file_len = match (compressed, final_cursor.as_ref()) {
+        (false, _) => file.metadata()?.len(),
+        (true, Some(cursor)) if transcript_reaches(harness, path, cursor.offset)? => cursor.offset,
+        (true, Some(_)) => 0,
+        (true, None) => u64::MAX,
+    };
+    let len = final_cursor
+        .as_ref()
+        .map_or(file_len, |cursor| cursor.offset);
+    if len > file_len {
+        return Err(anyhow!(
+            "native transcript final cursor is past the current transcript end"
+        ));
+    }
     let (start, mut prefix_hasher) = if journal_rewrites_in_place(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
@@ -664,20 +1185,133 @@ fn export_jsonl(
             Sha256::new(),
         )
     };
-    file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new(file);
+    let (mut reader, start): (Box<dyn BufRead>, u64) = if compressed {
+        // A zstd stream cannot seek: decode and drop the bytes before `start`.
+        // A shorter stream ends the skip early, which clamps `start` the way
+        // `min(len)` clamps it for a plain file.
+        let mut reader = transcript_reader(harness, path, file)?;
+        let skipped = std::io::copy(
+            &mut std::io::Read::by_ref(&mut reader).take(start),
+            &mut std::io::sink(),
+        )?;
+        (reader, skipped)
+    } else {
+        file.seek(SeekFrom::Start(start))?;
+        (Box::new(BufReader::new(file)), start)
+    };
     let mut offset = start;
     let mut committed_offset = start;
     let mut line = Vec::new();
     let mut events = Vec::new();
     let mut losses = Vec::new();
+    let mut records = 0_usize;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
     let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
+        let remaining = len.saturating_sub(offset);
+        if remaining == 0 {
+            break;
+        }
+        let read_limit = remaining.min((MAX_SOURCE_RECORD_BYTES + 1) as u64);
+        let read = std::io::Read::by_ref(&mut reader)
+            .take(read_limit)
+            .read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        if read > MAX_SOURCE_RECORD_BYTES {
+            // One record over the cap (an image in a Claude Code tool result
+            // is the usual one) is skipped as a loss rather than failing the
+            // whole session. Its tail is discarded in bounded chunks and still
+            // counts toward the source-byte cap, and only a complete record
+            // moves the cursor: one still being written is read again, from
+            // its start, by the next export.
+            let record_start = offset;
+            let rewrites = journal_rewrites_in_place(harness);
+            let mut record_hasher = prefix_hasher.clone();
+            let mut raw_hasher = Sha256::new();
+            let mut feed = |chunk: &[u8]| {
+                if rewrites {
+                    record_hasher.update(chunk);
+                    raw_hasher.update(chunk.strip_suffix(b"\n").unwrap_or(chunk));
+                }
+            };
+            feed(&line);
+            let (tail, complete) = if line.ends_with(b"\n") {
+                (0, true)
+            } else {
+                let budget = MAX_SOURCE_BYTES.saturating_sub(source_bytes.saturating_add(read));
+                let limit = (remaining - read as u64).min(budget as u64 + 1);
+                discard_through_newline(
+                    &mut std::io::Read::by_ref(&mut reader).take(limit),
+                    &mut feed,
+                )?
+            };
+            let record_bytes = read as u64 + tail;
+            enforce_parse_bounds(
+                &events,
+                &mut checked_events,
+                &mut event_bytes,
+                &mut source_bytes,
+                usize::try_from(record_bytes).unwrap_or(usize::MAX),
+            )?;
+            offset += record_bytes;
+            if !complete {
+                break;
+            }
+            // The same record id rule as a parsed record, so the marker keeps
+            // its event id across a journal rewrite.
+            let record_id = if rewrites {
+                prefix_hasher = record_hasher;
+                format!("{:x}", raw_hasher.finalize())
+            } else {
+                format!("byte-{record_start}")
+            };
+            committed_offset = offset;
+            losses.push(format!(
+                "{OVERSIZED_RECORD_LOSS} at byte {record_start} ({record_bytes} bytes, over the {MAX_SOURCE_RECORD_BYTES} byte cap)"
+            ));
+            // The skipped record may have been a tool call. Its result can
+            // carry no id (Kimi, Grok), and the capture policy judges such a
+            // result by the calls of its turn, so the gap is marked for it to
+            // fail closed on instead of lending the result a sibling's keep.
+            push_event(
+                &mut events,
+                harness.agent_kind(),
+                native_session_id,
+                &record_id,
+                0,
+                WorkstreamEventKind::Annotation,
+                None,
+                SKIPPED_RECORD_NOTE,
+                None,
+                json!({ SKIPPED_RECORD_KEY: true, "bytes": record_bytes }),
+            );
+            enforce_parse_bounds(
+                &events,
+                &mut checked_events,
+                &mut event_bytes,
+                &mut source_bytes,
+                0,
+            )?;
+            continue;
+        }
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            read,
+        )?;
         offset += read as u64;
         if !line.ends_with(b"\n") {
             break;
@@ -769,6 +1403,13 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::Copilot => parse_copilot(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::OpenCode
             | ManagedHarness::OpenCode2
             | ManagedHarness::Crush
@@ -794,6 +1435,13 @@ fn export_jsonl(
             _ => None,
         };
         stamp_record_cwd(&mut events[first_event..], record_cwd);
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     if harness == ManagedHarness::Kimi {
         annotate_kimi_subagents(path, &mut losses);
@@ -801,11 +1449,16 @@ fn export_jsonl(
     Ok(ExportedTranscript {
         native_session_id: native_session_id.to_string(),
         source_cursor: Some(serde_json::to_string(&FileCursor {
-            path: path.to_string_lossy().into_owned(),
+            path: named_path.to_string_lossy().into_owned(),
             offset: committed_offset,
             flavor,
-            prefix_sha256: journal_rewrites_in_place(harness)
-                .then(|| format!("{:x}", prefix_hasher.finalize())),
+            prefix_sha256: if journal_rewrites_in_place(harness) {
+                final_cursor
+                    .and_then(|cursor| cursor.prefix_sha256.clone())
+                    .or_else(|| Some(format!("{:x}", prefix_hasher.finalize())))
+            } else {
+                None
+            },
         })?),
         events,
         losses: deduplicate_losses(losses),
@@ -844,6 +1497,33 @@ fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
         remaining -= read as u64;
     }
     Ok(Some(hasher))
+}
+
+/// Consume the rest of an oversized record through its newline, holding at
+/// most 64 KiB of it at a time and handing every chunk to `feed`; only the
+/// last chunk can end with the newline. Returns the bytes consumed and
+/// whether the newline was reached before `reader` ran out.
+fn discard_through_newline(
+    reader: &mut impl BufRead,
+    feed: &mut impl FnMut(&[u8]),
+) -> std::io::Result<(u64, bool)> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut chunk = Vec::new();
+    let mut consumed = 0_u64;
+    loop {
+        chunk.clear();
+        let read = std::io::Read::by_ref(reader)
+            .take(CHUNK)
+            .read_until(b'\n', &mut chunk)?;
+        if read == 0 {
+            return Ok((consumed, false));
+        }
+        feed(&chunk);
+        consumed += read as u64;
+        if chunk.ends_with(b"\n") {
+            return Ok((consumed, true));
+        }
+    }
 }
 
 fn parse_claude(
@@ -2149,6 +2829,152 @@ fn parse_grok(
     }
 }
 
+/// Copilot CLI `events.jsonl` records (verified on 1.0.92). Each record is
+/// `{type, data, id, timestamp, parentId}`. Only the user's typed text, the
+/// assistant's visible text and tool requests, completed tool output, and
+/// compaction summaries are imported. `transformedContent` (the prompt with
+/// injected datetime/context), `reasoningText`/`reasoningOpaque`, hook output
+/// (where ai-memory's own startup packet lands), permission prompts, model
+/// snapshots, and session telemetry never reach the ledger.
+fn parse_copilot(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let data = value.get("data").unwrap_or(&Value::Null);
+    match record_type {
+        "system.message" => {
+            losses.push("Copilot system prompt records were intentionally excluded".into());
+        }
+        "model.messages_snapshot" => {
+            losses.push("Copilot model message snapshots were intentionally excluded".into());
+        }
+        "user.message" => {
+            if let Some(text) = data.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::CopilotCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    text,
+                    timestamp(value),
+                    json!({}),
+                );
+            }
+        }
+        "assistant.message" => {
+            if ["reasoningText", "reasoningOpaque", "reasoningBlocks"]
+                .iter()
+                .any(|key| data.get(*key).is_some_and(|value| !value.is_null()))
+            {
+                losses.push("Copilot hidden reasoning was intentionally excluded".into());
+            }
+            let block_count = match data.get("content").and_then(Value::as_str) {
+                Some(text) if !text.trim().is_empty() => {
+                    push_event(
+                        events,
+                        AgentKind::CopilotCli,
+                        session,
+                        record_id,
+                        0,
+                        WorkstreamEventKind::Message,
+                        Some("assistant"),
+                        text,
+                        timestamp(value),
+                        json!({}),
+                    );
+                    1
+                }
+                _ => 0,
+            };
+            let requests = data
+                .get("toolRequests")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for (index, request) in requests.iter().enumerate() {
+                let name = first_string(request, &["name"]).unwrap_or("tool");
+                let arguments = request
+                    .get("arguments")
+                    .map(compact_json)
+                    .unwrap_or_default();
+                push_event(
+                    events,
+                    AgentKind::CopilotCli,
+                    session,
+                    record_id,
+                    block_count + index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {arguments}"),
+                    timestamp(value),
+                    with_tool_use_id(
+                        json!({"tool": name}),
+                        first_string(request, &["toolCallId"]),
+                    ),
+                );
+            }
+        }
+        "tool.execution_complete" => {
+            let success = data.get("success").and_then(Value::as_bool);
+            // `detailedContent` repeats the output as a diff carrying absolute
+            // paths; the model-visible `content` is the portable record.
+            let body = if success == Some(false) {
+                data.get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .map(|message| format!("error: {message}"))
+            } else {
+                data.get("result")
+                    .and_then(|result| result.get("content"))
+                    .map(value_text)
+            };
+            push_event(
+                events,
+                AgentKind::CopilotCli,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolResult,
+                Some("tool"),
+                body.as_deref().unwrap_or_default(),
+                timestamp(value),
+                with_tool_use_id(
+                    json!({"success": success}),
+                    first_string(data, &["toolCallId"]),
+                ),
+            );
+        }
+        "session.compaction_complete" => {
+            if data.get("success").and_then(Value::as_bool) == Some(true)
+                && let Some(text) = data.get("summaryContent").and_then(Value::as_str)
+            {
+                push_event(
+                    events,
+                    AgentKind::CopilotCli,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Compaction,
+                    Some("assistant"),
+                    text,
+                    timestamp(value),
+                    json!({}),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_content_blocks(
     agent: AgentKind,
@@ -2306,11 +3132,22 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn export_opencode(
     home: &Path,
     session_dir: Option<&Path>,
     session: &str,
     source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    export_opencode_range(home, session_dir, session, source_cursor, None)
+}
+
+fn export_opencode_range(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let db = opencode_db(home, session_dir);
     let connection = Connection::open_with_flags(
@@ -2326,25 +3163,57 @@ fn export_opencode(
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
+    let upper = final_cursor
+        .map(serde_json::from_str::<SqlCursor>)
+        .transpose()
+        .context("invalid native transcript final SQL cursor")?
+        .unwrap_or(SqlCursor {
+            updated: i64::MAX,
+            id: "\u{10ffff}".to_string(),
+        });
     let mut statement = connection.prepare(
-        "SELECT p.id, p.time_updated, m.data, p.data
+        "SELECT p.id, p.time_updated, length(m.data), length(p.data), m.data, p.data
          FROM part p JOIN message m ON m.id = p.message_id
          WHERE p.session_id = ?1 AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND p.id > ?3))
-         ORDER BY p.time_updated, p.id",
+           AND (p.time_updated < ?4 OR (p.time_updated = ?4 AND p.id <= ?5))
+         ORDER BY p.time_updated, p.id
+         LIMIT ?6",
     )?;
-    let rows = statement.query_map(params![session, cursor.updated, cursor.id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
+    let mut rows = statement.query(params![
+        session,
+        cursor.updated,
+        cursor.id,
+        upper.updated,
+        upper.id,
+        (MAX_SOURCE_RECORDS + 1) as i64
+    ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
     let mut next_cursor = cursor;
-    for row in rows {
-        let (id, updated, message_raw, part_raw) = row?;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
+    let mut records = 0_usize;
+    while let Some(row) = rows.next()? {
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        let updated = row.get::<_, i64>(1)?;
+        let message_len = row.get::<_, usize>(2)?;
+        let part_len = row.get::<_, usize>(3)?;
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            message_len.saturating_add(part_len),
+        )?;
+        let id = row.get::<_, String>(0)?;
+        let message_raw = row.get::<_, String>(4)?;
+        let part_raw = row.get::<_, String>(5)?;
         next_cursor = SqlCursor {
             updated,
             id: id.clone(),
@@ -2358,6 +3227,13 @@ fn export_opencode(
             continue;
         };
         parse_opencode(&message, &part, session, &id, &mut events, &mut losses);
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -2367,12 +3243,24 @@ fn export_opencode(
     })
 }
 
+#[cfg(test)]
 fn export_crush(
     home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     session: &str,
     source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    export_crush_range(home, cwd, session_dir, session, source_cursor, None)
+}
+
+fn export_crush_range(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let db = crush_db(home, cwd, session_dir);
     let connection = Connection::open_with_flags(
@@ -2383,27 +3271,57 @@ fn export_crush(
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
+    let upper = final_cursor
+        .map(serde_json::from_str::<SqlCursor>)
+        .transpose()
+        .context("invalid native transcript final SQL cursor")?
+        .unwrap_or(SqlCursor {
+            updated: i64::MAX,
+            id: "\u{10ffff}".to_string(),
+        });
     let mut statement = connection.prepare(
-        "SELECT id, role, parts, updated_at, is_summary_message \
+        "SELECT id, role, length(parts), parts, updated_at, is_summary_message \
          FROM messages \
          WHERE session_id = ?1 \
            AND (updated_at > ?2 OR (updated_at = ?2 AND id > ?3)) \
-         ORDER BY updated_at, id",
+           AND (updated_at < ?4 OR (updated_at = ?4 AND id <= ?5)) \
+         ORDER BY updated_at, id LIMIT ?6",
     )?;
-    let rows = statement.query_map(params![session, cursor.updated, cursor.id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-        ))
-    })?;
+    let mut rows = statement.query(params![
+        session,
+        cursor.updated,
+        cursor.id,
+        upper.updated,
+        upper.id,
+        (MAX_SOURCE_RECORDS + 1) as i64
+    ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
     let mut next_cursor = cursor;
-    for row in rows {
-        let (id, role, parts_raw, updated, is_summary) = row?;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
+    let mut records = 0_usize;
+    while let Some(row) = rows.next()? {
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        let parts_len = row.get::<_, usize>(2)?;
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            parts_len,
+        )?;
+        let id = row.get::<_, String>(0)?;
+        let role = row.get::<_, String>(1)?;
+        let parts_raw = row.get::<_, String>(3)?;
+        let updated = row.get::<_, i64>(4)?;
+        let is_summary = row.get::<_, i64>(5)?;
         next_cursor = SqlCursor {
             updated,
             id: id.clone(),
@@ -2425,6 +3343,13 @@ fn export_crush(
             &mut events,
             &mut losses,
         );
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -2663,6 +3588,15 @@ fn locate_session_file(
         let exact = root.join(format!("{id}.db"));
         return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
     }
+    if harness == ManagedHarness::Copilot {
+        // The session directory is named by its UUID, so no scan is needed;
+        // the header still has to name this checkout.
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let exact = root.join(id).join("events.jsonl");
+        return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
+    }
     if harness == ManagedHarness::Claude {
         // The project folder is the cwd with every character outside
         // `[A-Za-z0-9]` turned into `-` (#1167). A name that does not derive
@@ -2873,6 +3807,19 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
         // One SQLite database per conversation, named by its id.
         return path.extension().is_some_and(|ext| ext == "db");
     }
+    if harness == ManagedHarness::Copilot {
+        // `<session-state>/<uuid>/events.jsonl` only; checkpoints, files and
+        // research artifacts in the same directory are not transcripts.
+        return path.file_name().and_then(|name| name.to_str()) == Some("events.jsonl")
+            && path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| Uuid::parse_str(name).is_ok());
+    }
+    if compressed_codex_rollout(harness, path) {
+        return !cursor_path(harness, path).exists();
+    }
     path.extension().is_some_and(|ext| ext == "jsonl")
         || matches!(harness, ManagedHarness::Pi | ManagedHarness::Omp) && temporary_transcript(path)
 }
@@ -2883,6 +3830,245 @@ fn temporary_transcript(path: &Path) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains(".jsonl."))
+}
+
+/// Codex moves a rollout it has not written for seven days to a zstd
+/// `rollout-*.jsonl.zst` sibling, keeping its modification time, and restores
+/// the plain `.jsonl` when it reopens that session to write to it, which
+/// `codex resume` does at startup. A reader that finds both uses the plain
+/// file. The compressed copy is the same session, so it is located, listed and
+/// read like the plain one, and a cursor names the plain path in either form.
+/// Modeled on Codex 0.163.0: `RolloutFile::from_path` and
+/// `materialize_rollout_for_append` in
+/// <https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/rollout/src/compression.rs>
+/// and the `Resume` arm of `RolloutRecorder::new_inner` in
+/// <https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/rollout/src/recorder.rs>.
+fn compressed_codex_rollout(harness: ManagedHarness, path: &Path) -> bool {
+    harness == ManagedHarness::Codex
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl.zst"))
+}
+
+/// The path a file cursor names: the plain `.jsonl` a compressed Codex rollout
+/// is restored to, so a cursor stays valid across Codex's own conversion.
+fn cursor_path(harness: ManagedHarness, path: &Path) -> PathBuf {
+    if compressed_codex_rollout(harness, path) {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Open a transcript for sequential reads, decompressing a compressed Codex
+/// rollout.
+fn open_transcript(harness: ManagedHarness, path: &Path) -> std::io::Result<Box<dyn BufRead>> {
+    transcript_reader(harness, path, File::open(path)?)
+}
+
+/// [`open_transcript`] over a file already opened at `path`.
+fn transcript_reader(
+    harness: ManagedHarness,
+    path: &Path,
+    file: File,
+) -> std::io::Result<Box<dyn BufRead>> {
+    if compressed_codex_rollout(harness, path) {
+        return Ok(Box::new(BufReader::new(ZstdFrames::new(BufReader::new(
+            file,
+        ))?)));
+    }
+    Ok(Box::new(BufReader::new(file)))
+}
+
+/// Whether a transcript holds at least `offset` bytes of content, counted in
+/// decompressed bytes for a compressed Codex rollout, which is decoded only
+/// up to `offset` rather than trusting the frame's optional content size.
+fn transcript_reaches(harness: ManagedHarness, path: &Path, offset: u64) -> std::io::Result<bool> {
+    if compressed_codex_rollout(harness, path) {
+        let decoded = std::io::copy(
+            &mut std::io::Read::take(open_transcript(harness, path)?, offset),
+            &mut std::io::sink(),
+        )?;
+        return Ok(decoded == offset);
+    }
+    Ok(fs::metadata(path)?.len() >= offset)
+}
+
+/// Every frame of a zstd stream, in order. `StreamingDecoder` stops after one;
+/// Codex writes a single frame, but the format allows a concatenation, which
+/// `zstd -d` reads whole. A skippable frame, which Codex never writes, is
+/// reported as a decoding error.
+struct ZstdFrames<R: BufRead> {
+    decoder: Option<StreamingDecoder<TrackedSource<R>, FrameDecoder>>,
+    source_error: SourceError,
+}
+
+impl<R: BufRead> ZstdFrames<R> {
+    fn new(source: R) -> std::io::Result<Self> {
+        let source_error = SourceError::default();
+        let source = TrackedSource {
+            inner: source,
+            error: source_error.clone(),
+        };
+        let decoder = StreamingDecoder::new(source).map_err(|error| source_error.or(error))?;
+        Ok(Self {
+            decoder: Some(decoder),
+            source_error,
+        })
+    }
+}
+
+impl<R: BufRead> std::io::Read for ZstdFrames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while let Some(decoder) = self.decoder.as_mut() {
+            let read = decoder
+                .read(buf)
+                .map_err(|error| self.source_error.or(error))?;
+            if read > 0 || buf.is_empty() {
+                return Ok(read);
+            }
+            let Some(finished) = self.decoder.take() else {
+                break;
+            };
+            let mut source = finished.into_inner();
+            if !source.fill_buf()?.is_empty() {
+                self.decoder = Some(
+                    StreamingDecoder::new(source).map_err(|error| self.source_error.or(error))?,
+                );
+            }
+        }
+        Ok(0)
+    }
+}
+
+/// The decoder reports a failed read of its input as one of its own errors.
+/// The input's last I/O error is kept here so a file that could not be read is
+/// reported as such, and only a stream that is not valid zstd counts as damaged.
+#[derive(Clone, Default)]
+struct SourceError(std::rc::Rc<std::cell::RefCell<Option<std::io::Error>>>);
+
+impl SourceError {
+    fn record(&self, error: &std::io::Error) {
+        *self.0.borrow_mut() = Some(std::io::Error::new(error.kind(), error.to_string()));
+    }
+
+    /// The input's I/O error if the decoder failed because of one, else a
+    /// decoding error.
+    fn or(&self, error: impl std::fmt::Display) -> std::io::Error {
+        self.0
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| zstd_decode_error(error))
+    }
+}
+
+struct TrackedSource<R> {
+    inner: R,
+    error: SourceError,
+}
+
+impl<R: BufRead> std::io::Read for TrackedSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner
+            .read(buf)
+            .inspect_err(|error| self.error.record(error))
+    }
+}
+
+impl<R: BufRead> BufRead for TrackedSource<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner
+            .fill_buf()
+            .inspect_err(|error| self.error.record(error))
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+    }
+}
+
+/// A compressed rollout whose bytes are not a zstd stream this reader decodes.
+#[derive(Debug)]
+struct ZstdDecodeError(String);
+
+impl std::fmt::Display for ZstdDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid zstd stream: {}", self.0)
+    }
+}
+
+impl std::error::Error for ZstdDecodeError {}
+
+fn zstd_decode_error(error: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        ZstdDecodeError(error.to_string()),
+    )
+}
+
+fn is_zstd_decode_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ZstdDecodeError>())
+}
+
+fn read_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native transcript metadata exceeds its byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native transcript metadata exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// One line read under a byte cap.
+enum CappedLine {
+    /// The reader was already at end of file.
+    Eof,
+    /// The line fits the cap and is valid UTF-8.
+    Line(String),
+    /// The line is longer than the cap, so the caller skips the record.
+    Oversized,
+}
+
+/// Read one newline-terminated line, buffering at most `cap + 1` bytes so an
+/// oversized record can be recognised without reading it.
+///
+/// `BufRead::read_line` validates UTF-8 over exactly the bytes it read, so a
+/// `Take` boundary landing inside a multi-byte character makes it fail with
+/// `InvalidData` before the caller can compare the byte count against its cap
+/// — which turns a record meant to be skipped into an error. Reading bytes and
+/// decoding only a line that fits keeps the cap decidable wherever the
+/// boundary falls, while a line within the cap is still rejected when it is
+/// not valid UTF-8. This matches the byte-safe `read_until` the transcript
+/// readers already use.
+fn read_capped_line<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<CappedLine> {
+    let mut bytes = Vec::new();
+    let read =
+        std::io::Read::take(reader.by_ref(), (cap + 1) as u64).read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(CappedLine::Eof);
+    }
+    if read > cap {
+        return Ok(CappedLine::Oversized);
+    }
+    String::from_utf8(bytes).map(CappedLine::Line).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
@@ -2901,13 +4087,24 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
     if harness == ManagedHarness::Antigravity {
         return antigravity_session_header(path);
     }
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
+    if harness == ManagedHarness::Copilot {
+        return copilot_session_header(path);
+    }
+    // A damaged compressed rollout has no readable header, like a plain file
+    // with no parseable line; it is skipped rather than failing the store.
+    let mut reader = match open_transcript(harness, path) {
+        Ok(reader) => reader,
+        Err(error) if is_zstd_decode_error(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     for _ in 0..64 {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
+        let line = match read_capped_line(&mut reader, MAX_SESSION_HEADER_BYTES) {
+            Ok(CappedLine::Eof) => break,
+            Ok(CappedLine::Oversized) => return Ok(None),
+            Ok(CappedLine::Line(line)) => line,
+            Err(error) if is_zstd_decode_error(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -2935,7 +4132,8 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             | ManagedHarness::Kiro
             | ManagedHarness::KiroV3
             | ManagedHarness::Grok
-            | ManagedHarness::Antigravity => (None, None),
+            | ManagedHarness::Antigravity
+            | ManagedHarness::Copilot => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -2955,12 +4153,9 @@ fn command_code_session_header(path: &Path) -> Result<Option<(String, PathBuf)>>
         return Ok(None);
     }
     let mut reader = BufReader::new(File::open(path)?);
-    let mut line = String::new();
-    let read =
-        std::io::Read::take(&mut reader, (MAX_EVENT_BYTES + 1) as u64).read_line(&mut line)?;
-    if read == 0 || read > MAX_EVENT_BYTES {
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
         return Ok(None);
-    }
+    };
     let Ok(header) = serde_json::from_str::<Value>(&line) else {
         return Ok(None);
     };
@@ -2982,6 +4177,43 @@ fn command_code_session_header(path: &Path) -> Result<Option<(String, PathBuf)>>
         || timestamp.parse::<jiff::Timestamp>().is_err()
         || !cwd.is_absolute()
     {
+        return Ok(None);
+    }
+    Ok(Some((id.to_string(), cwd)))
+}
+
+/// Copilot CLI opens every `events.jsonl` with a `session.start` record
+/// naming the session and its working directory. Fail closed when that first
+/// record is missing, oversized, or disagrees with the directory name.
+fn copilot_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(dir_id) = path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return Ok(None);
+    };
+    let mut reader = BufReader::new(File::open(path)?);
+    let CappedLine::Line(line) = read_capped_line(&mut reader, MAX_EVENT_BYTES)? else {
+        return Ok(None);
+    };
+    let Ok(header) = serde_json::from_str::<Value>(&line) else {
+        return Ok(None);
+    };
+    if header.get("type").and_then(Value::as_str) != Some("session.start") {
+        return Ok(None);
+    }
+    let data = header.get("data").unwrap_or(&Value::Null);
+    let (Some(id), Some(cwd)) = (
+        data.get("sessionId").and_then(Value::as_str),
+        data.get("context")
+            .and_then(|context| context.get("cwd"))
+            .and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let cwd = PathBuf::from(cwd);
+    if id != dir_id || Uuid::parse_str(id).is_err() || !cwd.is_absolute() {
         return Ok(None);
     }
     Ok(Some((id.to_string(), cwd)))
@@ -3011,10 +4243,11 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Some(session_dir) = path.ancestors().nth(3) else {
         return Ok(None);
     };
-    let Ok(raw) = fs::read_to_string(session_dir.join("state.json")) else {
+    let Ok(raw) = read_bounded_file(&session_dir.join("state.json"), MAX_SESSION_METADATA_BYTES)
+    else {
         return Ok(None);
     };
-    let Ok(state) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(state) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
@@ -3057,10 +4290,11 @@ fn kiro_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     if Uuid::parse_str(stem).is_err() {
         return Ok(None);
     }
-    let Ok(raw) = fs::read_to_string(path.with_extension("json")) else {
+    let Ok(raw) = read_bounded_file(&path.with_extension("json"), MAX_SESSION_METADATA_BYTES)
+    else {
         return Ok(None);
     };
-    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(metadata) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     let Some(id) = metadata.get("session_id").and_then(Value::as_str) else {
@@ -3094,10 +4328,13 @@ fn kiro_v3_session_header(path: &Path, cwd: &Path) -> Result<Option<(String, Pat
     if Uuid::parse_str(uuid).is_err() {
         return Ok(None);
     }
-    let Ok(raw) = fs::read_to_string(session_dir.join("session.json")) else {
+    let Ok(raw) = read_bounded_file(
+        &session_dir.join("session.json"),
+        MAX_SESSION_METADATA_BYTES,
+    ) else {
         return Ok(None);
     };
-    let Ok(metadata) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(metadata) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     if metadata.get("schemaVersion").and_then(Value::as_str) != Some("1.0.0")
@@ -3127,10 +4364,13 @@ fn grok_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
     let Some(session_dir) = path.parent() else {
         return Ok(None);
     };
-    let Ok(raw) = fs::read_to_string(session_dir.join("summary.json")) else {
+    let Ok(raw) = read_bounded_file(
+        &session_dir.join("summary.json"),
+        MAX_SESSION_METADATA_BYTES,
+    ) else {
         return Ok(None);
     };
-    let Ok(summary) = serde_json::from_str::<Value>(&raw) else {
+    let Ok(summary) = serde_json::from_slice::<Value>(&raw) else {
         return Ok(None);
     };
     let info = summary.get("info").unwrap_or(&Value::Null);
@@ -3173,15 +4413,18 @@ fn export_antigravity(
         Some((path, file, len))
     });
     let Some((history, mut file, len)) = opened else {
-        losses.push(
-            "Antigravity history.jsonl is missing or unreadable; no user prompts were imported"
-                .into(),
-        );
+        let events = antigravity_brain_prompt_events(home, session_dir, session, &mut losses);
+        if events.is_empty() {
+            losses.push(
+                "Antigravity history.jsonl and brain transcript are missing or unreadable; no user prompts were imported"
+                    .into(),
+            );
+        }
         losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
         return Ok(ExportedTranscript {
             native_session_id: session.to_string(),
             source_cursor: None,
-            events: Vec::new(),
+            events,
             losses,
         });
     };
@@ -3211,6 +4454,7 @@ fn export_antigravity(
     let mut offset = start;
     let mut line = Vec::new();
     let mut prompts: Vec<HistoryPrompt> = Vec::new();
+    let mut saw_session_prompt = false;
     // Unlabelled prompts from this checkout that could have opened it.
     let mut openers: Vec<HistoryPrompt> = Vec::new();
     loop {
@@ -3278,6 +4522,7 @@ fn export_antigravity(
                 losses.push("Antigravity shell commands were intentionally excluded".into());
             }
             (Some(_), AntigravityHistoryKind::Prompt) => {
+                saw_session_prompt = true;
                 if in_checkout(entry.workspace) {
                     prompts.push(prompt());
                 } else {
@@ -3327,6 +4572,17 @@ fn export_antigravity(
             prompt.metadata,
         );
     }
+    // A prompt explicitly attributed to this conversation but typed in a
+    // different checkout is authoritative scope evidence. Falling back to
+    // the conversation-wide brain log here would re-admit the rejected text.
+    if events.is_empty() && !saw_session_prompt {
+        events.extend(antigravity_brain_prompt_events(
+            home,
+            session_dir,
+            session,
+            &mut losses,
+        ));
+    }
     losses.push(ANTIGRAVITY_PROMPTS_ONLY.into());
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -3341,7 +4597,182 @@ fn export_antigravity(
     })
 }
 
-const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only user prompts from history.jsonl were imported";
+const ANTIGRAVITY_PROMPTS_ONLY: &str = "Antigravity assistant and tool steps are not decodable; only explicit user prompts were imported";
+
+const MAX_ANTIGRAVITY_BRAIN_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ANTIGRAVITY_BRAIN_LINE_BYTES: usize = 1024 * 1024;
+
+fn antigravity_brain_prompt_events(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    losses: &mut Vec<String>,
+) -> Vec<NewWorkstreamEvent> {
+    let session_root = session_root(ManagedHarness::Antigravity, home, session_dir);
+    let Some(root) = session_root.parent() else {
+        return Vec::new();
+    };
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let logs = root
+        .join("brain")
+        .join(session)
+        .join(".system_generated")
+        .join("logs");
+    let opened = ["transcript.jsonl", "transcript_full.jsonl"]
+        .into_iter()
+        .map(|name| logs.join(name))
+        .find_map(|candidate| open_contained_antigravity_transcript(&root, &candidate));
+    let Some(file) = opened else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let start = offset;
+        let read = match read_bounded_line(
+            &mut reader,
+            MAX_ANTIGRAVITY_BRAIN_LINE_BYTES,
+            b"USER_INPUT",
+            &mut line,
+            &mut Sha256::new(),
+        ) {
+            Ok(BoundedLine::Line(read)) => read,
+            Ok(BoundedLine::Oversized { read, mentions }) => {
+                offset += read;
+                if mentions {
+                    losses.push("oversized Antigravity brain prompt records were skipped".into());
+                }
+                continue;
+            }
+            Ok(BoundedLine::Eof | BoundedLine::Partial) => break,
+            Err(_) => {
+                losses.push("Antigravity brain transcript became unreadable".into());
+                break;
+            }
+        };
+        offset += read;
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        let Some((text, step, created_at)) = antigravity_brain_prompt(raw) else {
+            continue;
+        };
+        let hash = format!("{:x}", Sha256::digest(raw));
+        let record = format!("brain-{}-{}", step.unwrap_or(start), &hash[..16]);
+        push_event(
+            &mut events,
+            AgentKind::AntigravityCli,
+            session,
+            &record,
+            0,
+            WorkstreamEventKind::Message,
+            Some("user"),
+            &text,
+            created_at,
+            json!({"source": "brain-transcript"}),
+        );
+    }
+    events
+}
+
+fn open_contained_antigravity_transcript(root: &Path, path: &Path) -> Option<File> {
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(root) || fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&canonical)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = File::open(&canonical).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ANTIGRAVITY_BRAIN_BYTES {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let descriptor = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+        if descriptor != canonical {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+fn antigravity_brain_prompt(raw: &[u8]) -> Option<(String, Option<u64>, Option<String>)> {
+    if !raw
+        .windows(b"USER_INPUT".len())
+        .any(|window| window.eq_ignore_ascii_case(b"USER_INPUT"))
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    let step = value.as_object()?;
+    let kind = step.get("type")?.as_str()?.trim().to_ascii_uppercase();
+    if kind != "USER_INPUT" && !kind.ends_with("_USER_INPUT") {
+        return None;
+    }
+    if let Some(source) = step.get("source") {
+        let source = source.as_str()?.trim().to_ascii_uppercase();
+        if source != "USER_EXPLICIT" && !source.ends_with("_USER_EXPLICIT") {
+            return None;
+        }
+    }
+    let content = antigravity_content_text(step.get("content")?)?;
+    let text = antigravity_user_request_text(&content).trim().to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let index = step.get("step_index").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    });
+    let created_at = step
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| value.parse::<jiff::Timestamp>().is_ok())
+        .map(str::to_owned);
+    Some((text, index, created_at))
+}
+
+fn antigravity_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(part) => part.get("text").and_then(Value::as_str).map(str::to_owned),
+        Value::Array(parts) => {
+            let text: Vec<&str> = parts
+                .iter()
+                .filter_map(|part| {
+                    part.as_str()
+                        .or_else(|| part.get("text").and_then(Value::as_str))
+                })
+                .collect();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn antigravity_user_request_text(content: &str) -> &str {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    let Some(start) = content.find(OPEN) else {
+        return content;
+    };
+    let inner = &content[start + OPEN.len()..];
+    inner.find(CLOSE).map_or(inner, |end| &inner[..end])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AntigravityHistoryKind {
@@ -3568,8 +4999,8 @@ fn antigravity_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> 
         return Ok(None);
     };
     let blob = connection.query_row(
-        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1",
-        [],
+        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' AND length(data) <= ?1 LIMIT 1",
+        params![MAX_SESSION_METADATA_BYTES as i64],
         |row| row.get::<_, Vec<u8>>(0),
     );
     let Ok(blob) = blob else {
@@ -3971,11 +5402,22 @@ fn opencode_directories(cwd: &Path) -> (String, String) {
 /// is encrypted and excluded like v1's hidden reasoning; anything else
 /// unrecognized becomes a bounded loss, never a guess — the beta schema is
 /// still changing.
+#[cfg(test)]
 fn export_opencode2(
     home: &Path,
     session_dir: Option<&Path>,
     session: &str,
     source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    export_opencode2_range(home, session_dir, session, source_cursor, None)
+}
+
+fn export_opencode2_range(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let db = opencode_db(home, session_dir);
     let connection = Connection::open_with_flags(
@@ -3991,24 +5433,54 @@ fn export_opencode2(
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
+    let upper = final_cursor
+        .map(serde_json::from_str::<SqlCursor>)
+        .transpose()
+        .context("invalid native transcript final SQL cursor")?
+        .unwrap_or(SqlCursor {
+            updated: i64::MAX,
+            id: "\u{10ffff}".to_string(),
+        });
     let mut statement = connection.prepare(
-        "SELECT id, time_updated, type, data FROM session_message \
+        "SELECT id, time_updated, type, length(data), data FROM session_message \
          WHERE session_id = ?1 AND (time_updated > ?2 OR (time_updated = ?2 AND id > ?3)) \
-         ORDER BY time_updated, id",
+           AND (time_updated < ?4 OR (time_updated = ?4 AND id <= ?5)) \
+         ORDER BY time_updated, id LIMIT ?6",
     )?;
-    let rows = statement.query_map(params![session, cursor.updated, cursor.id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
+    let mut rows = statement.query(params![
+        session,
+        cursor.updated,
+        cursor.id,
+        upper.updated,
+        upper.id,
+        (MAX_SOURCE_RECORDS + 1) as i64
+    ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
     let mut next_cursor = cursor;
-    for row in rows {
-        let (id, updated, message_type, data_raw) = row?;
+    let mut source_bytes = 0_usize;
+    let mut checked_events = 0_usize;
+    let mut event_bytes = 0_usize;
+    let mut records = 0_usize;
+    while let Some(row) = rows.next()? {
+        records += 1;
+        if records > MAX_SOURCE_RECORDS {
+            return Err(anyhow!(
+                "native transcript exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+            ));
+        }
+        let data_len = row.get::<_, usize>(3)?;
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            data_len,
+        )?;
+        let id = row.get::<_, String>(0)?;
+        let updated = row.get::<_, i64>(1)?;
+        let message_type = row.get::<_, String>(2)?;
+        let data_raw = row.get::<_, String>(4)?;
         next_cursor = SqlCursor {
             updated,
             id: id.clone(),
@@ -4018,6 +5490,13 @@ fn export_opencode2(
             continue;
         };
         parse_opencode2(&message_type, &data, session, &id, &mut events, &mut losses);
+        enforce_parse_bounds(
+            &events,
+            &mut checked_events,
+            &mut event_bytes,
+            &mut source_bytes,
+            0,
+        )?;
     }
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
@@ -4259,6 +5738,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::KiroV3 => home.join(".kiro/sessions"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
         ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
+        ManagedHarness::Copilot => home.join(".copilot/session-state"),
     }
 }
 
@@ -4492,8 +5972,9 @@ mod tests {
                         json!({"type":"session","id":"other-id","cwd":other})
                     ),
                     // Kimi's header lives in state.json and Grok's in
-                    // summary.json, not the journal; covered by their own
-                    // discovery tests.
+                    // summary.json, not the journal; Copilot's journal must
+                    // sit in a UUID-named directory. All are covered by their
+                    // own discovery tests.
                     ManagedHarness::OpenCode
                     | ManagedHarness::OpenCode2
                     | ManagedHarness::Crush
@@ -4502,7 +5983,8 @@ mod tests {
                     | ManagedHarness::Kiro
                     | ManagedHarness::KiroV3
                     | ManagedHarness::Grok
-                    | ManagedHarness::Antigravity => {
+                    | ManagedHarness::Antigravity
+                    | ManagedHarness::Copilot => {
                         unreachable!()
                     }
                 },
@@ -4724,6 +6206,807 @@ mod tests {
         assert_eq!(second.events.len(), 1);
         assert_eq!(second.events[0].content, "visible alternate branch");
         assert_eq!(second.events[0].metadata["parent_id"], "u1");
+    }
+
+    #[tokio::test]
+    async fn persisted_baseline_exports_only_offline_append_and_rejects_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41d";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd}),
+                json!({"type":"message","id":"before","timestamp":"2026-08-07T17:00:01Z","message":{"role":"user","content":[{"type":"text","text":"prior live history"}],"meta":{"source":"user"}}})
+            ),
+        )
+        .unwrap();
+        let baseline = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"after","timestamp":"2026-08-07T17:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"offline append"}],"meta":{"source":"model"}}})
+        )
+        .unwrap();
+        let delta = export_transcript_delta(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            &baseline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0].content, "offline append");
+        let final_cursor = delta.source_cursor.clone().unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"later","timestamp":"2026-08-07T17:00:03Z","message":{"role":"user","content":[{"type":"text","text":"later resumed work"}],"meta":{"source":"user"}}})
+        )
+        .unwrap();
+        let exact = export_transcript_range(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            Some(&baseline),
+            &final_cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exact.events.len(), 1);
+        assert_eq!(exact.events[0].content, "offline append");
+
+        fs::write(&path, b"{}\n").unwrap();
+        let error = export_transcript_delta(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            &baseline,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("past the current transcript end")
+                || error.to_string().contains("was not found"),
+            "{error:#}"
+        );
+    }
+
+    fn file_cursor_offset(cursor: &str) -> u64 {
+        serde_json::from_str::<FileCursor>(cursor).unwrap().offset
+    }
+
+    fn oversized_losses(transcript: &ExportedTranscript) -> usize {
+        transcript
+            .losses
+            .iter()
+            .filter(|loss| loss.starts_with(OVERSIZED_RECORD_LOSS))
+            .count()
+    }
+
+    fn skip_loss(start: usize, bytes: usize) -> String {
+        format!(
+            "{OVERSIZED_RECORD_LOSS} at byte {start} ({bytes} bytes, over the {MAX_SOURCE_RECORD_BYTES} byte cap)"
+        )
+    }
+
+    fn kinds_and_contents(transcript: &ExportedTranscript) -> Vec<(&str, &str)> {
+        transcript
+            .events
+            .iter()
+            .map(|event| (event.kind.as_str(), event.content.as_str()))
+            .collect()
+    }
+
+    /// An oversized record still being written is neither an error nor
+    /// committed: the baseline stops before it, and once its newline lands the
+    /// baseline, the delta export and the exact range all step over it to the
+    /// same byte and agree on the events after it.
+    #[tokio::test]
+    async fn an_oversized_record_is_skipped_only_once_it_is_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41f";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        let header = format!(
+            "{}\n",
+            json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+        );
+        let mut bytes = header.clone().into_bytes();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_SOURCE_RECORD_BYTES + 2));
+        fs::write(&path, bytes).unwrap();
+        let unfinished = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_cursor_offset(&unfinished), header.len() as u64);
+        let early = export_transcript(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            early.losses.iter().all(|loss| {
+                !loss.starts_with(OVERSIZED_RECORD_LOSS) && !loss.starts_with("malformed")
+            }),
+            "an unfinished record is neither skipped nor parsed: {:?}",
+            early.losses
+        );
+        assert_eq!(
+            file_cursor_offset(early.source_cursor.as_deref().unwrap()),
+            header.len() as u64
+        );
+
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"message","id":"after","timestamp":"2026-08-07T17:00:02Z","message":{"role":"user","content":[{"type":"text","text":"after the image"}],"meta":{"source":"user"}}})
+        )
+        .unwrap();
+        let file_len = fs::metadata(&path).unwrap().len();
+        let finished = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_cursor_offset(&finished), file_len);
+        let delta = export_transcript_delta(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            &unfinished,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_and_contents(&delta),
+            [
+                ("annotation", SKIPPED_RECORD_NOTE),
+                ("message", "after the image")
+            ]
+        );
+        assert_eq!(
+            delta.losses,
+            [skip_loss(header.len(), MAX_SOURCE_RECORD_BYTES + 3)]
+        );
+        assert_eq!(
+            file_cursor_offset(delta.source_cursor.as_deref().unwrap()),
+            file_len
+        );
+        let exact = export_transcript_range(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            Some(&unfinished),
+            &finished,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            transcript_interval_digests(&exact.events),
+            transcript_interval_digests(&delta.events)
+        );
+    }
+
+    #[test]
+    fn claude_export_skips_an_oversized_record_and_keeps_its_neighbours() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let prompt = |uuid: &str, text: &str| json!({"type":"user","uuid":uuid,"timestamp":"2026-10-22T12:00:00Z","message":{"role":"user","content":[{"type":"text","text":text}]}});
+        let screenshot = json!({"type":"user","uuid":"image","timestamp":"2026-10-22T12:00:01Z","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"tool","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"A".repeat(MAX_SOURCE_RECORD_BYTES)}}
+            ]}
+        ]}});
+        let records = [
+            prompt("before", "before the screenshot"),
+            screenshot,
+            prompt("after", "after the screenshot"),
+        ];
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let exported = export_jsonl(ManagedHarness::Claude, &path, "session", None).unwrap();
+        assert_eq!(
+            kinds_and_contents(&exported),
+            [
+                ("message", "before the screenshot"),
+                ("annotation", SKIPPED_RECORD_NOTE),
+                ("message", "after the screenshot"),
+            ]
+        );
+        assert_eq!(exported.events[1].metadata[SKIPPED_RECORD_KEY], true);
+        let first = records[0].to_string().len() + 1;
+        assert_eq!(
+            exported.losses,
+            [skip_loss(first, records[1].to_string().len() + 1)]
+        );
+        assert_eq!(
+            file_cursor_offset(exported.source_cursor.as_deref().unwrap()),
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    /// Kimi validates its cursor by a hash of every committed byte, so the
+    /// skipped record must be hashed whole: otherwise the next export would
+    /// distrust the cursor and replay the journal from the start.
+    #[test]
+    fn a_skipped_record_stays_inside_the_rewrite_prefix_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let wire = temp
+            .path()
+            .join("store/bucket/session_x/agents/main/wire.jsonl");
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        let message = |role: &str, text: &str| {
+            json!({"type":"context.append_message","message":{"role":role,"content":[{"type":"text","text":text}]}})
+                .to_string()
+        };
+        let oversized = message("user", &"x".repeat(MAX_SOURCE_RECORD_BYTES));
+        let journal = format!(
+            "{}\n{oversized}\n{}\n",
+            message("user", "one"),
+            message("assistant", "two")
+        );
+        fs::write(&wire, &journal).unwrap();
+
+        let initial = export_jsonl(ManagedHarness::Kimi, &wire, "session_x", None).unwrap();
+        assert_eq!(
+            kinds_and_contents(&initial),
+            [
+                ("message", "one"),
+                ("annotation", SKIPPED_RECORD_NOTE),
+                ("message", "two"),
+            ]
+        );
+        assert_eq!(
+            initial.losses,
+            [skip_loss(
+                message("user", "one").len() + 1,
+                oversized.len() + 1
+            )]
+        );
+        let cursor: FileCursor =
+            serde_json::from_str(initial.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(cursor.offset, journal.len() as u64);
+        assert_eq!(
+            cursor.prefix_sha256.as_deref(),
+            Some(format!("{:x}", Sha256::digest(journal.as_bytes())).as_str())
+        );
+
+        fs::write(&wire, format!("{journal}{}\n", message("user", "three"))).unwrap();
+        let incremental = export_jsonl(
+            ManagedHarness::Kimi,
+            &wire,
+            "session_x",
+            initial.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            incremental
+                .events
+                .iter()
+                .map(|event| event.content.as_str())
+                .collect::<Vec<_>>(),
+            ["three"]
+        );
+        assert_eq!(oversized_losses(&incremental), 0);
+
+        // A rewrite that shifts every byte offset keeps the marker's event id,
+        // as it keeps a parsed record's.
+        fs::write(
+            &wire,
+            format!("{}\n{journal}", message("user", "a rewritten prefix")),
+        )
+        .unwrap();
+        let rewritten = export_jsonl(
+            ManagedHarness::Kimi,
+            &wire,
+            "session_x",
+            initial.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(rewritten.events.len(), 4);
+        assert_eq!(rewritten.events[2].event_id, initial.events[1].event_id);
+    }
+
+    /// For a journal validated by its prefix hash, the baseline hashes a
+    /// skipped record exactly as the export does, and leaves an unfinished one
+    /// out of the hash: a delta from either cursor trusts it and resumes there.
+    #[tokio::test]
+    async fn kimi_baseline_and_export_agree_on_the_prefix_across_a_skipped_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let (root, wire) = kimi_store_fixture(&cwd, &other);
+        let message = |role: &str, text: &str| {
+            json!({"type":"context.append_message","message":{"role":role,"content":[{"type":"text","text":text}]}})
+                .to_string()
+        };
+        let first = format!("{}\n", message("user", "one"));
+        let oversized = message("user", &"x".repeat(MAX_SOURCE_RECORD_BYTES));
+        fs::write(&wire, format!("{first}{oversized}")).unwrap();
+        let baseline = || {
+            transcript_baseline(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "session_aaa",
+            )
+        };
+        let unfinished: FileCursor = serde_json::from_str(&baseline().await.unwrap()).unwrap();
+        assert_eq!(unfinished.offset, first.len() as u64);
+        assert_eq!(
+            unfinished.prefix_sha256.as_deref(),
+            Some(format!("{:x}", Sha256::digest(first.as_bytes())).as_str())
+        );
+
+        let journal = format!("{first}{oversized}\n{}\n", message("assistant", "two"));
+        fs::write(&wire, &journal).unwrap();
+        let finished = baseline().await.unwrap();
+        let exported = export_transcript(
+            ManagedHarness::Kimi,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            "session_aaa",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exported.source_cursor.as_deref(), Some(finished.as_str()));
+        let delta = export_transcript_delta(
+            ManagedHarness::Kimi,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            "session_aaa",
+            &serde_json::to_string(&unfinished).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds_and_contents(&delta),
+            [("annotation", SKIPPED_RECORD_NOTE), ("message", "two")]
+        );
+    }
+
+    /// Discarding never reads past the source-byte cap: one record larger than
+    /// the whole budget still fails both readers instead of being skipped.
+    #[tokio::test]
+    async fn discarding_an_oversized_record_counts_toward_the_source_byte_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e420";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        let mut bytes = format!(
+            "{}\n",
+            json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+        )
+        .into_bytes();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_SOURCE_BYTES));
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+
+        let error = export_transcript(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
+        let error = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
+    }
+
+    /// An oversized FIRST JSONL record is rejected by the byte caps before any
+    /// unbounded allocation: the session-listing paths every degraded
+    /// pre/post snapshot uses skip the transcript (a valid header on a later
+    /// line is deliberately never reached) instead of reading the record.
+    #[tokio::test]
+    async fn an_oversized_first_record_is_skipped_by_session_listing_caps() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "9c8d7a06-93e4-4a01-b14e-64f2f1f2b3c4";
+        let transcripts = temp
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_dir_name(&cwd));
+        fs::create_dir_all(&transcripts).unwrap();
+        let claude_path = transcripts.join(format!("{session}.jsonl"));
+        let oversized_header = json!({
+            "sessionId": session,
+            "cwd": cwd,
+            "padding": "x".repeat(MAX_SOURCE_RECORD_BYTES + 2),
+        });
+        let valid_header = json!({"sessionId": session, "cwd": cwd});
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&claude_path).unwrap();
+            writeln!(file, "{oversized_header}").unwrap();
+            writeln!(file, "{valid_header}").unwrap();
+        }
+        assert!(
+            list_native_sessions(ManagedHarness::Claude, temp.path(), &cwd, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a transcript whose first record exceeds the header cap is skipped, header or not"
+        );
+
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let command_code_path = bucket.join(format!("{session}.jsonl"));
+        {
+            use std::io::Write as _;
+            let mut file = fs::File::create(&command_code_path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "type":"session","version":3,"id":session,
+                    "timestamp":"2026-08-07T17:00:00Z","cwd":cwd,
+                    "padding":"y".repeat(MAX_EVENT_BYTES + 2),
+                })
+            )
+            .unwrap();
+        }
+        assert!(
+            list_native_sessions(
+                ManagedHarness::CommandCode,
+                temp.path(),
+                &cwd,
+                Some(&store),
+                10
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the tighter first-line cap rejects before the source-record cap is even reached"
+        );
+    }
+
+    /// An oversized JSONL record whose padding places a three-byte character
+    /// so that the header reader's `cap + 1` boundary falls inside it. The
+    /// character begins at `char_offset`, so `char_offset` of `cap - 1` and
+    /// `cap` leave a truncated character in the bytes that were read while
+    /// `cap + 1` leaves the character out of them entirely.
+    fn oversized_header_cut_mid_character(
+        session: &str,
+        cwd: &Path,
+        cap: usize,
+        char_offset: usize,
+    ) -> Vec<u8> {
+        let head = format!(
+            "{{\"sessionId\":\"{session}\",\"cwd\":\"{}\",\"padding\":\"",
+            cwd.display()
+        );
+        let mut bytes = head.into_bytes();
+        assert!(
+            bytes.len() < char_offset,
+            "the padding has to start before the cut"
+        );
+        bytes.resize(char_offset, b'x');
+        bytes.extend("\u{65e5}".repeat(16).as_bytes());
+        bytes.extend(b"\"}\n");
+        assert!(bytes.len() > cap + 1, "the record has to be oversized");
+        bytes
+    }
+
+    /// The size cap's skip guard has to hold for non-ASCII input.
+    /// `BufRead::read_line` validates UTF-8 over exactly the bytes the `Take`
+    /// let through, so a boundary landing inside a multi-byte character fails
+    /// the read with `InvalidData` and the `read > cap` guard below it is
+    /// never reached. Two of every three byte alignments of the cut character
+    /// hit that; the maintainer's own cap test pads with ASCII only, where
+    /// none of them do.
+    #[test]
+    fn an_oversized_session_header_cut_mid_character_is_skipped() {
+        for offset in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd = temp.path().join("repo");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = "1f8c0f4c-26f9-4c21-9f85-3d1dcb9aa0f1";
+            let path = cwd.join(format!("{session}.jsonl"));
+            fs::write(
+                &path,
+                oversized_header_cut_mid_character(
+                    session,
+                    &cwd,
+                    MAX_SESSION_HEADER_BYTES,
+                    MAX_SESSION_HEADER_BYTES - 1 + offset,
+                ),
+            )
+            .unwrap();
+            assert!(
+                session_header(ManagedHarness::Claude, &path)
+                    .unwrap()
+                    .is_none(),
+                "an oversized header is skipped with the cut character at offset \
+                 MAX_SESSION_HEADER_BYTES - 1 + {offset}"
+            );
+        }
+    }
+
+    /// The same cut in the two single-record header readers, which cap on
+    /// `MAX_EVENT_BYTES`.
+    #[test]
+    fn an_oversized_event_header_cut_mid_character_is_skipped() {
+        for offset in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd = temp.path().join("repo");
+            fs::create_dir_all(&cwd).unwrap();
+            let session = "3b6d2f70-5a3c-41a8-9a4e-7c0b2d9e4f11";
+            let record = oversized_header_cut_mid_character(
+                session,
+                &cwd,
+                MAX_EVENT_BYTES,
+                MAX_EVENT_BYTES - 1 + offset,
+            );
+
+            let command_code = cwd.join(format!("{session}.jsonl"));
+            fs::write(&command_code, &record).unwrap();
+            assert!(
+                command_code_session_header(&command_code)
+                    .unwrap()
+                    .is_none(),
+                "command code: cut character at offset MAX_EVENT_BYTES - 1 + {offset}"
+            );
+
+            let copilot_dir = cwd.join(session);
+            fs::create_dir_all(&copilot_dir).unwrap();
+            let copilot = copilot_dir.join("events.jsonl");
+            fs::write(&copilot, &record).unwrap();
+            assert!(
+                copilot_session_header(&copilot).unwrap().is_none(),
+                "copilot: cut character at offset MAX_EVENT_BYTES - 1 + {offset}"
+            );
+        }
+    }
+
+    /// A header that is NOT oversized and is not valid UTF-8 keeps failing the
+    /// read, so the cap's skip guard does not widen into accepting malformed
+    /// transcripts.
+    #[test]
+    fn a_malformed_utf8_header_within_the_cap_still_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let path = cwd.join("1a1f2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b.jsonl");
+        fs::write(&path, b"{\"sessionId\":\"\xff\xfe\"}\n").unwrap();
+        let error = session_header(ManagedHarness::Claude, &path).unwrap_err();
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "a short malformed header still errors: {error:#}"
+        );
+        let error = command_code_session_header(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "a short malformed header still errors: {error:#}"
+        );
+    }
+
+    /// The consequence of the lost skip: `discover_native_session` propagates
+    /// the header read's error, so one oversized non-ASCII record in Claude
+    /// Code's shared `~/.claude/projects` tree aborts discovery for every
+    /// other session recorded beside it.
+    #[tokio::test]
+    async fn an_oversized_non_ascii_record_does_not_abort_discovery_of_another_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let transcripts = temp
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_dir_name(&cwd));
+        fs::create_dir_all(&transcripts).unwrap();
+        // Sorted ahead of the session we are looking for, so discovery reads
+        // it first whether or not the two share a modification time.
+        let poisoned = "0aaaaaaa-0000-4000-8000-000000000000";
+        let wanted = "fbbbbbbb-0000-4000-8000-000000000000";
+        fs::write(
+            transcripts.join(format!("{wanted}.jsonl")),
+            format!("{}\n", json!({"sessionId": wanted, "cwd": cwd})),
+        )
+        .unwrap();
+        fs::write(
+            transcripts.join(format!("{poisoned}.jsonl")),
+            oversized_header_cut_mid_character(
+                poisoned,
+                &cwd,
+                MAX_SESSION_HEADER_BYTES,
+                MAX_SESSION_HEADER_BYTES,
+            ),
+        )
+        .unwrap();
+        let discovered = discover_native_session(
+            ManagedHarness::Claude,
+            temp.path(),
+            &cwd,
+            None,
+            SystemTime::now() - Duration::from_secs(60),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(discovered.as_deref(), Some(wanted));
+    }
+
+    #[tokio::test]
+    async fn exact_empty_range_stays_empty_after_later_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let session = "7c1d5698-204a-4c0f-ae9c-43db7fc4e41e";
+        let store = temp.path().join("command-code");
+        let bucket = store.join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let path = bucket.join(format!("{session}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({"type":"session","version":3,"id":session,"timestamp":"2026-08-07T17:00:00Z","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        let baseline = transcript_baseline(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+        )
+        .await
+        .unwrap();
+        let final_cursor = baseline.clone();
+        use std::io::Write as _;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            json!({"type":"message","id":"later","message":{"role":"user","content":[{"type":"text","text":"later resumed work"}]}})
+        )
+        .unwrap();
+        let exact = export_transcript_range(
+            ManagedHarness::CommandCode,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            session,
+            Some(&baseline),
+            &final_cursor,
+        )
+        .await
+        .unwrap();
+        assert!(exact.events.is_empty());
+    }
+
+    #[test]
+    fn jsonl_scan_stops_at_source_byte_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.jsonl");
+        let record = format!(
+            "{}\n",
+            json!({"type":"system","padding":"x".repeat(MAX_SOURCE_RECORD_BYTES / 2)})
+        );
+        let mut file = fs::File::create(&path).unwrap();
+        use std::io::Write as _;
+        for _ in 0..(MAX_SOURCE_BYTES / record.len() + 2) {
+            file.write_all(record.as_bytes()).unwrap();
+        }
+        let error = export_jsonl(ManagedHarness::CommandCode, &path, "session", None).unwrap_err();
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
+    }
+
+    #[test]
+    fn exported_transcript_caps_count_and_serialized_bytes() {
+        let event = NewWorkstreamEvent {
+            event_id: "event".into(),
+            agent: AgentKind::ClaudeCode,
+            native_session_id: "session".into(),
+            source_record_id: None,
+            kind: WorkstreamEventKind::Message,
+            role: Some("user".into()),
+            content: "x".repeat(MAX_EVENT_BYTES),
+            occurred_at: None,
+            metadata: Value::Null,
+        };
+        let too_many = ExportedTranscript {
+            events: vec![event.clone(); MAX_EXPORTED_EVENTS + 1],
+            ..ExportedTranscript::default()
+        };
+        assert!(
+            validate_export_bounds(too_many)
+                .unwrap_err()
+                .to_string()
+                .contains("event recovery limit")
+        );
+        let too_large = ExportedTranscript {
+            events: vec![event; MAX_EXPORTED_BYTES / MAX_EVENT_BYTES + 1],
+            ..ExportedTranscript::default()
+        };
+        assert!(
+            validate_export_bounds(too_large)
+                .unwrap_err()
+                .to_string()
+                .contains("byte recovery limit")
+        );
     }
 
     #[tokio::test]
@@ -5337,6 +7620,391 @@ mod tests {
         files.push(temporary.clone());
         let candidates = lookup_candidates(files, id);
         assert_eq!(candidates.first(), Some(&temporary));
+    }
+
+    fn codex_rollout(store: &Path, id: &str, cwd: &Path, texts: &[&str]) -> PathBuf {
+        let day = store.join("2026/10/05");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(cwd).unwrap();
+        let path = day.join(format!("rollout-2026-10-05T20-43-00-{id}.jsonl"));
+        let mut records = vec![json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}})];
+        records.extend(texts.iter().map(|text| {
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}})
+        }));
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// What Codex does to a rollout idle for a week: a zstd copy replaces it.
+    fn compress_codex_rollout(plain: &Path) -> PathBuf {
+        let compressed = plain.with_extension("jsonl.zst");
+        let bytes = fs::read(plain).unwrap();
+        fs::write(
+            &compressed,
+            ruzstd::encoding::compress_to_vec(
+                bytes.as_slice(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        fs::remove_file(plain).unwrap();
+        compressed
+    }
+
+    fn exported_texts(transcript: &ExportedTranscript) -> Vec<&str> {
+        transcript
+            .events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect()
+    }
+
+    /// A rollout Codex compressed is still the linked session, so a managed
+    /// launch resumes it instead of starting fresh. The compressed copy is
+    /// located through the same header and checkout match as a plain one.
+    #[test]
+    fn codex_compressed_rollout_still_exists_only_for_its_own_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let mine = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e5";
+        let theirs = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e6";
+        let exists = |id: &str| {
+            native_session_exists(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), id)
+                .unwrap()
+        };
+
+        let plain = codex_rollout(&store, mine, &cwd, &["hello"]);
+        assert!(exists(mine));
+        let compressed = compress_codex_rollout(&plain);
+        assert!(!plain.exists());
+        assert!(exists(mine), "the compressed copy is the same session");
+        assert!(
+            native_session_in_checkout(
+                ManagedHarness::Codex,
+                temp.path(),
+                &cwd,
+                Some(&store),
+                mine
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            locate_session_file(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), mine)
+                .unwrap(),
+            Some(compressed)
+        );
+
+        // Another checkout's compressed rollout is refused like a plain one.
+        compress_codex_rollout(&codex_rollout(&store, theirs, &other, &["elsewhere"]));
+        assert!(!exists(theirs));
+
+        // A damaged compressed copy is skipped, not an unreadable store.
+        let broken = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e7";
+        fs::write(
+            store.join(format!(
+                "2026/10/05/rollout-2026-10-05T20-43-00-{broken}.jsonl.zst"
+            )),
+            b"not zstd",
+        )
+        .unwrap();
+        assert!(!exists(broken));
+        // So is one cut short before its first block ends.
+        let truncated = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e8";
+        let whole = fs::read(compress_codex_rollout(&codex_rollout(
+            &store,
+            truncated,
+            &cwd,
+            &["a reply long enough to span more than the header record"],
+        )))
+        .unwrap();
+        fs::write(
+            store.join(format!(
+                "2026/10/05/rollout-2026-10-05T20-43-00-{truncated}.jsonl.zst"
+            )),
+            &whole[..whole.len() / 2],
+        )
+        .unwrap();
+        assert!(!exists(truncated));
+        assert!(exists(mine));
+    }
+
+    /// Codex reads the plain file when both forms exist (a conversion in
+    /// progress). Its staging files (`rollout-compress-*.tmp` while
+    /// compressing, `<rollout>.decompress.<pid>.<n>.tmp` while restoring) and
+    /// a `.jsonl.zst` without the `rollout-` prefix are never sessions.
+    #[tokio::test]
+    async fn codex_plain_rollout_hides_its_compressed_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let plain = codex_rollout(&store, id, &cwd, &["hello"]);
+        let compressed = compress_codex_rollout(&plain);
+        let others = [
+            compressed.with_file_name("rollout-compress-a1b2c3.tmp"),
+            PathBuf::from(format!("{}.decompress.4242.0.tmp", plain.display())),
+            compressed.with_file_name(format!("notes-{id}.jsonl.zst")),
+        ];
+        for other in &others {
+            fs::copy(&compressed, other).unwrap();
+            assert!(!transcript_file(ManagedHarness::Codex, other), "{other:?}");
+        }
+        assert!(transcript_file(ManagedHarness::Codex, &compressed));
+        assert!(!transcript_file(ManagedHarness::Claude, &compressed));
+
+        codex_rollout(&store, id, &cwd, &["hello"]);
+        assert!(!transcript_file(ManagedHarness::Codex, &compressed));
+        assert_eq!(
+            locate_session_file(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), id)
+                .unwrap(),
+            Some(plain)
+        );
+        let listed =
+            list_native_sessions(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), 10)
+                .await
+                .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].native_session_id, id);
+    }
+
+    /// The pre-launch baseline of a compressed rollout names the plain path,
+    /// so the import after the run lines up whether Codex restored the file
+    /// (it does on `codex resume`) or the run ended before Codex reopened it.
+    #[test]
+    fn codex_cursor_survives_codex_restoring_a_compressed_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let id = "01a16539-8691-7df3-a8fd-dd78556eaed4";
+        let codex = ManagedHarness::Codex;
+        let plain = codex_rollout(&store, id, &cwd, &["before"]);
+        let plain_len = fs::metadata(&plain).unwrap().len();
+        let before_compression =
+            export_transcript_blocking(codex, temp.path(), &cwd, Some(&store), id, None, None)
+                .unwrap();
+        assert_eq!(exported_texts(&before_compression), ["before"]);
+        let compressed = compress_codex_rollout(&plain);
+
+        let baseline =
+            transcript_baseline_blocking(codex, temp.path(), &cwd, Some(&store), id).unwrap();
+        let cursor: FileCursor = serde_json::from_str(&baseline).unwrap();
+        assert_eq!(Path::new(&cursor.path), plain);
+        assert_eq!(cursor.offset, plain_len);
+        assert_eq!(
+            before_compression.source_cursor.as_deref(),
+            Some(baseline.as_str()),
+            "a cursor taken before compression is the same cursor"
+        );
+
+        // The run ended before Codex reopened the rollout: still compressed.
+        validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &baseline).unwrap();
+        let unchanged = export_transcript_blocking(
+            codex,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            id,
+            Some(&baseline),
+            None,
+        )
+        .unwrap();
+        assert!(unchanged.events.is_empty(), "{:?}", unchanged.events);
+        assert_eq!(unchanged.source_cursor.as_deref(), Some(baseline.as_str()));
+
+        // Codex resumed the session: it restored the plain file and appended.
+        codex_rollout(&store, id, &cwd, &["before", "after"]);
+        fs::remove_file(&compressed).unwrap();
+        validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &baseline).unwrap();
+        let delta = export_transcript_blocking(
+            codex,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            id,
+            Some(&baseline),
+            None,
+        )
+        .unwrap();
+        assert_eq!(exported_texts(&delta), ["after"]);
+        let next: FileCursor =
+            serde_json::from_str(delta.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(Path::new(&next.path), plain);
+        assert_eq!(next.offset, fs::metadata(&plain).unwrap().len());
+    }
+
+    /// Reading the compressed form exports exactly what the plain form does,
+    /// from the start, from a cursor, and up to an exact final cursor.
+    #[test]
+    fn codex_compressed_rollout_exports_like_the_plain_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let id = "01a16797-f057-7762-b123-f8ba78018cf7";
+        let codex = ManagedHarness::Codex;
+        let plain = codex_rollout(&store, id, &cwd, &["one", "two", "three"]);
+        let export = |source: Option<&str>, last: Option<&str>| {
+            export_transcript_blocking(codex, temp.path(), &cwd, Some(&store), id, source, last)
+                .unwrap()
+        };
+        let ends = fs::read_to_string(&plain)
+            .unwrap()
+            .split_inclusive('\n')
+            .scan(0, |end, line| {
+                *end += line.len() as u64;
+                Some(*end)
+            })
+            .collect::<Vec<_>>();
+        let at = |offset: u64| {
+            serde_json::to_string(&FileCursor {
+                path: plain.to_string_lossy().into_owned(),
+                offset,
+                flavor: None,
+                prefix_sha256: None,
+            })
+            .unwrap()
+        };
+        let (middle, end_of_two) = (at(ends[1]), at(ends[2]));
+        let whole = export(None, None);
+        let from_middle = export(Some(&middle), None);
+        let exact = export(Some(&middle), Some(&end_of_two));
+        assert_eq!(exported_texts(&from_middle), ["two", "three"]);
+        assert_eq!(exported_texts(&exact), ["two"]);
+
+        compress_codex_rollout(&plain);
+        let compressed_whole = export(None, None);
+        assert_eq!(exported_texts(&compressed_whole), ["one", "two", "three"]);
+        assert_eq!(compressed_whole.source_cursor, whole.source_cursor);
+        let compressed_from_middle = export(Some(&middle), None);
+        assert_eq!(exported_texts(&compressed_from_middle), ["two", "three"]);
+        assert_eq!(
+            compressed_from_middle.source_cursor,
+            from_middle.source_cursor
+        );
+        let compressed_exact = export(Some(&middle), Some(&end_of_two));
+        assert_eq!(exported_texts(&compressed_exact), ["two"]);
+        assert_eq!(compressed_exact.source_cursor, exact.source_cursor);
+
+        // Past the end: a source cursor clamps to the end as it does for a
+        // plain file, and a final cursor or a recovery cursor is refused.
+        let beyond = at(ends[3] + 10);
+        assert!(export(Some(&beyond), None).events.is_empty());
+        assert_eq!(
+            export(Some(&beyond), None).source_cursor,
+            whole.source_cursor
+        );
+        let error = export_transcript_blocking(
+            codex,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            id,
+            Some(&middle),
+            Some(&beyond),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("past the current transcript end"),
+            "{error}"
+        );
+        let error = validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &beyond)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("past the current transcript end"),
+            "{error}"
+        );
+        validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &at(ends[3]))
+            .unwrap();
+    }
+
+    /// `StreamingDecoder` reads one frame; the reader continues into the next.
+    #[test]
+    fn codex_compressed_rollout_reader_reads_every_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout-x.jsonl.zst");
+        let frame = |text: &[u8]| {
+            ruzstd::encoding::compress_to_vec(text, ruzstd::encoding::CompressionLevel::Fastest)
+        };
+        // `printf 'second\n' | zstd -c --check`: the CLI adds a content
+        // checksum by default, which the encoder used for the other frame
+        // does not, and the reader still consumes it to reach the end.
+        let checksummed = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x39, 0x00, 0x00, 0x73, 0x65, 0x63, 0x6f, 0x6e,
+            0x64, 0x0a, 0x16, 0x40, 0x4c, 0x55,
+        ];
+        fs::write(&path, [frame(b"first\n"), checksummed.to_vec()].concat()).unwrap();
+        let read = || {
+            let mut content = String::new();
+            std::io::Read::read_to_string(
+                &mut open_transcript(ManagedHarness::Codex, &path).unwrap(),
+                &mut content,
+            )
+            .map(|_| content)
+        };
+        assert_eq!(read().unwrap(), "first\nsecond\n");
+        assert!(transcript_reaches(ManagedHarness::Codex, &path, 13).unwrap());
+        assert!(!transcript_reaches(ManagedHarness::Codex, &path, 14).unwrap());
+
+        fs::write(&path, [frame(b"first\n"), b"garbage".to_vec()].concat()).unwrap();
+        let error = read().unwrap_err();
+        assert!(is_zstd_decode_error(&error), "{error}");
+    }
+
+    /// A file that fails to read mid-stream is an I/O error, not a damaged
+    /// stream, so a lookup reports it instead of treating the session as gone.
+    #[test]
+    fn codex_compressed_rollout_reader_keeps_input_errors_apart_from_damage() {
+        struct FailsAfter {
+            bytes: Vec<u8>,
+            position: usize,
+            fail_at: usize,
+        }
+        impl std::io::Read for FailsAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.position >= self.bytes.len() {
+                    return Ok(0);
+                }
+                if self.position >= self.fail_at {
+                    return Err(std::io::Error::other("disk went away"));
+                }
+                let end = self.fail_at.min(self.position + buf.len());
+                let count = end - self.position;
+                buf[..count].copy_from_slice(&self.bytes[self.position..end]);
+                self.position = end;
+                Ok(count)
+            }
+        }
+        let text = (0..400)
+            .map(|line| format!("{{\"line\":{line},\"text\":\"record number {line}\"}}\n"))
+            .collect::<String>();
+        let bytes = ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        let decode = |fail_at: usize| {
+            let source = FailsAfter {
+                bytes: bytes.clone(),
+                position: 0,
+                fail_at,
+            };
+            let mut content = Vec::new();
+            ZstdFrames::new(BufReader::with_capacity(16, source))
+                .and_then(|mut frames| std::io::Read::read_to_end(&mut frames, &mut content))
+                .map(|_| content)
+        };
+        assert_eq!(decode(bytes.len()).unwrap(), text.as_bytes());
+        let error = decode(bytes.len() / 2).unwrap_err();
+        assert!(!is_zstd_decode_error(&error), "{error}");
+        assert!(error.to_string().contains("disk went away"), "{error}");
     }
 
     #[test]
@@ -6086,6 +8754,36 @@ mod tests {
     }
 
     #[test]
+    fn opencode_sql_scan_stops_at_source_byte_cap_before_json_parse() {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);\
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                                   time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES ('m1', 's1', ?1)",
+                [json!({"role":"user"}).to_string()],
+            )
+            .unwrap();
+        let oversized = "x".repeat(MAX_SOURCE_BYTES + 1);
+        connection
+            .execute(
+                "INSERT INTO part VALUES ('p1', 'm1', 's1', 1, ?1)",
+                [oversized],
+            )
+            .unwrap();
+        let error = export_opencode(home.path(), None, "s1", None).unwrap_err();
+        assert!(error.to_string().contains("source-byte limit"), "{error:#}");
+    }
+
+    #[test]
     fn opencode2_updated_tracks_session_v2_rows() {
         let home = tempfile::tempdir().unwrap();
         opencode2_fixture(home.path());
@@ -6814,6 +9512,223 @@ mod tests {
         );
     }
 
+    fn copilot_session_start(id: &str, cwd: &Path) -> Value {
+        json!({"type":"session.start","data":{"sessionId":id,"version":1,
+               "producer":"copilot-agent","copilotVersion":"1.0.92",
+               "context":{"cwd":cwd}},"id":"start","timestamp":"2026-10-07T13:00:33.339Z"})
+    }
+
+    #[tokio::test]
+    async fn copilot_discovery_requires_uuid_directory_header_and_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let root = temp.path().join("session-state");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+
+        let matching = "318db77d-e19b-4750-82df-192a6b931437";
+        let wrong_checkout = "c79ce9b8-de85-442e-915a-1c6ec4f74719";
+        let mismatched_header = "0e88ebd2-ed54-4f5a-9056-46e041e3b44d";
+        let phantom = "5b1f0c3e-7a2d-4e8b-9c6f-1d2e3f4a5b6c";
+        for (dir, header) in [
+            (matching, copilot_session_start(matching, &cwd)),
+            (
+                wrong_checkout,
+                copilot_session_start(wrong_checkout, &other),
+            ),
+            // A header naming a session other than its directory must never
+            // surface that phantom id as a candidate.
+            (mismatched_header, copilot_session_start(phantom, &cwd)),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("events.jsonl"), format!("{header}\n")).unwrap();
+        }
+        // Workspace metadata and non-UUID directories are not transcripts.
+        fs::write(root.join(matching).join("workspace.yaml"), "id: x\n").unwrap();
+        fs::create_dir_all(root.join("not-a-uuid")).unwrap();
+        fs::write(
+            root.join("not-a-uuid/events.jsonl"),
+            format!("{}\n", copilot_session_start("not-a-uuid", &cwd)),
+        )
+        .unwrap();
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Copilot, temp.path(), &cwd, Some(&root), 8)
+                .await
+                .unwrap();
+        let ids: Vec<_> = sessions
+            .iter()
+            .map(|session| session.native_session_id.as_str())
+            .collect();
+        assert_eq!(ids, [matching]);
+
+        let found = locate_session_file(
+            ManagedHarness::Copilot,
+            temp.path(),
+            &cwd,
+            Some(&root),
+            matching,
+        )
+        .unwrap();
+        assert_eq!(found, Some(root.join(matching).join("events.jsonl")));
+        for foreign in [
+            wrong_checkout,
+            mismatched_header,
+            phantom,
+            "not-a-uuid",
+            "../x",
+        ] {
+            assert!(
+                !native_session_exists(
+                    ManagedHarness::Copilot,
+                    temp.path(),
+                    &cwd,
+                    Some(&root),
+                    foreign
+                )
+                .unwrap(),
+                "{foreign} must not resolve for this checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_store_defaults_below_home() {
+        let home = Path::new("/home/user");
+        assert_eq!(
+            session_root(ManagedHarness::Copilot, home, None),
+            home.join(".copilot/session-state")
+        );
+    }
+
+    /// Record shapes captured from a real Copilot CLI 1.0.92 session (paths,
+    /// ids, and long fields shortened).
+    #[test]
+    fn copilot_adapter_excludes_private_records_and_keeps_visible_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let records = [
+            copilot_session_start("318db77d-e19b-4750-82df-192a6b931437", temp.path()),
+            json!({"type":"session.model_change","data":{"newModel":"claude-sonnet-5"},"id":"r1"}),
+            json!({"type":"user.message","data":{"content":"read note.txt",
+                   "transformedContent":"<current_datetime>2026-10-07</current_datetime>\n\nread note.txt"},
+                   "id":"r2","timestamp":"2026-10-07T13:00:35.074Z"}),
+            json!({"type":"system.message","data":{"role":"system","content":"You are the GitHub Copilot CLI"},"id":"r3"}),
+            json!({"type":"hook.end","data":{"hookType":"sessionStart","success":true,
+                   "output":{"additionalContext":"ai-memory startup packet"}},"id":"r4"}),
+            json!({"type":"assistant.message","data":{"content":"","reasoningText":"private plan",
+                   "reasoningOpaque":"opaque","toolRequests":[{"toolCallId":"call-1","name":"view",
+                   "arguments":{"path":"note.txt"},"type":"function"}]},"id":"r5"}),
+            json!({"type":"tool.execution_start","data":{"toolCallId":"call-1","toolName":"view",
+                   "arguments":{"path":"note.txt"}},"id":"r6"}),
+            json!({"type":"permission.requested","data":{"permissionRequest":{"kind":"shell"}},"id":"r7"}),
+            json!({"type":"tool.execution_complete","data":{"toolCallId":"call-1","success":true,
+                   "result":{"content":"hello\n","detailedContent":"diff --git a/abs/path"}},"id":"r8"}),
+            json!({"type":"tool.execution_complete","data":{"toolCallId":"call-2","success":false,
+                   "result":null,"error":{"message":"Permission denied","code":"denied"}},"id":"r9"}),
+            json!({"type":"assistant.message","data":{"content":"hello","toolRequests":[]},"id":"r10"}),
+            json!({"type":"session.resume","data":{"context":{"cwd":temp.path()}},"id":"r11"}),
+            json!({"type":"model.messages_snapshot","data":{"messages":[{"role":"system","content":"private"}]},"id":"r12"}),
+            json!({"type":"session.compaction_complete","data":{"success":true,
+                   "summaryContent":"<overview>read a file</overview>"},"id":"r13"}),
+            json!({"type":"session.compaction_complete","data":{"success":false,
+                   "summaryContent":"failed attempt"},"id":"r14"}),
+        ];
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Copilot, &path, "copilot-session", None).unwrap();
+        // A call and its result share the Copilot call id, so a transcript
+        // import can give the result the call's capture decision.
+        let ids: Vec<_> = export
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    WorkstreamEventKind::ToolCall | WorkstreamEventKind::ToolResult
+                )
+            })
+            .map(|event| event.metadata.get("tool_use_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, [Some("call-1"), Some("call-1"), Some("call-2")]);
+        let contents: Vec<_> = export
+            .events
+            .iter()
+            .map(|event| (event.kind, event.content.as_str()))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (WorkstreamEventKind::Message, "read note.txt"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "view: {\"path\":\"note.txt\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "hello\n"),
+                (WorkstreamEventKind::ToolResult, "error: Permission denied"),
+                (WorkstreamEventKind::Message, "hello"),
+                (
+                    WorkstreamEventKind::Compaction,
+                    "<overview>read a file</overview>"
+                ),
+            ]
+        );
+        assert!(export.events.iter().all(|event| {
+            event.agent == AgentKind::CopilotCli
+                && !event.content.contains("private")
+                && !event.content.contains("startup packet")
+                && !event.content.contains("current_datetime")
+                && !event.content.contains("abs/path")
+        }));
+        for expected in [
+            "system prompt records",
+            "hidden reasoning",
+            "message snapshots",
+        ] {
+            assert!(
+                export.losses.iter().any(|loss| loss.contains(expected)),
+                "missing loss annotation for {expected}"
+            );
+        }
+        let cursor: FileCursor = serde_json::from_str(&export.source_cursor.unwrap()).unwrap();
+        assert!(cursor.prefix_sha256.is_some());
+    }
+
+    #[test]
+    fn copilot_export_is_incremental_and_holds_back_an_incomplete_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let first_line = json!({"type":"user.message","data":{"content":"one"},"id":"a"});
+        let second_line = json!({"type":"assistant.message","data":{"content":"two"},"id":"b"});
+        // A record still being written has no trailing newline yet.
+        let partial = second_line.to_string();
+        fs::write(&path, format!("{first_line}\n{}", &partial[..10])).unwrap();
+        let first = export_jsonl(ManagedHarness::Copilot, &path, "s", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert!(first.losses.is_empty());
+
+        fs::write(&path, format!("{first_line}\n{second_line}\n")).unwrap();
+        let second = export_jsonl(
+            ManagedHarness::Copilot,
+            &path,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "two");
+
+        // Re-reading from scratch yields identical event ids.
+        let replay = export_jsonl(ManagedHarness::Copilot, &path, "s", None).unwrap();
+        assert_eq!(replay.events[0].event_id, first.events[0].event_id);
+        assert_eq!(replay.events[1].event_id, second.events[0].event_id);
+    }
+
     fn push_protobuf_varint(output: &mut Vec<u8>, mut value: u64) {
         loop {
             let byte = (value & 0x7f) as u8;
@@ -6954,6 +9869,43 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
+    #[test]
+    fn transcript_interval_identity_is_ordered_and_semantic() {
+        let event = |id: &str, role: &str, timestamp: &str, content: &str| NewWorkstreamEvent {
+            event_id: id.into(),
+            agent: AgentKind::ClaudeCode,
+            native_session_id: "session".into(),
+            source_record_id: None,
+            kind: WorkstreamEventKind::Message,
+            role: Some(role.into()),
+            content: content.into(),
+            occurred_at: Some(timestamp.into()),
+            metadata: json!({}),
+        };
+        let first = event("one", "user", "2026-10-07T10:00:00Z", "hello");
+        let second = event("two", "assistant", "2026-10-07T10:00:01Z", "world");
+        let expected = transcript_interval_digests(&[first.clone(), second.clone()]);
+        assert_eq!(
+            transcript_interval_digests(&[first.clone(), second.clone()]),
+            expected
+        );
+        assert_ne!(
+            transcript_interval_digests(&[second.clone(), first.clone()]),
+            expected,
+            "row order is part of interval identity"
+        );
+        for changed in [
+            event("one", "assistant", "2026-10-07T10:00:00Z", "hello"),
+            event("one", "user", "2026-10-07T10:00:02Z", "hello"),
+            event("one", "user", "2026-10-07T10:00:00Z", "changed"),
+        ] {
+            assert_ne!(
+                transcript_interval_digests(&[changed, second.clone()]),
+                expected
+            );
+        }
+    }
+
     const AG_MINE: &str = "a0d5ac62-2501-4780-b783-76d159c56cb3";
     const AG_THEIRS: &str = "9576275f-7c4e-4709-b372-22d1ad2a0af8";
     /// Far from any fixture `.db` creation time, so unlabelled lines at this
@@ -7001,6 +9953,23 @@ mod tests {
         let mut body = lines.join("\n");
         body.push('\n');
         fs::write(root.parent().unwrap().join("history.jsonl"), body).unwrap();
+    }
+
+    fn write_antigravity_brain(root: &Path, lines: &[Value]) {
+        let logs = root
+            .parent()
+            .unwrap()
+            .join("brain")
+            .join(AG_MINE)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let mut body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push('\n');
+        fs::write(logs.join("transcript.jsonl"), body).unwrap();
     }
 
     async fn export_antigravity_fixture(
@@ -7064,6 +10033,107 @@ mod tests {
             "other conversations are not this session's losses: {:?}",
             exported.losses
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_print_mode_falls_back_to_explicit_brain_prompts() {
+        let fixture = antigravity_fixture();
+        write_antigravity_brain(
+            &fixture.root,
+            &[
+                json!({
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "print-mode prompt",
+                    "created_at": "2026-10-22T12:00:00Z"
+                }),
+                json!({
+                    "step_index": 2,
+                    "type": "USER_INPUT",
+                    "source": "HOOK",
+                    "content": "injected canary"
+                }),
+                json!({
+                    "step_index": 3,
+                    "type": "TOOL_OUTPUT",
+                    "content": "USER_INPUT canary in tool output"
+                }),
+            ],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert_eq!(prompts(&exported), ["print-mode prompt"]);
+        assert_eq!(
+            exported.events[0].metadata,
+            json!({"source": "brain-transcript"})
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_brain_fallback_does_not_re_admit_foreign_workspace_prompts() {
+        let fixture = antigravity_fixture();
+        write_antigravity_history(
+            &fixture.root,
+            &[history_line(
+                Some(AG_MINE),
+                &fixture.other,
+                "foreign history prompt",
+                AG_PAST,
+            )],
+        );
+        write_antigravity_brain(
+            &fixture.root,
+            &[json!({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": "foreign brain prompt"
+            })],
+        );
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
+        assert!(
+            exported
+                .losses
+                .iter()
+                .any(|loss| loss.contains("another workspace")),
+            "{:?}",
+            exported.losses
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_brain_fallback_refuses_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = antigravity_fixture();
+        let outside = fixture.temp.path().join("outside");
+        fs::create_dir_all(outside.join(".system_generated/logs")).unwrap();
+        fs::write(
+            outside.join(".system_generated/logs/transcript.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "escape canary"
+                })
+            ),
+        )
+        .unwrap();
+        let brain = fixture.root.parent().unwrap().join("brain");
+        fs::create_dir_all(&brain).unwrap();
+        symlink(&outside, brain.join(AG_MINE)).unwrap();
+
+        let exported = export_antigravity_fixture(&fixture, None).await;
+
+        assert!(exported.events.is_empty(), "{:?}", exported.events);
     }
 
     /// `agy --conversation=<id>` run from another directory keeps the id but
@@ -7262,7 +10332,7 @@ mod tests {
             exported
                 .losses
                 .iter()
-                .any(|loss| loss.contains("history.jsonl is missing")),
+                .any(|loss| loss.contains("history.jsonl and brain transcript are missing")),
             "{:?}",
             exported.losses
         );
@@ -7973,6 +11043,63 @@ mod tests {
         // must return None unconditionally rather than guess at a location.
         assert_eq!(
             native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_finds_the_knowledge_directory_for_antigravity() {
+        let fixture = antigravity_fixture();
+        let knowledge = fixture
+            .temp
+            .path()
+            .join(".gemini/antigravity-cli/knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        fs::write(knowledge.join("fact.md"), "hello").unwrap();
+
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None
+            ),
+            Some(knowledge)
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_without_a_knowledge_directory_for_antigravity() {
+        let fixture = antigravity_fixture();
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &fixture.cwd,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_when_no_antigravity_session_matches_this_cwd() {
+        let fixture = antigravity_fixture();
+        let knowledge = fixture
+            .temp
+            .path()
+            .join(".gemini/antigravity-cli/knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        let other_cwd = fixture.temp.path().join("unrelated-checkout");
+        fs::create_dir_all(&other_cwd).unwrap();
+
+        assert_eq!(
+            native_memory_dir(
+                ManagedHarness::Antigravity,
+                fixture.temp.path(),
+                &other_cwd,
+                None
+            ),
             None
         );
     }

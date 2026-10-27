@@ -242,9 +242,23 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         if is_git_internal(wiki.root(), raw_path) {
             continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(raw_path) else {
-            // Likely a transient state (mv, atomic rename in flight).
-            continue;
+        let metadata = match std::fs::symlink_metadata(raw_path) {
+            Ok(metadata) => metadata,
+            // A rename away from a watched path arrives as
+            // `Modify(Name(RenameMode::From))`, not as a `Remove`, and its
+            // path is already gone. Unreported, the next path-scoped commit
+            // keeps the old blob in its tree, so a checkpoint taken in that
+            // window records a page that no longer exists. Reporting a path
+            // that was merely mid-rename is harmless: staging re-adds a file
+            // that still exists.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !is_tempfile(raw_path) {
+                    wiki.git().mark_written(raw_path);
+                }
+                continue;
+            }
+            // Likely a transient state (an atomic rename in flight).
+            Err(_) => continue,
         };
         let ft = metadata.file_type();
         if crate::confinement::is_link_like(&metadata) {
@@ -281,28 +295,11 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         if is_reserved_page_file(raw_path, &page_path) {
             continue;
         }
-        // A tombstoned session's page must not come back from a file its
-        // purge could not remove (#701). The path shape decides whether the
-        // lookup is worth a round trip: only `sessions/<id>.md` can be that
-        // file, so an ordinary edit to `index.md` or a decision page never
-        // queries. The sweep paths amortise the same set over a whole
-        // directory instead; this one sees a single file per event.
-        if let Some(session) = crate::wiki::session_id_for_page(&page_path) {
-            match wiki.purged_sessions(ws, proj).await {
-                Ok(purged) if purged.contains(&session) => {
-                    debug!(path = %page_path, "ignoring event for a purged session page");
-                    continue;
-                }
-                Ok(_) => {}
-                // Fails open, deliberately: a transient lookup error must not
-                // stop the watcher from indexing edits. The cost of failing
-                // open here is bounded — the next reconcile pass loads the set
-                // again and skips the page then.
-                Err(e) => warn!(path = %page_path, error = %e, "purged-session lookup failed"),
-            }
-        }
         match wiki.reindex_page(ws, proj, page_path.clone()).await {
             Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
+            Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                debug!(path = %page_path, "ignoring event for a purged session page");
+            }
             Err(e) => warn!(path = %page_path, error = %e, "watcher reindex failed"),
         }
     }
@@ -352,21 +349,12 @@ async fn reindex_project_dir(
         }
     };
 
-    // Fails open for the same reason the single-event path does: a lookup
-    // error must not stop a directory event from indexing. `Wiki::reindex_all`
-    // is the one caller that fails closed, because an operator-triggered
-    // reindex should report the failure rather than quietly skip the gate.
-    let purged = wiki.purged_sessions(ws, proj).await.unwrap_or_else(|e| {
-        warn!(error = %e, "purged-session lookup failed; not gating this pass");
-        std::collections::HashSet::new()
-    });
     for path in pages {
-        if crate::wiki::is_purged_session_page(&path, &purged) {
-            debug!(path = %path, "skipping a purged session page");
-            continue;
-        }
         match wiki.reindex_page(ws, proj, path.clone()).await {
             Ok(_) => debug!(path = %path, "reindexed via watcher directory event"),
+            Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                debug!(path = %path, "skipping a purged session page");
+            }
             Err(e) => warn!(path = %path, error = %e, "watcher directory reindex failed"),
         }
     }
@@ -693,25 +681,15 @@ async fn reconcile(
             tokio::task::spawn_blocking(move || walk_markdown_partial(&proj_root))
                 .await
                 .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
-        // Once per directory, not once per page: a project accumulates one
-        // tombstone per purge, and the set is only consulted for the
-        // `sessions/<id>.md` paths that a session purge could have left behind.
-        let purged = wiki.purged_sessions(ws, proj).await?;
         let mut walked: HashSet<PagePath> = HashSet::with_capacity(pages.len());
         for path in pages {
             walked.insert(path.clone());
-            if crate::wiki::is_purged_session_page(&path, &purged) {
-                debug!(
-                    path = %path,
-                    "skipping reconcile of a purged (tombstoned) session page",
-                );
-                stats.skipped_purged_sessions += 1;
-                continue;
-            }
-            if let Err(e) = wiki.reindex_page(ws, proj, path.clone()).await {
-                warn!(path = %path, error = %e, "reconcile reindex failed");
-            } else {
-                stats.indexed += 1;
+            match wiki.reindex_page(ws, proj, path.clone()).await {
+                Ok(_) => stats.indexed += 1,
+                Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                    stats.skipped_purged_sessions += 1;
+                }
+                Err(e) => warn!(path = %path, error = %e, "reconcile reindex failed"),
             }
         }
 
@@ -1048,6 +1026,96 @@ mod tests {
     /// reported, already-tested outcome, and after one the rows are gone while
     /// the markdown is still on disk. Reverting the tombstone gate fails this.
     #[tokio::test]
+    async fn manual_survivor_remains_reindexable_after_session_purge() {
+        let (_tmp, store, wiki, ws, proj) = setup().await;
+        let sid = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(
+            &abs,
+            format!("---\ntitle: Session\nsession_id: {sid}\n---\n\noriginalsummarytoken\n"),
+        )
+        .unwrap();
+        let id = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        store.writer.end_session(sid, Some(id)).await.unwrap();
+        // A manual replacement has no session_id; the store deliberately preserves it (#866).
+        std::fs::write(&abs, "---\ntitle: Manual\n---\n\nmanualbeforetoken\n").unwrap();
+        wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        let outcome = wiki
+            .purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip)
+            .await
+            .unwrap();
+        assert_eq!(outcome.summary.pages_deleted, 1);
+        assert!(outcome.summary.removed_paths.is_empty());
+        assert!(abs.is_file());
+        assert_eq!(
+            store
+                .reader
+                .search_pages("manualbeforetoken".into(), 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        for (indexer, token) in [
+            ("reconcile", "manualreconciletoken"),
+            ("file event", "manualfileeventtoken"),
+            ("directory event", "manualdirectorytoken"),
+            ("rebuild", "manualrebuildtoken"),
+        ] {
+            std::fs::write(&abs, format!("---\ntitle: Manual\n---\n\n{token}\n")).unwrap();
+            match indexer {
+                "reconcile" => {
+                    let stats = reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
+                    assert_eq!(stats.skipped_purged_sessions, 0);
+                }
+                "file event" => {
+                    let event = notify_debouncer_full::DebouncedEvent::new(
+                        notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                            .add_path(abs.clone()),
+                        std::time::Instant::now(),
+                    );
+                    handle_event(&wiki, event).await;
+                }
+                "directory event" => {
+                    assert!(
+                        reindex_project_dir(&wiki, ws, proj, wiki.project_root(ws, proj)).await
+                    );
+                }
+                "rebuild" => {
+                    let summary = wiki.reindex_all().await.unwrap();
+                    assert_eq!(summary.skipped_purged_sessions, 0);
+                }
+                _ => unreachable!(),
+            }
+            let hits = store
+                .reader
+                .search_pages(token.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{indexer} must keep the preserved manual page editable"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn purged_session_page_is_not_resurrected_by_a_reconcile_tick() {
         let (tmp, store, wiki, ws, proj) = setup().await;
         let sid = ai_memory_core::SessionId::new();
@@ -1349,6 +1417,50 @@ mod tests {
                 .iter()
                 .any(|p| p.components().any(|c| c.as_os_str() == ".git")),
             "{reported:?}"
+        );
+    }
+
+    /// A page renamed away with an external tool arrives as
+    /// `Modify(Name(RenameMode::From))`, never as a `Remove`; the next
+    /// commit must still drop it from the tree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renamed_away_page_is_reported_and_dropped_from_the_tree() {
+        let (_tmp, _store, wiki, ws, proj) = setup().await;
+        let proj_dir = wiki.root().join(ws.to_string()).join(proj.to_string());
+        let notes = proj_dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let gone = notes.join("a.md");
+        let kept = notes.join("b.md");
+        std::fs::write(&gone, "renamed away\n").unwrap();
+        std::fs::write(&kept, "still here\n").unwrap();
+        let rel = |p: &Path| p.strip_prefix(wiki.root()).unwrap().to_path_buf();
+        wiki.git().mark_written(&gone);
+        wiki.git().mark_written(&kept);
+        wiki.commit_all("seed").unwrap().expect("seed commit");
+        // Control: the page is in the tree before the rename.
+        wiki.git().file_at_rev("HEAD", &rel(&gone)).unwrap();
+
+        // `mv notes/a.md /tmp/`: the path is gone before the event arrives.
+        std::fs::remove_file(&gone).unwrap();
+        let event = notify_debouncer_full::DebouncedEvent::new(
+            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::From,
+            )))
+            .add_path(gone.clone()),
+            std::time::Instant::now(),
+        );
+        handle_event(&wiki, event).await;
+
+        let reported = wiki.git().written_paths();
+        assert!(reported.contains(&rel(&gone)), "{reported:?}");
+        wiki.commit_all("after the rename")
+            .unwrap()
+            .expect("a commit that drops the page");
+        assert!(wiki.git().file_at_rev("HEAD", &rel(&gone)).is_err());
+        // Control: the commit dropped only the page that vanished.
+        assert_eq!(
+            wiki.git().file_at_rev("HEAD", &rel(&kept)).unwrap(),
+            b"still here\n"
         );
     }
 

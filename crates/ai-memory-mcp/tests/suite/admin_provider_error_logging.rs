@@ -55,6 +55,7 @@ fn provider_404() -> LlmError {
     LlmError::Provider {
         status: 404,
         body: "404 page not found".into(),
+        retry_after: None,
     }
 }
 
@@ -93,6 +94,7 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
     let db_path = store.db_path().to_path_buf();
     AdminState {
         ingest_metrics: Arc::new(ai_memory_core::IngestMetrics::default()),
+        mcp_metrics: std::sync::Arc::new(ai_memory_mcp::McpMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
