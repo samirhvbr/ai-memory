@@ -2,8 +2,8 @@
 
 > **Status:** `ACTIVE` · Production runs the **upstream's published Docker image**,
 > not a build of this fork (the fork carries no code of its own). Since
-> 13/10/2026 18:02 UTC that image is **`2.6.6`**, the release this fork's
-> upstream point contains.
+> 27/10/2026 22:06 UTC that image is **`3.2.8`**, the release this fork's
+> upstream point contains (schema 88). Before that it was `2.6.6`, from 13/10.
 
 | | |
 |---|---|
@@ -11,7 +11,7 @@
 | Access | `ssh samir@100.64.100.125`, then `sudo` |
 | Public address | `https://mem.shvia.org`, an Apache vhost on the same machine proxying to `http://127.0.0.1:49374/` |
 | Deploy | `docker compose` in `/srv/ai-memory`. `docker-compose.yml` holds the bearer token (mode 600); `./data` is bind-mounted at `/data` |
-| Image | `akitaonrails/ai-memory:2.6.6`, **pinned on purpose**: an upgrade migrates the database one way |
+| Image | `akitaonrails/ai-memory:3.2.8`, **pinned on purpose**: an upgrade migrates the database one way |
 | Data | `data/db/memory.sqlite` is about 45 GB: 1,444 latest pages (60,298 versions) and 655,901 observations. The wiki is about 0.6 GB. `/srv` has about 30 GB free, and the volume group has no free extents |
 
 **Not** `shvia-site` (`100.64.100.242`, the app server), and **not** `170.233.231.20`
@@ -19,7 +19,46 @@
 address). `deploy/ai-memory-servidor.md` in shvia-web still names `shvia-site` and
 `2.0.0`.
 
-## Next: 2.6.6 to 3.2.8, rehearsed on 27/10/2026
+## Upgrading: what worked on 27/10/2026, from 2.6.6 to 3.2.8
+
+`/srv/ai-memory/upgrade-3.2.8.sh`, with its log next to it, ran the procedure
+below unattended. All times UTC.
+
+| Step | Time |
+|---|---|
+| Image pulled while 2.6.6 still served | 21:44:14 |
+| Checks before, then stop | 21:44:19 – 21:44:20 |
+| Cold backup `backup-2.6.6-20261027-184414.tar.zst`, verified | 21:44:22 – 21:49:27, **825 MB** |
+| `3.2.8` started; V77 to V88 | 21:49:27 – **22:05:58**, when the API answered |
+| Checks after and the `ai-memory-web` probe | 22:05:58 – 22:06:02, all green |
+
+Down for **21 minutes 38 seconds**: 5 for the backup, 16 for the migrations. The
+rehearsal had predicted about 15 for the migrations. Free space stayed at 28 GB,
+and the WAL was empty until the server came up. The container reports
+`unhealthy` while it migrates, as it did on 13/10; that is the API not answering
+yet, not a failure.
+
+- Before and after, directly and through Apache: `workspaces` and `search` 200,
+  401 without the token, MCP `initialize` 200. Workspaces: default 136 / 950,
+  samirhv-shvia 23 / 41, shvia 1 / 2, the same on both sides.
+- `refinery_schema_history` ends at 88, and the `ai-memory-web` probe printed
+  `array ()`.
+- `status` after: 993 latest pages (60,759 versions), 3,063 sessions, 794,432
+  observations, FTS complete, `auth: bearer token`.
+- While the server was down, Apache answered the hooks with 500 and 502. From the
+  first minute back the hooks flushed what they had held: 125 events accepted
+  and stored, none failed, in the first minute.
+
+Rollback, which was not needed: stop; delete `data/db`;
+`zstd -dc --long=27 backup-2.6.6-20261027-184414.tar.zst | tar -C /srv/ai-memory -xf - data`;
+restore `docker-compose.yml.bak-20261027-184414-pre-3.2.8`; `docker compose up -d`.
+A 2.x binary refuses a store migrated to 3.x. The `2.6.6` image is still on the
+machine.
+
+**Still to do: the clients.** Each machine with the hooks keeps its own 2.x
+client until `ai-memory upgrade` runs there.
+
+## The 3.2.8 rehearsal, 27/10/2026
 
 The fork moved onto `v3.2.8` (version `0.3.0`). Before touching the server, the
 upgrade was rehearsed on a workstation, on a copy of the 13/10 cold backup
