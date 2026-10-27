@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.0`
+**Current version:** `0.3.1`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `0e548807` (`main`, exactly the `v3.2.8` release)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,15 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.1 - the 3.2.8 upgrade of mem.shvia.org is rehearsed on a copy first
+
+`docs/mem-shvia-org.md` records a rehearsal on a workstation, on a copy of the
+13/10 cold backup brought to 2.6.6 first: V77 to V88 applied in 4 min 17 s with
+no extra disk, the same counts before and after, the production checks green
+(200 with the bearer, 401 without), and `ai-memory-web`'s schema probe clean
+against schema 88. On the server's speed that is about 15 minutes down plus the
+backup. The server itself is still on 2.6.6.
 
 ## 0.3.0 - the fork moves onto upstream v3.2.8, past the 3.0 major release
 

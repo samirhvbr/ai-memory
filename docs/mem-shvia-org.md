@@ -19,6 +19,36 @@
 address). `deploy/ai-memory-servidor.md` in shvia-web still names `shvia-site` and
 `2.0.0`.
 
+## Next: 2.6.6 to 3.2.8, rehearsed on 27/10/2026
+
+The fork moved onto `v3.2.8` (version `0.3.0`). Before touching the server, the
+upgrade was rehearsed on a workstation, on a copy of the 13/10 cold backup
+(`backup-2.1.2-20261013-142356.tar.zst`, checksum verified), first brought to
+`2.6.6` the way production is, then started on `3.2.8`:
+
+| | Result |
+|---|---|
+| Migrations | V77 to V88, applied on the first start; `refinery_schema_history` ends at 88 |
+| Time to the API answering | **4 min 17 s** on the workstation. The same machine ran the 2.6.6 step in 9 min 31 s, which took 38 min on the server, so expect roughly **15 minutes** there, plus the five-minute backup |
+| Extra disk | none: the database stayed at 43 GB through the migration |
+| Counts | the same before and after: 1,437 pages (60,199 versions), 2,955 sessions, 655,798 observations, FTS complete |
+| Checks | `workspaces`, `search` and MCP `initialize` 200 with the bearer, 401 without it; workspaces default 125 / 1,392, samirhv-shvia 21 / 41, shvia 1 / 4 |
+| `ai-memory-web` | the schema probe returns `array ()` against schema 88, in 1.4 s |
+| Auth | `AI_MEMORY_AUTH_TOKEN` in the environment still authenticates; `status` now prints `auth: bearer token` |
+
+The probe needs PHP with `pdo_sqlite`; the workstation has none, so it ran in
+`php:8.4-cli`. A probe that cannot open the database reports `could not find
+driver` for every read, which is a missing tool, not a schema answer.
+
+What changes for clients: nothing has to change first. Upgrade the server, then
+run `ai-memory upgrade` on each machine with the hooks. In 3.x `memory_query`
+also searches observations by default; `[retrieval] observation_stream = false`
+restores the 2.x ranking.
+
+The script is `upgrade-3.2.8.sh`, the 2.6.6 one with the tags changed, the image
+pulled before the stop so the download is not downtime, and the
+`ai-memory-web` probe added to the after-checks.
+
 ## Upgrading: what worked on 13/10/2026, from 2.1.2 to 2.6.6
 
 The script is on the server, `/srv/ai-memory/upgrade-2.6.6.sh`, with its log next
