@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.2.3`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `d408450d` (`main`: the `v2.6.6` release plus nine commits)
+**Current version:** `0.3.0`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `0e548807` (`main`, exactly the `v3.2.8` release)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,27 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.0 - the fork moves onto upstream v3.2.8, past the 3.0 major release
+
+The fork sat on `d408450d` (`v2.6.6` plus nine commits) since 13/10/2026. By
+27/10/2026 that was **1,552 upstream commits and fifteen releases behind**:
+`v2.6.7`, the **`v3.0.0` major release** on 14/10, and `v3.0.1` through
+`v3.2.8`. This sync merges upstream `main` at `0e548807`, which is exactly the
+`v3.2.8` tag: nothing after the release, so the fork is the code the published
+`3.2.8` image runs.
+
+It came in as a merge again: no upstream commit rewritten, no force-push, and it
+merged clean. After the merge the tree differs from `v3.2.8` in our three files
+(`version.md`, `docs/ci.md`, `docs/mem-shvia-org.md`) and nothing else. Not a
+line of our own code changed.
+
+**What 3.0 means for the server** ([`docs/upgrading-to-3.0.md`](docs/upgrading-to-3.0.md)
+upstream): the 1.x token commands are gone (the server authenticates with the
+`AI_MEMORY_AUTH_TOKEN` variable, which 3.x still honours), `memory_query` now
+searches observations by default, and the first start applies migrations
+**V77 to V88**, forward only. `mem.shvia.org` is still on `2.6.6` at this
+version; the upgrade and its measurements go in `docs/mem-shvia-org.md`.
 
 ## 0.2.3 - the post-upgrade checks reach ai-memory-web through its schema probe
 
