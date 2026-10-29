@@ -2,8 +2,9 @@
 
 > **Status:** `ACTIVE` · Production runs the **upstream's published Docker image**,
 > not a build of this fork (the fork carries no code of its own). Since
-> 27/10/2026 22:06 UTC that image is **`3.2.8`**, the release this fork's
-> upstream point contains (schema 88). Before that it was `2.6.6`, from 13/10.
+> 27/10/2026 22:06 UTC that image is **`3.2.8`** (schema 88). Before that it was
+> `2.6.6`, from 13/10. The fork's code has since moved on to upstream `3.2.10`
+> and 38 commits (version `0.3.3`); the server has not.
 
 | | |
 |---|---|

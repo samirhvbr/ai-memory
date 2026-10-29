@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.2`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `0e548807` (`main`, exactly the `v3.2.8` release)
+**Current version:** `0.3.3`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `6ac0ebce` (`main`, `v3.2.10` plus 38 commits)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,35 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.3 - the fork moves onto upstream main past v3.2.10, and why Releases still read v2.0.1
+
+The fork was on `v3.2.8` (`0e548807`) since 27/10/2026 and by 29/10 was 188
+upstream commits behind: the `v3.2.9` and `v3.2.10` releases plus 38 commits on
+`main`. This sync merges upstream `main` at `6ac0ebce`. It came in as a merge
+again, with no upstream commit rewritten and no force-push, and it merged clean.
+After it the tree differs from `upstream/main` in our three files
+(`version.md`, `docs/ci.md`, `docs/mem-shvia-org.md`) and nothing else, so no
+customization was lost and none exists in code: not a line of our own changed.
+
+Five of the 38 commits are ours, merged upstream earlier from this account
+(#1844, #1845, #1846, #1848, #1849: the macOS LaunchAgent paths and output
+drain, the grouped CJK column filters, the device-authorization polling
+deadline, the ephemeral SDK test port).
+
+**The "Latest" release of this repository still reads `v2.0.1`, and that is not
+the code.** The Releases box lists what was tagged *here*, and the only tags
+ever pushed to this fork are `v2.0.0`, `v2.0.1` and `v2.0.2` (02 and 03/09/2026,
+each built by `release.yml`). The syncs since then merged the code and never
+pushed the upstream's tags, so the page stayed where it was. The code is `3.2.10`
+(`Cargo.toml`); the image production runs is the upstream's, not a build of this
+fork. Pushing a `v*.*.*` tag here starts `release.yml`, which builds on the
+hosted runners (the account is billing-locked at the time of writing), so the
+fork's tags were not touched.
+
+`mem.shvia.org` is still on the `3.2.8` image: the server follows the published
+image, not this branch, and moves only by the procedure in
+[`docs/mem-shvia-org.md`](docs/mem-shvia-org.md).
 
 ## 0.3.2 - mem.shvia.org runs 3.2.8, after a cold compressed backup and 22 minutes down
 
