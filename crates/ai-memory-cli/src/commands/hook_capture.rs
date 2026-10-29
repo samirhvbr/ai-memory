@@ -774,12 +774,15 @@ const NATIVE_HOOK_CLIENT_KIND: &str = "hook";
 /// ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, which have no
 /// business on a loopback/LAN POST; reqwest is built without its
 /// `system-proxy` feature, so no OS proxy setting is read either way.
+/// Redirects are disabled so a 3xx from an SSO portal or proxy never drops
+/// spooled events, replays payloads, or injects foreign HTML into context.
 /// Built once per invocation and reused for both the event POST and the
 /// handoff GET. Default root certs are kept so HTTPS targets (e.g. a TLS
 /// proxy) still work.
 pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -1277,6 +1280,100 @@ mod tests {
         let url = serve_once("401 Unauthorized", "unauthorized").await;
         let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
         assert!(got.is_none(), "non-2xx body must not become context");
+    }
+
+    async fn redirect_server(status: &'static str, target_url: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = target_url.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}/redirect")
+    }
+
+    #[tokio::test]
+    async fn build_client_refuses_redirects() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let response = build_client().get(&source_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_hook_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let outcome = post_hook(
+            &build_client(),
+            &source_url,
+            "{}",
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(outcome, PostOutcome::Failed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_batch_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let outcome = post_batch(
+            &build_client(),
+            &source_url,
+            "[]",
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(outcome, BatchOutcome::Failed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_handoff_does_not_follow_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/login", target.local_addr().unwrap());
+        let source_url = redirect_server("302 Found", &target_url).await;
+
+        let got = get_handoff(&build_client(), &source_url, None, Duration::from_secs(1)).await;
+        assert!(got.is_none(), "redirect must not inject target content");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target must never be contacted"
+        );
     }
 
     /// Like `serve_once`, but answers 200 and hands back the raw request.

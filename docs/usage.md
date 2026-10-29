@@ -637,6 +637,14 @@ ai-memory auth status
 Copilot auth stores a GitHub user token, then the provider exchanges it for a
 short-lived Copilot API token before each LLM call.
 
+Device login (`openai-oauth`, `copilot` and `oidc-device`) waits up to
+`--timeout-secs` seconds for authorization after the device code is issued
+(default: 600). The limit covers device-authorization polling requests,
+response reads and pauses between polls, including a provider's `slow_down`
+backoff. Reaching it discards the polling result without changing stored
+credentials. Discovery, the initial device-code request and OpenAI's exchange
+of a code authorized within the deadline keep their own HTTP request timeout.
+
 ## Browse the wiki in a browser
 
 Start the server with `--enable-web` and open

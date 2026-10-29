@@ -162,7 +162,10 @@ from hook paths.
    explicit pending-writes approval. If `[auto_improve.eval] enabled = true`,
    targeted proposals (default `_rules/` and `procedures/`) must pass the
    configured executable JSON contract before they are staged; failures become
-   rejected candidates/rejection-buffer entries rather than wiki writes.
+   rejected candidates/rejection-buffer entries rather than wiki writes. Like
+   the consolidation prompts, the per-session reviewer, the cross-session
+   experience pass, the dream merge and the lint contradiction pass write
+   prose in the dominant natural language of their input.
    Every LLM prompt treats repository text, observations, wiki pages, and prior
    proposals as untrusted data rather than instructions. The same explicit
    trust boundary and delimiters precede automatically injected handoffs,
@@ -265,7 +268,8 @@ from hook paths.
    enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A
    separate daily cleanup removes week-old project rows only when they contain
-   no pages, sessions, observations, handoffs, managed workstreams, or
+   no pages, sessions, observations, handoffs, managed workstreams, sent or
+   received agent messages (including claimed/cancelled history), or
    auto-improvement data; managed continuity history therefore keeps its
    project scope alive even when no lifecycle-hook session has been captured.
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
@@ -1032,7 +1036,9 @@ that touch the relevant area.
    code that must read process or harness environment takes an injectable
    lookup so tests can stub it. (agentmemory #456 / #469.)
 2. **Single-writer SQLite actor.** All writes go through one `mpsc`
-   channel to one dedicated OS thread. (cognee #2717.)
+   channel to one dedicated OS thread. Dropping the final writer handle
+   drains accepted commands and joins that thread, even when the bounded
+   queue is full or callers have cancelled their reply waits. (cognee #2717.)
 3. **Indexes commit in the same transaction as the data.** No
    background-task-indexing-after-return. (basic-memory #763 / #578.)
 4. **Typed 3-tuple identity** (`workspace_id`, `project_id`, path)

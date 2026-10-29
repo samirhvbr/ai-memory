@@ -975,41 +975,41 @@ impl Wiki {
             )))
         })?;
         let mut md = parse(&raw)?;
-        // Conform like the three sibling write paths (`write_page_inner`,
-        // `apply_batch`, `approve_auto_improve_proposal`) do: the row this
-        // upserts is conformed at the store's write choke point either way,
-        // so writing the historical bytes verbatim left the file behind the
-        // row. Restoring the pre-OKF checkpoint every migrated install
-        // carries then failed `export-okf` for the whole project with "run
-        // the server once to migrate" — which the one-shot wiki migration
-        // never does again — and made each `serve` boot re-archive the data
-        // dir once the migration archive was deleted. Conformance is
-        // idempotent modulo `generated.at`. When the file on disk already
-        // holds the same content, its timestamp still wins, so the file keeps
-        // matching the row the store's idempotent upsert reuses. Otherwise
-        // the disk holds a newer version and would leave only `now()`; an
-        // already-conformant checkpoint keeps its own `generated.at` instead,
-        // so it restores byte-exact whatever the clock.
-        conform_frontmatter_for_disk_keeping(
-            &self.abs_path(workspace_id, project_id, &path),
-            path.as_str(),
-            &mut md,
-            true,
-        );
-        let raw = emit(&md)?;
-        let title = derive_title(&md.frontmatter, &md.body, &path);
-        let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
-        let meta = derive_index_metadata(&path, &md.frontmatter)?;
-        let body = md.body.clone();
-        let abstract_text = frontmatter_abstract(&md.frontmatter).map(str::to_owned);
-
-        let id = {
+        let (id, body, abstract_text) = {
             let _guard = self.mutation_lock.read().await;
+            // Restore shares the writer/reindex lock, including the disk read
+            // that chooses generated.at and any rollback after a refused upsert.
+            let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
+            let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
+            // Conform like the three sibling write paths (`write_page_inner`,
+            // `apply_batch`, `approve_auto_improve_proposal`) do: the row this
+            // upserts is conformed at the store's write choke point either way,
+            // so writing the historical bytes verbatim left the file behind the
+            // row. Restoring the pre-OKF checkpoint every migrated install
+            // carries then failed `export-okf` for the whole project with "run
+            // the server once to migrate" — which the one-shot wiki migration
+            // never does again — and made each `serve` boot re-archive the data
+            // dir once the migration archive was deleted. Conformance is
+            // idempotent modulo `generated.at`. When the file on disk already
+            // holds the same content, its timestamp still wins, so the file keeps
+            // matching the row the store's idempotent upsert reuses. Otherwise
+            // the disk holds a newer version and would leave only `now()`; an
+            // already-conformant checkpoint keeps its own `generated.at` instead,
+            // so it restores byte-exact whatever the clock.
+            conform_frontmatter_for_disk_keeping(&abs, path.as_str(), &mut md, true);
+            let raw = emit(&md)?;
+            let title = derive_title(&md.frontmatter, &md.body, &path);
+            let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
+            let meta = derive_index_metadata(&path, &md.frontmatter)?;
+            let body = md.body.clone();
+            let abstract_text = frontmatter_abstract(&md.frontmatter).map(str::to_owned);
+
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
             let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
-            self.git.write_atomic(&abs, raw.as_bytes())?;
-            self.writer
+            let installed = replace_file_with_rollback_snapshot(&self.git, &abs, raw.as_bytes())?;
+            let id = match self
+                .writer
                 .upsert_page(NewPage {
                     workspace_id,
                     project_id,
@@ -1025,7 +1025,15 @@ impl Wiki {
                     entities: meta.entities,
                     evidence: Vec::new(),
                 })
-                .await?
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    rollback_or_inconsistent(&self.git, std::slice::from_ref(&installed), &e)?;
+                    return Err(e.into());
+                }
+            };
+            (id, body, abstract_text)
         };
         // Embed the restored version like `write_page` does; without this it
         // ranked FTS-only until a backfill. The watcher's reindex of the file
@@ -5326,6 +5334,249 @@ mod tests {
         assert!(meta.pinned);
         let md = wiki.read_page(ws, proj, &path).unwrap();
         assert_eq!(md.body.trim(), "old");
+    }
+
+    #[tokio::test]
+    async fn restore_page_collision_keeps_disk_and_store_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let historical = PagePath::new("notes/A.md").unwrap();
+        let current = PagePath::new("notes/a.md").unwrap();
+        wiki.write_page(req(
+            ws,
+            proj,
+            historical.as_str(),
+            "historical",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+        wiki.delete_page(ws, proj, &historical, None, None)
+            .await
+            .unwrap();
+        let current_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                current.as_str(),
+                "current",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let current_abs = wiki.abs_path(ws, proj, &current);
+        let historical_abs = wiki.abs_path(ws, proj, &historical);
+        let before = std::fs::read(&current_abs).unwrap();
+        // On case-folding filesystems these paths already address one file;
+        // on case-sensitive filesystems the rejected restore must not create A.md.
+        let historical_existed = historical_abs.exists();
+
+        let err = wiki
+            .restore_page_from_checkpoint(ws, proj, historical.clone(), &rev)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("collides with existing page"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&current_abs).unwrap(), before);
+        assert_eq!(historical_abs.exists(), historical_existed);
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, current.as_str().into())
+                .await
+                .unwrap(),
+            Some(current_id)
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, historical.as_str().into())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, current.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "current"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_page_store_failure_rolls_back_replacement_and_new_file() {
+        for existing in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let (store, wiki, ws, proj) = scoped(&tmp).await;
+            let path = PagePath::new("notes/restore.md").unwrap();
+            wiki.write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "historical",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+            let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+            let expected_id = if existing {
+                Some(
+                    wiki.write_page(req(
+                        ws,
+                        proj,
+                        path.as_str(),
+                        "current",
+                        serde_json::json!({}),
+                    ))
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                wiki.delete_page(ws, proj, &path, None, None).await.unwrap();
+                None
+            };
+            let abs = wiki.abs_path(ws, proj, &path);
+            let before = snapshot_existing_file(&abs).unwrap();
+            // Reject the real store transaction after restore installs the file.
+            // Both rollback branches must work regardless of filesystem casing.
+            let db = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+            db.execute_batch(
+                "CREATE TRIGGER reject_restore BEFORE INSERT ON pages \
+                WHEN NEW.path = 'notes/restore.md' BEGIN \
+                SELECT RAISE(ABORT, 'injected restore failure'); END;",
+            )
+            .unwrap();
+
+            let err = wiki
+                .restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains("injected restore failure"),
+                "{err}"
+            );
+            assert_eq!(snapshot_existing_file(&abs).unwrap(), before);
+            assert_eq!(
+                store
+                    .reader
+                    .latest_page_id_by_ids(ws, proj, path.as_str().into())
+                    .await
+                    .unwrap(),
+                expected_id
+            );
+            if existing {
+                assert_eq!(
+                    store
+                        .reader
+                        .page_body_by_ids(ws, proj, path.as_str())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .body,
+                    "current"
+                );
+            }
+
+            db.execute_batch("DROP TRIGGER reject_restore;").unwrap();
+            wiki.restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
+                .await
+                .unwrap();
+            assert_eq!(wiki.read_page(ws, proj, &path).unwrap().body, "historical");
+            assert_eq!(
+                store
+                    .reader
+                    .page_body_by_ids(ws, proj, path.as_str())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                "historical"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_page_lock_waits_before_conformance_and_allows_another_path() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/held-restore.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "historical",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let mut checkpoint_md = wiki.read_page(ws, proj, &path).unwrap();
+        ai_memory_core::okf::stamp_generated_at(
+            &mut checkpoint_md.frontmatter,
+            "2020-01-01T00:00:00Z",
+        );
+        std::fs::write(&abs, emit(&checkpoint_md).unwrap()).unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+        wiki.write_page(req(ws, proj, path.as_str(), "newer", serde_json::json!({})))
+            .await
+            .unwrap();
+
+        let global = wiki.mutation_lock.read().await;
+        let page = wiki.lock_page(ws, proj, &path).await;
+        // Queue an ordinary writer first, then the restore. The restore must
+        // conform against the bytes that writer commits, not the old disk view.
+        let write = wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "historical",
+            serde_json::json!({}),
+        ));
+        tokio::pin!(write);
+        wait_for_page_waiter(&wiki, &(ws, proj, path.clone()), write.as_mut()).await;
+        let restore = wiki.restore_page_from_checkpoint(ws, proj, path.clone(), &rev);
+        tokio::pin!(restore);
+        wait_for_page_waiter(&wiki, &(ws, proj, path.clone()), restore.as_mut()).await;
+        finish_lock_test(wiki.write_page(req(
+            ws,
+            proj,
+            "notes/independent.md",
+            "control",
+            serde_json::json!({}),
+        )))
+        .await
+        .unwrap();
+        assert_eq!(wiki.read_page(ws, proj, &path).unwrap().body, "newer");
+
+        drop(page);
+        drop(global);
+        let written = finish_lock_test(write).await.unwrap();
+        let committed = std::fs::read(&abs).unwrap();
+        let restored = finish_lock_test(restore).await.unwrap();
+        assert_eq!(
+            restored, written,
+            "restoring the same content reuses the current row"
+        );
+        assert_eq!(std::fs::read(&abs).unwrap(), committed);
+        let disk = wiki.read_page(ws, proj, &path).unwrap();
+        let row = latest_row(&tmp, path.as_str()).2;
+        assert_eq!(
+            ai_memory_core::okf::generated_at(&disk.frontmatter),
+            ai_memory_core::okf::generated_at(&row)
+        );
+        assert_ne!(
+            ai_memory_core::okf::generated_at(&disk.frontmatter),
+            Some("2020-01-01T00:00:00Z")
+        );
     }
 
     // The newer file on disk has another body, so the disk-inheritance rule

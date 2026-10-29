@@ -222,7 +222,10 @@ Everything in A works with no provider and does not require ranking changes.
   (bounded, not the whole corpus). Adaptive eps from the k-distance elbow. Collapse
   = write one survivor, supersede the rest with a merge note pointing at the
   survivor. Zero-LLM: the survivor is the highest-retention member, body chosen by
-  A2's extractive rules; the *LLM* rewrite of a cluster is B2, opt-in.
+  A2's extractive rules; the *LLM* rewrite of a cluster is B2, opt-in. Every
+  replacement is conditional on its selected source version. If any source
+  changed before the write, the whole dedup batch stays unapplied in the report;
+  those selected pages are not evicted or compacted by the same sweep.
 - *Schema delta:* none beyond A2's marker; merge provenance goes in `page_evidence`
   (`source_kind`) and supersession.
 - *Invariants:* #2 (cluster on the already-materialized cold set, one batch write);
@@ -511,7 +514,10 @@ in a boot migration.
   before it may default on. An existing user sees no ranking change until they opt in.
 - **B2 dream rewrite/merge: never deletes a source.** Originals live in git and
   the supersession chain; `dry_run` first; R2-gated; opt-in LLM. The zero-LLM
-  default path (#13) is untouched; a provider-less store never runs B2.
+  default path (#13) is untouched; a provider-less store never runs B2. Each
+  merge checks that every selected source version is still current when the
+  batch writes. If any member changed, the whole cluster is skipped and counted
+  in the report; newer edits and unchanged peers stay intact for a later pass.
 - **C1 access reinforcement on more read paths: strictly non-destructive.** It
   only raises retention scores (keeps memory a little longer); it can never lower a
   score or delete anything, and it still cannot block TTL cleanup (the TTL pass

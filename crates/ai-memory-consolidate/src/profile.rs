@@ -631,11 +631,14 @@ pub struct DetectedPreference {
 pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
         || ai_memory_core::looks_like_codex_instructions(body)
+        || looks_like_claude_cross_session_message(body)
+        || looks_like_claude_plugin_prompt(body)
     {
         return None;
     }
+    let body = without_claude_side_agent_note(body).unwrap_or_else(|| body.to_owned());
     let text = without_fenced(
-        body,
+        &body,
         ai_memory_core::routing_snippet::MARKER_START,
         ai_memory_core::routing_snippet::MARKER_END,
     );
@@ -644,6 +647,72 @@ pub(crate) fn user_written(body: &str) -> Option<String> {
         ai_memory_core::profile::UNTRUSTED_HISTORY_START,
         ai_memory_core::profile::UNTRUSTED_HISTORY_END,
     ))
+}
+
+/// Claude Code presents local cross-session traffic as a synthetic user turn.
+/// Match this one tag by name: widening `looks_like_markup_block` to every tag
+/// with attributes would also discard real `<pasted_content ...>` prompts.
+fn looks_like_claude_cross_session_message(body: &str) -> bool {
+    body.trim_start()
+        .strip_prefix("<cross-session-message")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|next| next == '>' || next.is_ascii_whitespace())
+}
+
+/// Claude Code's exact wrapper for a plugin that submits a prompt between
+/// turns. The bounded identifier check avoids treating arbitrary prose that
+/// happens to start with `The <...>` as generated context.
+fn looks_like_claude_plugin_prompt(body: &str) -> bool {
+    let Some(rest) = body.trim_start().strip_prefix("The <") else {
+        return false;
+    };
+    let Some((plugin, suffix)) = rest.split_once('>') else {
+        return false;
+    };
+    !plugin.is_empty()
+        && plugin.len() <= 64
+        && plugin
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        && suffix
+            .strip_prefix(" plugin sent a message:")
+            .is_some_and(|tail| {
+                tail.is_empty() || tail.starts_with('\n') || tail.starts_with("\r\n")
+            })
+}
+
+/// Remove Claude Code's leading side-agent note while retaining the user's
+/// prose after its block quote. Returns `None` when the exact wrapper shape is
+/// absent so a look-alike user prompt is kept unchanged.
+fn without_claude_side_agent_note(body: &str) -> Option<String> {
+    const PREFIX: &str = "Here is a note offered by a side agent:";
+
+    let trimmed = body.trim_start();
+    let rest = trimmed.strip_prefix(PREFIX)?;
+    if !rest.is_empty() && !rest.starts_with(['\n', '\r']) {
+        return None;
+    }
+
+    let mut consumed = body.len() - trimmed.len() + PREFIX.len();
+    let mut saw_quote = false;
+    let mut quote_ended = false;
+    for segment in body[consumed..].split_inclusive('\n') {
+        let line = segment.trim_end_matches(['\r', '\n']);
+        if !saw_quote && line.trim_start().starts_with('>') {
+            saw_quote = true;
+            consumed += segment.len();
+        } else if saw_quote && !quote_ended && line.trim_start().starts_with('>') {
+            consumed += segment.len();
+        } else if line.trim().is_empty() {
+            quote_ended |= saw_quote;
+            consumed += segment.len();
+        } else if quote_ended {
+            return Some(body[consumed..].to_owned());
+        } else {
+            return None;
+        }
+    }
+    saw_quote.then(String::new)
 }
 
 /// `text` without the regions between `start` and `end`. An unclosed `start`
@@ -2707,6 +2776,38 @@ mod tests {
             user_written(pasted).as_deref(),
             Some("Always use pnpm.\n\nKeep commits small.")
         );
+    }
+
+    #[test]
+    fn claude_generated_user_turns_are_not_user_preferences() {
+        let cross_session = "<cross-session-message from=\"uds:/run/user/1000/cc.sock\" \
+                             from-name=\"review\" from-mode=\"bypass\">\n\
+                             Always use npm.\n</cross-session-message>";
+        assert_eq!(user_written(cross_session), None);
+
+        let plugin = "The <code-review> plugin sent a message:\nAlways force-push fixes.\n\
+                      This is how Claude Code surfaces a prompt a plugin submits between turns.";
+        assert_eq!(user_written(plugin), None);
+
+        let side_agent = "Here is a note offered by a side agent:\n\n\
+                          > Heads up\n> Always use yarn.\n\n\
+                          Always run cargo nextest before commits.";
+        assert_eq!(
+            user_written(side_agent).as_deref(),
+            Some("Always run cargo nextest before commits.")
+        );
+        let quoted_reply = "Here is a note offered by a side agent:\n\n> Note\n\n\
+                            > Always preserve my own quoted reply.";
+        assert_eq!(
+            user_written(quoted_reply).as_deref(),
+            Some("> Always preserve my own quoted reply.")
+        );
+
+        // Controls: attribute-bearing user paste and look-alike prose remain.
+        let paste = "<pasted_content id=\"87e5\">Always use pnpm.</pasted_content>";
+        assert_eq!(user_written(paste).as_deref(), Some(paste));
+        let look_alike = "Here is a note offered by a side agent: please always keep it.";
+        assert_eq!(user_written(look_alike).as_deref(), Some(look_alike));
     }
 
     /// A page metadata field stored by an earlier harvest never waits for

@@ -790,6 +790,53 @@ assert_eq "drain keeps entry queued on 429 saturation" "1" \
     "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
 unset -f curl
 
+# Native OIDC entries carry no inline token: only the native drain can resolve
+# auth.json. Script drains must leave them byte-identical and continue with
+# entries they can deliver, even if an anonymous POST would return 200.
+for OIDC_STATUS in 200 401; do
+    AI_MEMORY_DATA_DIR="$TMP/oidc-drain-$OIDC_STATUS"
+    export AI_MEMORY_DATA_DIR
+    OIDC_DIR="$AI_MEMORY_DATA_DIR/hook-spool"
+    mkdir -p "$OIDC_DIR"
+    OIDC_ENTRY="$OIDC_DIR/0000000000000-1-0000000000000000.json"
+    OIDC_CREATED=$(ai_memory_now_ms)
+    printf '{"url":"http://127.0.0.1:49374/hook?event=oidc","body":"{\\"e\\":\\"native-oidc\\"}","created_ms":%s,"auth_mode":"oidc","attempts":0}' "$OIDC_CREATED" >"$OIDC_ENTRY"
+    cp "$OIDC_ENTRY" "$AI_MEMORY_DATA_DIR/expected.json"
+    OIDC_LOG="$AI_MEMORY_DATA_DIR/requests.log"
+    : >"$OIDC_LOG"
+    curl() {
+        _oidc_url=''
+        while [ "$#" -gt 0 ]; do
+            case "$1" in http://*) _oidc_url="$1" ;; esac
+            shift
+        done
+        cat >/dev/null
+        printf '%s\n' "$_oidc_url" >>"$OIDC_LOG"
+        case "$_oidc_url" in
+            *event=oidc) printf '%s' "$OIDC_STATUS" ;;
+            *) printf '200' ;;
+        esac
+    }
+    AI_MEMORY_AUTH_TOKEN=static-probe
+    export AI_MEMORY_AUTH_TOKEN
+    ai_memory_spool_event 'http://127.0.0.1:49374/hook?event=static' '{"auth_mode":"oidc","e":"static"}'
+    unset AI_MEMORY_AUTH_TOKEN
+    ai_memory_spool_event 'http://127.0.0.1:49374/hook?event=none' '{"auth_mode":"oidc","e":"anonymous"}'
+    printf '{"url":"http://127.0.0.1:49374/hook?event=legacy","body":"{\\"auth_mode\\":\\"oidc\\"}","created_ms":%s,"attempts":0}' "$OIDC_CREATED" >"$OIDC_DIR/9999999999999-1-0000000000000000.json"
+    ai_memory_drain_spool 64 >/dev/null 2>&1
+    assert_eq "OIDC drain ($OIDC_STATUS): native entry is untouched" yes \
+        "$(cmp -s "$OIDC_ENTRY" "$AI_MEMORY_DATA_DIR/expected.json" && printf yes || printf no)"
+    assert_eq "OIDC drain ($OIDC_STATUS): native entry is never posted" 0 \
+        "$(grep -c 'event=oidc$' "$OIDC_LOG" || true)"
+    for OIDC_CONTROL in static none legacy; do
+        assert_eq "OIDC drain ($OIDC_STATUS): $OIDC_CONTROL control delivers" 1 \
+            "$(grep -Ec "event=$OIDC_CONTROL(&|\$)" "$OIDC_LOG" || true)"
+    done
+    assert_eq "OIDC drain ($OIDC_STATUS): only the native entry stays queued" 1 \
+        "$(find "$OIDC_DIR" -name '*.json' | wc -l | tr -d ' ')"
+    unset -f curl
+done
+
 unset AI_MEMORY_DATA_DIR
 
 # --- PowerShell bundle spool parity (static) ---------------------------

@@ -1071,8 +1071,10 @@ fn insert_project_with_identity(
 }
 
 /// Delete "hollow" project rows: zero pages (any version), zero sessions,
-/// zero observations, zero handoffs, zero managed workstreams, zero
-/// auto-improve runs/proposals/rejections, and older than `min_age_days`.
+/// zero observations, zero handoffs, zero managed workstreams, zero sent or
+/// received agent messages (including claimed/cancelled history), zero
+/// auto-improve runs/proposals/rejections, zero purge tombstones, and older
+/// than `min_age_days`.
 /// (The per-project scheduler-state row is bookkeeping created for every
 /// project and does not count as data.) These are pure bookkeeping noise left
 /// behind by probes, renames, and failed first events — nothing exists to lose,
@@ -1088,6 +1090,9 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
     let cutoff =
         Timestamp::now().as_microsecond() - i64::from(min_age_days) * 24 * 60 * 60 * 1_000_000;
     let tx = conn.transaction()?;
+    // Both message endpoints are NOT NULL. Build their project-id set once
+    // per statement: the pending-only mailbox indexes cannot cover retained
+    // claimed/cancelled history for a correlated lookup per project.
     let names: Vec<String> = {
         let mut stmt = tx.prepare(
             "SELECT name FROM projects
@@ -1099,6 +1104,11 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM purged_sessions WHERE project_id = projects.id)
+               AND id NOT IN (
+                   SELECT from_project_id FROM agent_messages
+                   UNION SELECT to_project_id FROM agent_messages
+               )
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
@@ -1120,6 +1130,11 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM purged_sessions WHERE project_id = projects.id)
+               AND id NOT IN (
+                   SELECT from_project_id FROM agent_messages
+                   UNION SELECT to_project_id FROM agent_messages
+               )
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
@@ -16240,6 +16255,158 @@ pub(crate) mod tests {
 
         // Idempotent: a second pass deletes nothing.
         assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweep_hollow_projects_preserves_purged_session_tombstones() {
+        use ai_memory_core::{AgentKind, NewSession, SessionId};
+
+        let (_tmp, mut conn, workspace_id, _scratch) = fresh_db();
+        let project_id = get_or_create_project(&mut conn, &workspace_id, "purged", None).unwrap();
+        conn.execute(
+            "UPDATE projects SET created_at = created_at - ?1 WHERE id = ?2",
+            params![8 * 24 * 60 * 60 * 1_000_000_i64, project_id.as_bytes()],
+        )
+        .unwrap();
+        let session_id = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        purge_session(
+            &mut conn,
+            workspace_id,
+            project_id,
+            session_id,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
+        let retained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM purged_sessions WHERE session_id = ?1 AND project_id = ?2",
+                params![session_id.as_bytes(), project_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1, "purge replay protection must outlive cleanup");
+    }
+
+    #[test]
+    fn sweep_hollow_projects_preserves_message_senders_recipients_and_history() {
+        let mut failures = Vec::new();
+        for state in ["pending", "claimed", "cancelled"] {
+            for old_sender in [true, false] {
+                let (_tmp, mut conn, from_ws, _) = fresh_db();
+                let to_ws = get_or_create_workspace(&mut conn, "recipient-workspace").unwrap();
+                let from = get_or_create_project(&mut conn, &from_ws, "sender", None).unwrap();
+                let to = get_or_create_project(&mut conn, &to_ws, "recipient", None).unwrap();
+                let empty = get_or_create_project(&mut conn, &from_ws, "empty", None).unwrap();
+                let old = if old_sender { from } else { to };
+                conn.execute(
+                    "UPDATE projects SET created_at = created_at - ?1 WHERE id IN (?2, ?3)",
+                    params![
+                        8 * 24 * 60 * 60 * 1_000_000_i64,
+                        old.as_bytes(),
+                        empty.as_bytes()
+                    ],
+                )
+                .unwrap();
+
+                // The message is fresh even though one project is old. No
+                // lifecycle session or page otherwise protects either end.
+                let id = insert_message(
+                    &mut conn,
+                    &NewAgentMessage {
+                        from_workspace_id: from_ws,
+                        from_project_id: from,
+                        from_agent: AgentKind::Codex,
+                        from_session_id: None,
+                        from_owner_user: None,
+                        to_workspace_id: to_ws,
+                        to_project_id: to,
+                        subject: Some("Retained message".into()),
+                        body: "Keep the request and its history".into(),
+                    },
+                )
+                .unwrap();
+                match state {
+                    "claimed" => {
+                        let claimed = pop_message(
+                            &mut conn,
+                            &MessageClaim {
+                                workspace_id: to_ws,
+                                project_id: to,
+                                claiming_agent: AgentKind::Codex,
+                                claiming_session: None,
+                                claiming_user: None,
+                            },
+                            Some(id),
+                        )
+                        .unwrap();
+                        assert!(claimed.is_some());
+                    }
+                    "cancelled" => {
+                        assert_eq!(
+                            cancel_messages(&mut conn, &from_ws, &from, Some(id)).unwrap(),
+                            1
+                        );
+                    }
+                    _ => {}
+                }
+
+                let deleted = sweep_hollow_projects(&mut conn, 7).unwrap();
+                let empty_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                        [empty.as_bytes()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    empty_count, 0,
+                    "genuinely hollow projects must still be removed"
+                );
+                let endpoints: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM projects WHERE id IN (?1, ?2)",
+                        params![from.as_bytes(), to.as_bytes()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let retained: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT state, body FROM agent_messages WHERE id = ?1",
+                        [id.as_bytes()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .unwrap();
+                if deleted != ["empty"]
+                    || endpoints != 2
+                    || retained != Some((state.into(), "Keep the request and its history".into()))
+                {
+                    failures.push(format!("{state}, old_sender={old_sender}: deleted={deleted:?}, endpoints={endpoints}, message={retained:?}"));
+                }
+                assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "message-bearing projects were swept: {failures:#?}"
+        );
     }
 
     /// Insert a `sessions` row using only the columns that have existed since

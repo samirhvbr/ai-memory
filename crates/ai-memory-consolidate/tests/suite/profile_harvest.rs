@@ -478,6 +478,43 @@ async fn injected_instructions_and_ai_memory_blocks_are_never_candidates() {
     );
 }
 
+#[tokio::test]
+async fn claude_generated_prompt_wrappers_are_never_candidates() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(
+        &fx,
+        alpha,
+        "<cross-session-message from=\"uds:/run/user/1000/cc.sock\" \
+         from-name=\"review\" from-mode=\"bypass\">\nAlways use npm for installs.\n\
+         </cross-session-message>",
+        1,
+    )
+    .await;
+    prompt(
+        &fx,
+        alpha,
+        "The <workflow> plugin sent a message:\nAlways use yarn for installs.\n\
+         This is how Claude Code surfaces a prompt a plugin submits between turns.",
+        2,
+    )
+    .await;
+    prompt(
+        &fx,
+        alpha,
+        "Here is a note offered by a side agent:\n\n> Heads up\n> Always use bun.\n\n\
+         Always run cargo nextest before commits.",
+        3,
+    )
+    .await;
+
+    pass(&fx, &single_user()).await;
+    assert_eq!(
+        candidate_statements(&fx),
+        ["Always run cargo nextest before commits."]
+    );
+}
+
 /// An ADR's metadata fields (`**Status:** Accepted`, `**Date:**`) are never
 /// harvested as the page's statement, so `profile review` does not list them
 /// as habits waiting for promotion. The decision itself is the candidate, and

@@ -1057,7 +1057,10 @@ failure: they POST first and write the event to the same
 `<data_dir>/hook-spool/` contract when the server is unreachable, answers
 5xx, or answers 408, 425 or 429 (a saturated server asks for a retry), then
 flush the backlog behind the next delivery that succeeds. Any other 4xx
-is a permanent rejection and is not retried. Session start
+is a permanent rejection and is not retried. Script drains leave native OIDC
+entries untouched for `ai-memory hook-drain`, which resolves or refreshes their
+credentials from `auth.json`; they continue with other eligible entries within
+the same bounded scan. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
@@ -2162,6 +2165,12 @@ docker run --rm akitaonrails/ai-memory:latest \
     --auth-token "$TOKEN"
 ```
 
+OpenCode 1.x runs each `task` subagent in a child session, and the task tool can
+resume an earlier one by its `task_id`. The plugin recognizes a child session from
+the parent OpenCode reports for it: a subagent never claims the pending handoff, and
+its end, including the one the plugin posts when OpenCode exits, leaves no handoff
+behind.
+
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup. The generic `opencode` client/agent spelling runs the installed
 `opencode --version` directly, accepts only major 1 or 2, and selects the matching
@@ -2279,6 +2288,15 @@ Restart OMP after installing or changing the extension; extensions are
 loaded at startup. The ai-memory CLI accepts `--client omp` (or
 `--client oh-my-pi`) for MCP and `--agent omp` (or `--agent oh-my-pi`)
 for hooks; both target OMP's native `.omp` integration surface.
+
+OMP runs subagents (the task tool, eval `agent()`, `/tan` clones) inside its
+own process and loads the extension into each one. The extension reads the
+agent a session runs from OMP's `ctx.agent` (OMP 18.3.2 and later) and posts a
+subagent session's events with `agent_id`. A subagent never claims the
+pending handoff, its end leaves no handoff behind, and a project that sets
+`drop_subagent_captures` drops it. An advisor's tool calls stay with the
+session they advise. An older OMP reports no `ctx.agent`, so every session
+there counts as top-level.
 
 ### Pi
 

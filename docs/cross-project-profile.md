@@ -185,7 +185,8 @@ is new since the last one.
   brief each other through the prompt channel, that text is a lead agent's
   task brief or a pasted review, not you. Text you did not write is skipped
   as well: a harness turn stored as a prompt (Claude Code's
-  `<task-notification>` blocks), the instruction files Codex injects as a user
+  `<task-notification>` blocks), Claude Code cross-session/plugin turns and
+  side-agent quote blocks, the instruction files Codex injects as a user
   message, and ai-memory's own routing snippet or recalled-history digest
   pasted into a prompt (only that block; your sentences around it still
   count). A prompt written by a program driving the agent through its SDK is

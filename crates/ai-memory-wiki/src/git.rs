@@ -2526,31 +2526,41 @@ mod tests {
     fn concurrent_appends_do_not_fail_a_commit() {
         let (_tmp, root, adapter) = committed(&[("ws/proj/log.md", "")]);
         let ledger = root.join("ws/proj/log.md");
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        const ROUNDS: usize = 8;
+        const WRITERS: usize = 3;
+        // Two barrier waits per round make every append race a commit attempt,
+        // while bounding the fsync-heavy work independently of mutex fairness.
+        let round = Arc::new(std::sync::Barrier::new(WRITERS + 1));
         let writers: Vec<_> = (0..3)
             .map(|_| {
                 let adapter = adapter.clone();
                 let ledger = ledger.clone();
-                let stop = Arc::clone(&stop);
+                let round = Arc::clone(&round);
                 std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        adapter
-                            .append(&ledger, b"2026-09-08T00:00:00Z stop x\n")
-                            .unwrap();
+                    let mut results = Vec::with_capacity(ROUNDS);
+                    for _ in 0..ROUNDS {
+                        round.wait();
+                        results.push(adapter.append(&ledger, b"2026-09-08T00:00:00Z stop x\n"));
+                        round.wait();
+                    }
+                    for result in results {
+                        result.unwrap();
                     }
                 })
             })
             .collect();
-        for i in 0..30 {
-            std::thread::sleep(Duration::from_millis(2));
+        let mut commits = Vec::with_capacity(ROUNDS);
+        for i in 0..ROUNDS {
+            round.wait();
             adapter.mark_written(&ledger);
-            adapter
-                .commit_all(&format!("session {i}"))
-                .unwrap_or_else(|e| panic!("commit {i} failed: {e}"));
+            commits.push((i, adapter.commit_all(&format!("session {i}"))));
+            round.wait();
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for w in writers {
             w.join().unwrap();
+        }
+        for (i, result) in commits {
+            result.unwrap_or_else(|e| panic!("commit {i} failed: {e}"));
         }
         assert!(adapter.commit_count() >= 2);
     }

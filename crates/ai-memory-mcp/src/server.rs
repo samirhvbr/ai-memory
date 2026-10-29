@@ -2876,7 +2876,7 @@ impl AiMemoryServer {
             ));
         }
         let recall_global = !explicit_scoping
-            && !args.global.unwrap_or(false)
+            && args.global.is_none()
             && !as_of_present
             && self.active_project.default_global_for(&aps_actor);
         if args.global.unwrap_or(false) || recall_global {
@@ -15385,7 +15385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_query_default_global_marker_broadens_unscoped_query() {
+    async fn memory_query_default_global_marker_honours_explicit_arguments() {
         let (_tmp, store, server, ws, _pj) = setup_server().await;
         let infra = store
             .writer
@@ -15428,92 +15428,90 @@ mod tests {
                 .unwrap();
         }
 
-        // The repo opted into `[recall] default_global` — the hook publishes it
-        // on the ActiveProject (single slot here, matching the empty test actor).
-        server
-            .active_project
-            .set_for(&ai_memory_core::ActorKey::default(), ws, infra, true);
-
-        // A query with NO scoping args now behaves as `global=true`.
-        let result = server
-            .memory_query(
-                Parameters(QueryArgs {
-                    kind: None,
-                    tier: None,
-                    path_prefix: None,
-                    tag: None,
-                    query: "recall_token".into(),
-                    limit: Some(10),
-                    project: None,
-                    scopes: Vec::new(),
-                    workspace: None,
-                    global: None,
-                    include_expired: None,
-                    include_superseded: None,
-                    pin_first: None,
-                    explain: None,
-                    as_of: None,
-                    answer: None,
-                    reasoning: None,
-                }),
-                OptionalParts(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let text = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(
-            text.contains("global_hits"),
-            "default_global must route the unscoped query to global: {text}"
-        );
-        assert!(text.contains("cluster.md"), "infra hit expected: {text}");
-        assert!(text.contains("deploy.md"), "runbooks hit expected: {text}");
-
-        // Precedence: an EXPLICIT workspace+project still wins over
-        // default_global — the query scopes to runbooks only (no infra hit).
-        let scoped = server
-            .memory_query(
-                Parameters(QueryArgs {
-                    kind: None,
-                    tier: None,
-                    path_prefix: None,
-                    tag: None,
-                    query: "recall_token".into(),
-                    limit: Some(10),
-                    project: Some("runbooks".into()),
-                    scopes: Vec::new(),
-                    workspace: Some("ops".into()),
-                    global: None,
-                    include_expired: None,
-                    include_superseded: None,
-                    pin_first: None,
-                    explain: None,
-                    as_of: None,
-                    answer: None,
-                    reasoning: None,
-                }),
-                OptionalParts(test_parts_default()),
-            )
-            .await
-            .unwrap();
-        let scoped_text = scoped
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap();
-        assert!(
-            scoped_text.contains("deploy.md"),
-            "explicit ops/runbooks hit expected: {scoped_text}"
-        );
-        assert!(
-            !scoped_text.contains("cluster.md"),
-            "explicit scope must NOT broaden to infra: {scoped_text}"
-        );
+        // The marker is only a default: an explicit false keeps the current
+        // project, while named scopes override either marker value.
+        for default_global in [false, true] {
+            server.active_project.set_for(
+                &ai_memory_core::ActorKey::default(),
+                ws,
+                infra,
+                default_global,
+            );
+            for (label, extra, global, expected_path) in [
+                (
+                    "omitted",
+                    serde_json::json!({}),
+                    default_global,
+                    "cluster.md",
+                ),
+                (
+                    "false",
+                    serde_json::json!({"global": false}),
+                    false,
+                    "cluster.md",
+                ),
+                ("true", serde_json::json!({"global": true}), true, ""),
+                (
+                    "named scope",
+                    serde_json::json!({"workspace": "ops", "project": "runbooks"}),
+                    false,
+                    "deploy.md",
+                ),
+                (
+                    "named scope with false",
+                    serde_json::json!({"workspace": "ops", "project": "runbooks", "global": false}),
+                    false,
+                    "deploy.md",
+                ),
+                (
+                    "scope list",
+                    serde_json::json!({"scopes": [{"workspace": "ops", "project": "runbooks"}]}),
+                    false,
+                    "deploy.md",
+                ),
+                (
+                    "scope list with false",
+                    serde_json::json!({"scopes": [{"workspace": "ops", "project": "runbooks"}], "global": false}),
+                    false,
+                    "deploy.md",
+                ),
+            ] {
+                let mut args = serde_json::json!({"query": "recall_token"});
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                let result = server
+                    .memory_query(
+                        Parameters(serde_json::from_value(args).unwrap()),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap();
+                let response: serde_json::Value =
+                    serde_json::from_str(&result.content.first().unwrap().as_text().unwrap().text)
+                        .unwrap();
+                let context = format!("marker={default_global}, {label}: {response}");
+                if global {
+                    let paths: BTreeSet<_> = response["global_hits"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|hit| hit["path"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        paths,
+                        BTreeSet::from(["cluster.md", "deploy.md"]),
+                        "{context}"
+                    );
+                    assert_eq!(response["hits"], serde_json::json!([]), "{context}");
+                } else {
+                    assert!(response.get("global_hits").is_none(), "{context}");
+                    let hits = response["hits"].as_array().unwrap();
+                    assert_eq!(hits.len(), 1, "{context}");
+                    assert_eq!(hits[0]["path"], expected_path, "{context}");
+                }
+            }
+        }
 
         // `as_of` wins over default_global too: the time-travel lookup reads
         // the current project (infra) instead of being broadened to a global
@@ -18806,10 +18804,10 @@ mod tests {
                 .map(|t| t.text.clone())
                 .unwrap()
         };
-        let found_by_query = |user, authorized| {
+        let query = |user, authorized, global| {
             let server = &server;
             async move {
-                let result = server
+                server
                     .memory_query(
                         Parameters(QueryArgs {
                             kind: None,
@@ -18825,7 +18823,7 @@ mod tests {
                             project: None,
                             workspace: None,
                             scopes: Vec::new(),
-                            global: Some(true),
+                            global: Some(global),
                             include_expired: None,
                             explain: None,
                             as_of: None,
@@ -18833,8 +18831,7 @@ mod tests {
                         OptionalParts(as_user(user, authorized)),
                     )
                     .await
-                    .unwrap();
-                text(result).contains("secrets/rates.md")
+                    .map(text)
             }
         };
         let found_by_recent = |user, authorized| {
@@ -18857,15 +18854,48 @@ mod tests {
 
         // Authorization on: bob holds nothing on alice's repository, so a
         // global search and the global recent listing do not surface it...
-        assert!(!found_by_query(bob, true).await, "bob found it by search");
+        assert!(
+            !query(bob, true, true)
+                .await
+                .unwrap()
+                .contains("secrets/rates.md")
+        );
         assert!(!found_by_recent(bob, true).await, "bob found it in recent");
         // ...while alice, who holds a grant, still finds her own page.
-        assert!(found_by_query(alice, true).await);
+        assert!(
+            query(alice, true, true)
+                .await
+                .unwrap()
+                .contains("secrets/rates.md")
+        );
         assert!(found_by_recent(alice, true).await);
 
         // No viewer is stamped and nothing changes.
-        assert!(found_by_query(bob, false).await);
+        assert!(
+            query(bob, false, true)
+                .await
+                .unwrap()
+                .contains("secrets/rates.md")
+        );
         assert!(found_by_recent(bob, false).await);
+
+        // Turning off the marker's global default must use the scoped read
+        // gate, even if the active pointer names a project the caller cannot
+        // read. It must not silently fall back to a filtered global search.
+        let refused = query(bob, true, false).await.unwrap_err();
+        assert!(!refused.to_string().contains("secrets/rates.md"));
+        assert!(
+            query(alice, true, false)
+                .await
+                .unwrap()
+                .contains("secrets/rates.md")
+        );
+        assert!(
+            query(bob, false, false)
+                .await
+                .unwrap()
+                .contains("secrets/rates.md")
+        );
     }
 
     /// R1 observation stream, per-project authorization (row 14) and pages
