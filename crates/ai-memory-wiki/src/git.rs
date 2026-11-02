@@ -331,6 +331,13 @@ fn validate_cli_fallback_root(root: &Path) -> WikiResult<()> {
     validate_resolved_repository_paths(root, &git_dir, &worktree, &resolved_git_dir, &common_dir)
 }
 
+/// Establish the configured repository root as a validated filesystem
+/// boundary before it is retained by [`GitAdapter`].
+fn repository_root(root: &Path) -> WikiResult<PathBuf> {
+    crate::confinement::initialize_root(root)?;
+    Ok(root.to_path_buf())
+}
+
 fn git_resolved_path(root: &Path, argument: &str) -> WikiResult<PathBuf> {
     let output = git_command(root)
         .args(["rev-parse", "--path-format=absolute", argument])
@@ -409,21 +416,21 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
-        crate::confinement::initialize_root(root)?;
+        let root = repository_root(root)?;
         match std::fs::symlink_metadata(root.join(".git")) {
             Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 debug!(root = %root.display(), "initialising wiki repo");
-                init_repo(root)?;
+                init_repo(&root)?;
             }
             Err(error) => return Err(error.into()),
         }
-        write_libgit2_config(&crate::confinement::inspect_git_directory(root)?)?;
-        if let Some(repo) = validate_repository_or_allow_cli_fallback(root)? {
-            check_repository_durability(root, &repo);
+        write_libgit2_config(&crate::confinement::inspect_git_directory(&root)?)?;
+        if let Some(repo) = validate_repository_or_allow_cli_fallback(&root)? {
+            check_repository_durability(&root, &repo);
         }
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             commit_lock: Arc::new(Mutex::new(None)),
             written: Arc::new(Mutex::new(Written::default())),
         })
@@ -655,6 +662,7 @@ impl GitAdapter {
         message: &str,
         staging: &Staging,
     ) -> Result<Option<git2::Oid>, CommitGit2Error> {
+        let root = repository_root(&self.root).map_err(CommitGit2Error::Wiki)?;
         let repo = &open.repo;
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
         // Stage through libgit2's stat cache: an entry whose size and mtime
@@ -668,16 +676,16 @@ impl GitAdapter {
         let touched = match staging {
             Staging::Everything => {
                 let walked =
-                    stage_working_tree(&self.root, &mut index).map_err(CommitGit2Error::Other)?;
+                    stage_working_tree(&root, &mut index).map_err(CommitGit2Error::Other)?;
                 // The walk only skips ledgers it would add or update; one a
                 // past version already tracks, and that has not changed, is
                 // not offered to it at all.
-                untrack_ledgers(&self.root, &mut index, None).map_err(CommitGit2Error::Other)?;
+                untrack_ledgers(&root, &mut index, None).map_err(CommitGit2Error::Other)?;
                 self.record_walk(&walked);
                 walked.len()
             }
             Staging::Paths(paths) => {
-                stage_paths(&self.root, &mut index, paths).map_err(CommitGit2Error::Other)?
+                stage_paths(&root, &mut index, paths).map_err(CommitGit2Error::Other)?
             }
         };
         debug!(
@@ -693,7 +701,7 @@ impl GitAdapter {
                     "index could not be written as a tree; re-hashing the working tree (#594)"
                 );
                 index.clear().map_err(CommitGit2Error::Other)?;
-                stage_working_tree(&self.root, &mut index).map_err(CommitGit2Error::Other)?;
+                stage_working_tree(&root, &mut index).map_err(CommitGit2Error::Other)?;
                 index.write().map_err(CommitGit2Error::Other)?;
                 index.write_tree().map_err(CommitGit2Error::Other)?
             }
@@ -1147,7 +1155,14 @@ fn stage_paths(
             warn!(path = %rel.display(), "skipping invalid git path with git-reserved component");
             continue;
         }
-        let abs = root.join(rel);
+        let abs =
+            match crate::confinement::tree_path(root, rel, crate::confinement::Prepare::Inspect) {
+                Ok(path) => path,
+                Err(error) => {
+                    warn!(path = %rel.display(), %error, "skipping invalid reported git path");
+                    continue;
+                }
+            };
         if abs.is_dir() {
             let spec = slash_path(rel);
             index.add_all(
@@ -2207,6 +2222,19 @@ mod tests {
             head_blob(&adapter, "ws/proj/sessions/b.md").as_deref(),
             Some("b")
         );
+    }
+
+    #[test]
+    fn path_scoped_staging_refuses_traversal_reports() {
+        let (tmp, _root, adapter) = committed(&[("page.md", "page")]);
+        std::fs::write(tmp.path().join("outside.md"), "outside").unwrap();
+        std::fs::write(tmp.path().join("log-2026-09.md"), LEDGER_BODY).unwrap();
+
+        adapter.mark_written(Path::new("../outside.md"));
+        adapter.mark_written(Path::new("../log-2026-09.md"));
+
+        assert!(adapter.commit_all("invalid reports").unwrap().is_none());
+        assert_eq!(head_blob(&adapter, "page.md").as_deref(), Some("page"));
     }
 
     #[test]

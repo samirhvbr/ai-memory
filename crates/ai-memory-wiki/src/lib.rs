@@ -23,7 +23,7 @@ pub use admission::{
     AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, MAX_ADMISSION_WEBHOOKS,
     MAX_RESPONSE_BYTES, WebhookConfig,
 };
-pub use atomic::write_atomic;
+pub use atomic::{rename_with_retry, write_atomic};
 pub use confinement::validate_wiki_tree;
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
@@ -36,7 +36,7 @@ pub use migrations::run_pending as run_wiki_migrations;
 pub use okf_index::okf_directory_listing;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{
-    ConditionalBatchWrite, ConditionalWrite, EventLedgerFile, MoveSessionOutcome,
+    ConditionalBatchWrite, ConditionalWrite, EventLedgerFile, MergeProjectFile, MoveSessionOutcome,
     PAGE_CHECKPOINT_WALK_LIMIT, PurgeSessionOutcome, SessionPageFile, Wiki, WritePageRequest,
 };
 

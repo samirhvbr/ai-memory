@@ -187,6 +187,85 @@ pub(crate) fn mcp_tool_name(name: &str) -> Option<McpToolName> {
     })
 }
 
+/// Longest harness tool name kept by `[ingest] record_tool_names`, the same
+/// bound as an MCP tool name: every documented harness tool name fits.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+
+/// Longest skill or subagent identifier kept by `[ingest] record_tool_names`.
+/// Plugin skills carry a `plugin:skill` prefix, so this is wider than a name.
+const MAX_TOOL_DESCRIPTOR_CHARS: usize = 128;
+
+/// A closed-tool call's own name, plus the one identifier that says which
+/// skill or subagent it ran. Kept only when the operator opts in with
+/// `[ingest] record_tool_names`; [`crate::HookEnvelope::record_tool_name`]
+/// writes it into the observation.
+///
+/// Never an argument. A shell command, a prompt, a path or a URL stays out:
+/// the name and the two descriptors are kept only when they are short
+/// identifiers, so free text a harness put in those fields is refused whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedToolName {
+    pub(crate) name: String,
+    /// `tool_input.skill` of Claude Code's `Skill` tool.
+    pub(crate) skill: Option<String>,
+    /// `tool_input.subagent_type` of Claude Code's `Agent` (formerly `Task`)
+    /// tool.
+    pub(crate) subagent_type: Option<String>,
+}
+
+/// The tool name a closed-tool event carries, read from the same adapter
+/// fields [`tool_observation_metadata`] uses, and refused unless it is at most
+/// 64 ASCII letters, digits, `_` or `-`.
+///
+/// The skill and subagent identifiers are Claude Code's own `tool_input`
+/// fields (<https://code.claude.com/docs/en/hooks>, "PreToolUse input": the
+/// `Agent` tool's `subagent_type`; the `Skill` tool's `skill`), so they are
+/// read for Claude Code only. Each is kept when it is at most 128 ASCII
+/// letters, digits, `_`, `-`, `.` or `:`.
+pub(crate) fn recorded_tool_name(agent: AgentKind, raw: &Value) -> Option<RecordedToolName> {
+    let (name, _) = tool_payload_fields(agent, raw)?;
+    if !valid_tool_name(name) {
+        return None;
+    }
+    let input = if agent == AgentKind::ClaudeCode {
+        raw.get("tool_input")
+    } else {
+        None
+    };
+    let descriptor = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_descriptor(value))
+            .map(str::to_owned)
+    };
+    Some(RecordedToolName {
+        name: name.to_owned(),
+        skill: (name == "Skill").then(|| descriptor("skill")).flatten(),
+        subagent_type: matches!(name, "Agent" | "Task")
+            .then(|| descriptor("subagent_type"))
+            .flatten(),
+    })
+}
+
+/// A harness tool name as `[ingest] record_tool_names` keeps it: an
+/// identifier, never free text.
+pub(crate) fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_CHARS
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_tool_descriptor(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TOOL_DESCRIPTOR_CHARS
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
 /// Safe outcome class for a completed tool call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolOutcome {
@@ -247,7 +326,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::CodeBuddy
         | AgentKind::IbmBob
         | AgentKind::Dsh
-        | AgentKind::QwenCode => (
+        | AgentKind::QwenCode
+        | AgentKind::Qoder => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -264,6 +344,10 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // Kiro v2/v3 tool hooks use `tool_name` + `tool_input`. Unknown payload
         // shapes fail safe to metadata-only under an active policy.
         AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
+        // Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+        // `tool_input` but no tool-call id (docs/hooks/reference.md and
+        // `hookEventHandler.ts`, v0.66.0).
+        AgentKind::GeminiCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
         AgentKind::Hermes => (
             object.get("tool_name")?.as_str()?,
@@ -337,7 +421,9 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CodeBuddy
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
+                            | AgentKind::GeminiCli
                             | AgentKind::QwenCode
+                            | AgentKind::Qoder
                     ) {
                         "tool_input"
                     } else {
@@ -386,6 +472,17 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(false) => ToolOutcome::Error,
             None => ToolOutcome::Unknown,
         },
+        // Gemini CLI's AfterTool `tool_response` has an `error` object only
+        // when the call failed: "If this property is present, the tool call
+        // is considered a failure" (`ToolResult`, packages/core/src/tools/
+        // tools.ts, v0.66.0). A payload without `tool_response` proves nothing.
+        AgentKind::GeminiCli => match raw.get("tool_response").and_then(Value::as_object) {
+            Some(response) => match response.get("error") {
+                None | Some(Value::Null) => ToolOutcome::Success,
+                Some(_) => ToolOutcome::Error,
+            },
+            None => ToolOutcome::Unknown,
+        },
         AgentKind::AntigravityCli
             if raw
                 .get("error")
@@ -402,7 +499,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Meta Muse Code's `PostToolUseFailure` has the same `error` string
         // (captured offline on Muse Code 1.4.7); its `PostToolUse` proves no
         // outcome.
-        AgentKind::Zcode | AgentKind::Muse | AgentKind::QwenCode
+        // Claude Code's `PostToolUseFailure` carries the same `error` string
+        // (<https://code.claude.com/docs/en/hooks>); an aborted call
+        // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
+        // only on success and has no `error` key.
+        AgentKind::Zcode
+        | AgentKind::Muse
+        | AgentKind::QwenCode
+        | AgentKind::Qoder
+        | AgentKind::ClaudeCode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -1187,6 +1292,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         | AgentKind::Cursor
         | AgentKind::GeminiCli
         | AgentKind::QwenCode
+        | AgentKind::Qoder
         | AgentKind::Devin
         | AgentKind::Hermes
         | AgentKind::KiroCli
@@ -4709,6 +4815,7 @@ mod tests {
             AgentKind::Muse,
             AgentKind::CodeBuddy,
             AgentKind::QwenCode,
+            AgentKind::Qoder,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -5230,6 +5337,71 @@ mod tests {
         );
     }
 
+    /// Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+    /// `tool_input` but no tool-call id, so the observation metadata reads the
+    /// name alone, and only a BeforeTool with `tool_input` proves its input.
+    #[test]
+    fn gemini_cli_tool_payload_fields_have_no_call_id() {
+        let before = json!({
+            "session_id": "gemini-session",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": "ls", "dir_path": "src"}
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::GeminiCli, &before),
+            Some(("run_shell_command", None))
+        );
+        let metadata = tool_observation_metadata(AgentKind::GeminiCli, &before, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id, None);
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::GeminiCli, &no_input, true).is_none());
+        let after = tool_observation_metadata(AgentKind::GeminiCli, &no_input, false).unwrap();
+        assert_eq!(after.tool_family, ToolFamily::File);
+    }
+
+    /// A Gemini CLI `tool_response` proves its outcome by the presence of
+    /// `error`; a payload without a `tool_response` proves nothing.
+    #[test]
+    fn gemini_cli_tool_response_error_decides_the_outcome() {
+        let failed = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "missing.md"},
+            "tool_response": {
+                "llmContent": "File not found: missing.md",
+                "returnDisplay": "File not found.",
+                "error": {"message": "File not found: missing.md", "type": "FILE_NOT_FOUND"}
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &failed),
+            ToolOutcome::Error
+        );
+        let succeeded = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "README.md"},
+            "tool_response": {"llmContent": "# Title", "returnDisplay": ""}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &succeeded),
+            ToolOutcome::Success
+        );
+        let null_error = json!({"tool_response": {"llmContent": "ok", "error": null}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &null_error),
+            ToolOutcome::Success
+        );
+        // Control: a BeforeTool has no `tool_response`.
+        let before = json!({"tool_name": "read_file", "tool_input": {"file_path": "README.md"}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &before),
+            ToolOutcome::Unknown
+        );
+    }
+
     /// Droid hook payloads carry no tool-call id, so the drop list and the
     /// observation metadata read the tool name alone (#1240).
     #[test]
@@ -5652,6 +5824,56 @@ mod tests {
         let no_input = json!({"tool_name": "read_file"});
         assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, true).is_none());
         assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, false).is_some());
+    }
+
+    /// Claude Code's documented `PostToolUseFailure` payload proves an error;
+    /// its success payload proves nothing.
+    #[test]
+    fn claude_code_post_tool_use_failure_error_maps_to_error_outcome() {
+        let failure = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test", "description": "Run test suite"},
+            "tool_use_id": "toolu_01ABC123",
+            "error": "Exit code 1
+        Error: Cannot find module 'express'",
+            "is_interrupt": false,
+            "duration_ms": 4187
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &failure),
+            ToolOutcome::Error
+        );
+        // An abort is still a call that did not succeed.
+        let interrupted = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sleep 100"},
+            "error": "Command aborted",
+            "is_interrupt": true
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &interrupted),
+            ToolOutcome::Error
+        );
+        // Control: a success and an empty `error` stay unknown.
+        let success = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "tool_response": {"stdout": "ok", "stderr": "", "interrupted": false}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &success),
+            ToolOutcome::Unknown
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::ClaudeCode,
+                &json!({"tool_name": "Bash", "error": ""})
+            ),
+            ToolOutcome::Unknown
+        );
     }
 
     #[test]
