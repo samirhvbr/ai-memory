@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.4`
+**Current version:** `0.3.5`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `72e4f427` (`main`, `v3.3.1` plus 1 commit)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,31 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.5 - mem.shvia.org runs 3.3.1, after a cold backup and 4 minutes down
+
+The server moved from `3.2.8` to `3.3.1` on 02/11/2026, so it is level with the
+code this fork carries since `0.3.4`. The last of three runs of `upgrade-3.3.1.sh`
+completed: a verified cold backup of 850 MB, `3.3.1` ready at 16:38:22 UTC, down
+about 4 min 18 s. V89 to V96 are applied (schema 96), every check matched before
+and after, directly and through Apache, the `ai-memory-web` probe is clean and the
+index is complete. The rehearsal on a copy of production data had started `3.3.1`
+in 2.1 s, which is what the migrations' shape predicted.
+
+Two earlier runs did not complete, and both are recorded in
+[`docs/mem-shvia-org.md`](docs/mem-shvia-org.md). The first aborted in the backup
+because the script treated a `tar` warning about transient SQLite files as a
+failure: a defect in the script, fixed (the backup now excludes `-wal` and `-shm`
+and guards the database file's size and time instead), with no change to the
+server. The second was interrupted by the virtual machine stopping abruptly after
+the backup had finished, an event of unestablished cause that is outside what this
+repository can see; the memory server was out of service for about 12 minutes and
+lost no data. The same document now also records the machine's measured
+configuration: an 8 vCPU, 7.7 GiB Hyper-V guest that shares the host with the
+websites, where ai-memory itself uses 250 MiB and 0.4% CPU.
+
+The clients on each machine are still `2.x`, which works against this server
+until `ai-memory upgrade` runs there.
 
 ## 0.3.4 - the fork moves onto upstream main past v3.3.1
 

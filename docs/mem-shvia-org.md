@@ -2,9 +2,9 @@
 
 > **Status:** `ACTIVE` · Production runs the **upstream's published Docker image**,
 > not a build of this fork (the fork carries no code of its own). Since
-> 27/10/2026 22:06 UTC that image is **`3.2.8`** (schema 88). Before that it was
-> `2.6.6`, from 13/10. The fork's code has since moved on to upstream `3.2.10`
-> and 38 commits (version `0.3.3`); the server has not.
+> 02/11/2026 16:38 UTC that image is **`3.3.1`** (schema 96). Before that it was
+> `3.2.8` (27/10) and `2.6.6` (13/10). The fork's code is upstream `main` at
+> `v3.3.1` plus one commit (version `0.3.5`), so server and fork are level.
 
 | | |
 |---|---|
@@ -12,13 +12,108 @@
 | Access | `ssh samir@100.64.100.125`, then `sudo` |
 | Public address | `https://mem.shvia.org`, an Apache vhost on the same machine proxying to `http://127.0.0.1:49374/` |
 | Deploy | `docker compose` in `/srv/ai-memory`. `docker-compose.yml` holds the bearer token (mode 600); `./data` is bind-mounted at `/data` |
-| Image | `akitaonrails/ai-memory:3.2.8`, **pinned on purpose**: an upgrade migrates the database one way |
-| Data | `data/db/memory.sqlite` is about 45 GB: 1,444 latest pages (60,298 versions) and 655,901 observations. The wiki is about 0.6 GB. `/srv` has about 30 GB free, and the volume group has no free extents |
+| Image | `akitaonrails/ai-memory:3.3.1`, **pinned on purpose**: an upgrade migrates the database one way |
+| Data | `data/db/memory.sqlite` is about 45.7 GB (42.6 GiB): 909 latest pages (61,080 versions) and 839,441 observations on 02/11/2026. The file grew by about 100 MB between 27/10 and 02/11. The wiki is about 0.6 GB. `/srv` has about 25 GB free, and the volume group has no free extents |
 
 **Not** `shvia-site` (`100.64.100.242`, the app server), and **not** `170.233.231.20`
 (the public IP, which appears in `AI_MEMORY_ALLOWED_HOSTS` and was once read as the
 address). `deploy/ai-memory-servidor.md` in shvia-web still names `shvia-site` and
 `2.0.0`.
+
+## The machine, measured on 02/11/2026
+
+`blue3site` is a **Hyper-V guest** (the ACPI tables read `VRTUAL MICROSFT`), and it
+is not dedicated to this server.
+
+| | |
+|---|---|
+| CPU | 8 vCPU: Intel Xeon Silver 4214R @ 2.40 GHz, 1 socket, 4 cores × 2 threads as the guest sees it |
+| Memory | 7.7 GiB (7,850 MB) and 1.9 GiB of swap, none in use. About 6.8 GB of it is page cache, mostly the database |
+| Disk | One 126 GB virtual disk, LVM: `/srv` 94.5 GB (69 GB used), `/` 7.6 GB (79% used), `/var` 7.6 GB, `/var/log` 11.4 GB, `/tmp` 1.9 GB, `/boot` 976 MB |
+| Also on it | Apache, PHP-FPM 8.4, MariaDB, `notes-server`, `fail2ban`. The `ai-memory` container is the only Docker container |
+| ai-memory footprint | 250 MiB of memory and 0.4% CPU a minute after the 3.3.1 start. CPU and memory pressure (PSI) read 0; IO pressure read 4 to 6% only while the cold backup ran |
+
+What limits this server is **IO and the one-way, offline upgrade**, not CPU or
+memory: a 45 GB SQLite file on a single virtual disk, with the only backups on
+the same volume (`/srv`). An upgrade needs the container stopped for the backup,
+so the downtime is the backup time (about 2 min 40 s of `tar` plus 50 s of
+verification on 02/11).
+
+On 02/11/2026 the guest restarted twice within two minutes, the first time
+abruptly (below). The cause is not established. The guest journal shows no panic,
+no out-of-memory kill and no disk error (the `fd0` I/O error is the virtual
+floppy), so the place to look is the Hyper-V host, which this repository cannot see.
+
+## Upgrading: 3.2.8 to 3.3.1 on 02/11/2026
+
+The range was `v3.2.8` to `v3.3.1`: eight new migrations, V89 to V96. V89 rebuilds
+`sessions` (about 3,000 rows) and V95 rebuilds `agent_messages` (empty); the other
+six add columns, indexes or small side tables. None touches `observations` or
+`pages`, which is why this was seconds and not the sixteen minutes of V77 to V88.
+
+**Rehearsal**, on a workstation, on a copy of the 27/10 cold backup (the 2.6.6
+state), first brought to `3.2.8` and then to `3.3.1`:
+
+| | Result |
+|---|---|
+| Start to "ready" on `3.3.1` | **2.1 s** (V89 to V96 applied together). On `3.2.8` the same copy had taken 4 min 34 s |
+| Counts before and after | identical: 895 latest pages (60,659 versions), 794,307 observations, 3,063 sessions; workspaces `default` 122 / 852, `samirhv-shvia` 23 / 41, `shvia` 1 / 2 |
+| HTTP | `workspaces` and `search` 200, 401 without the token, MCP `initialize` 200 |
+| Index | FTS complete (60,752 / 60,752 pages; 794,311 / 794,311 observations), 0 latest pages missing an embedding |
+| Wiki on disk | 0 of 46,929 files modified by the start |
+| `ai-memory-web` probe | `array ()` with the **deployed** `0.1.6` code, plus a positive control (a missing database path made it report failures) |
+| Client `2.5.2` | its shell hooks (`session-start`, `user-prompt-submit`, `post-tool-use`, `session-end`) stored one `claude-code` session with 4 observations and left the spool empty |
+
+The native `ai-memory hook` subcommand of `2.5.2` failed with "error sending
+request" before opening a socket, against a `3.2.8` server just the same, so it is
+not a `3.3.x` regression. It is not what the machines run (their hooks are the
+shell scripts), and it stayed untested.
+
+**Production**, in three runs of `upgrade-3.3.1.sh` (all UTC):
+
+| Run | What happened |
+|---|---|
+| 15:36:22 | Aborted at 15:41:35 in the backup step. `tar` reported that `memory.sqlite-wal` and `-shm` had been removed while it read, and that `data/db` changed; the script treated any `tar` warning as a failure, removed the partial archive and started `3.2.8` again. Nothing else had changed. Down 5 min 7 s |
+| 15:43:41 | The backup finished (15:48:50). The VM stopped abruptly at about 15:49:47: the journal ends with no shutdown messages, and the cause is not established. It booted at 15:50:49, shut down in an orderly way at 15:51:13 and booted again at 15:54:50. The container had been stopped by the script, so it was started by hand between the two boots; the memory server was out of service for about 12 minutes. The data was intact (the same counts as before, FTS complete) and the archive that finished before the reset verified (`zstd -t`, `memory.sqlite` at its full 45,733,642,240 bytes) |
+| 16:34:02 | **Completed**, started by the owner from the root console with the same `systemd-run` command. Stop 16:34:04; `tar` 16:34:06 to 16:36:47; verified and `backup ok: 850M` at 16:37:38; `3.3.1` started 16:37:38 and answered at 16:38:22; healthy 16:39:14; `DONE` 16:39:31 |
+
+Downtime of the last run: **about 4 min 18 s** (16:34:04 to 16:38:22). The
+checks matched before and after, directly and through Apache: `workspaces` 200,
+`search` 200, 401 without the token, MCP `initialize` 200; workspaces
+`default` 138 / 866, `samirhv-shvia` 24 / 41, `shvia` 1 / 2. Counts: 909 latest
+pages, 3,089 sessions and schema 88 before; 909, 3,089 and schema **96** after,
+with observations 839,396 and 839,418 (events that arrived in between). The
+`ai-memory-web` probe printed `array ()`. After the start, `status` showed FTS
+complete, 0 errors in the container log and 45 events accepted and stored with
+none failed; this session's own MCP tools (`memory_status`, `memory_query`)
+answered through `mem.shvia.org`.
+
+What the two interrupted runs changed in the script, now in
+`/srv/ai-memory/upgrade-3.3.1.sh`:
+
+- The "before" numbers come from `ai-memory status` on the **running** server.
+  Nothing opens the database file while it is stopped: any `sqlite3` or PHP reader
+  that does so creates and removes `-wal` and `-shm` files, which is what `tar`
+  tripped on. (A read-only query run by hand during the final backup did create
+  empty ones, with the database's owner and group, so the container could use them.)
+- The backup excludes `memory.sqlite-wal` and `memory.sqlite-shm`, after checking
+  that no non-empty WAL exists. It accepts `tar` exit status 1 only if the size
+  and modification time of `memory.sqlite` did not change during the copy, and it
+  checks that the archive lists `memory.sqlite` at its full size.
+- It is launched with `systemd-run` and a log file, never as a background job of
+  an SSH session: the first launch left the SSH session hanging, and a unit
+  survives the session dropping.
+
+Rollback, not needed: stop; delete `data/db`;
+`zstd -dc --long=27 backup-3.2.8-20261102-133402.tar.zst | tar -C /srv/ai-memory -xf - data`;
+restore the `docker-compose.yml.bak-…-pre-3.3.1` the script wrote; start with the
+`3.2.8` image. A `3.2.x` binary refuses a store migrated to `3.3.x`. The archive of
+the interrupted second run (`backup-3.2.8-20261102-124341.tar.zst`, 849 MB,
+verified) is also on the machine, 50 minutes older.
+
+**Still to do: the clients.** The machines keep their `2.x` clients, which work
+with this server (shown above), until `ai-memory upgrade` runs on each. `ai-memory
+status` from `3.x` warns when client and server differ in major version.
 
 ## Upgrading: what worked on 27/10/2026, from 2.6.6 to 3.2.8
 
