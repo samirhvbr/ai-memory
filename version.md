@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.3`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `6ac0ebce` (`main`, `v3.2.10` plus 38 commits)
+**Current version:** `0.3.4`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `72e4f427` (`main`, `v3.3.1` plus 1 commit)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,31 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.4 - the fork moves onto upstream main past v3.3.1
+
+The fork was on upstream `main` at `6ac0ebce` (`v3.2.10` plus 38 commits) since
+29/10/2026. By 02/11 upstream had published `v3.3.0` (29/10) and `v3.3.1` (31/10)
+and `main` had moved 300 commits. This sync merges upstream `main` at `72e4f427`
+(`v3.3.1` plus one commit, a consolidation of GitHub Actions bumps). It came in
+as a merge, with no upstream commit rewritten and no force-push, and it merged
+clean. After it the tree differs from `upstream/main` in our three files
+(`version.md`, `docs/ci.md`, `docs/mem-shvia-org.md`) and nothing else: not a
+line of our own code changed, and none exists.
+
+What the range brings that matters to the server: eight migrations, V89 to V96.
+Two rebuild a table (V89 `sessions`, V95 `agent_messages`); neither touches
+`observations` or `pages`, and the other six add columns, indexes or small side
+tables (`session_usage`, `token_calls`, `token_call_tools`). That is a different
+shape from the V77 to V88 run that took sixteen minutes on 27/10, but the
+timing on the real 45 GB database is not measured here: see
+[`docs/mem-shvia-org.md`](docs/mem-shvia-org.md) for the state of the server.
+
+`mem.shvia.org` is still on the `3.2.8` image when this is written: the server
+follows the published image, not this branch, and moves only by the procedure in
+that document. The upstream tags (`v3.3.0`, `v3.3.1`) were fetched here and not
+pushed to this fork, for the reason in `0.3.3`: a `v*.*.*` tag starts
+`release.yml`, and the Releases box of this repository still reads `v2.0.1`.
 
 ## 0.3.3 - the fork moves onto upstream main past v3.2.10, and why Releases still read v2.0.1
 
