@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.5`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `72e4f427` (`main`, `v3.3.1` plus 1 commit)
+**Current version:** `0.3.6`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `5d9660df` (`main`, `v3.4.2` plus 1 commit)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,38 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.6 - the fork moves onto upstream main past v3.4.2
+
+The fork was on upstream `main` at `72e4f427` (`v3.3.1` plus one commit) since
+02/11/2026. By 05/11 upstream had published five releases (`v3.3.2` and `v3.3.3`
+on 03/11, `v3.4.0` on 04/11, `v3.4.1` and `v3.4.2` on 05/11) and `main` had moved
+285 commits. This sync merges upstream `main` at `5d9660df` (`v3.4.2` plus one
+docs commit). It came in as a merge again, with no upstream commit rewritten and
+no force-push, and it merged clean. After it the tree differs from
+`upstream/main` in our three files (`version.md`, `docs/ci.md`,
+`docs/mem-shvia-org.md`) and nothing else: not a line of our own code changed,
+and none exists.
+
+What the range brings that matters to the server: three migrations, V97 to V99.
+V98 adds a small table and V99 a nullable column with a partial index, but **V97
+drops and rebuilds both full-text indexes** (`pages_fts` and `observations_fts`),
+so unlike V89 to V96 it is not seconds. The rehearsal on a copy of production
+data is recorded in [`docs/mem-shvia-org.md`](docs/mem-shvia-org.md): 7 min 38 s
+on a workstation, a 5.4 GB write-ahead log at its peak, no net growth of the
+database file. On the server's measured speed that is about half an hour of
+downtime on top of the cold backup. `3.3.3` also carries a security fix that
+matters to this server: a password or key printed by a tool is now redacted when
+Claude Code's `PostToolUse` result arrives as an object, which is the shape it
+always takes.
+
+`mem.shvia.org` is still on the `3.3.1` image when this is written: the server
+follows the published image, not this branch, and moves only by the procedure in
+that document. The upstream tags (`v3.3.2` to `v3.4.2`) were fetched here and not
+pushed to this fork. The reason in `0.3.3` is gone, since the Actions lock lifted
+on 03/11 and the scheduled `windows` run is green again, but a `v*.*.*` tag still
+starts `release.yml` and publishes a Release with its binaries, so it is left for
+the owner to decide. The Releases box of this repository still reads `v2.0.1`.
 
 ## 0.3.5 - mem.shvia.org runs 3.3.1, after a cold backup and 4 minutes down
 

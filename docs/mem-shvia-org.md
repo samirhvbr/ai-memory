@@ -4,7 +4,8 @@
 > not a build of this fork (the fork carries no code of its own). Since
 > 02/11/2026 16:38 UTC that image is **`3.3.1`** (schema 96). Before that it was
 > `3.2.8` (27/10) and `2.6.6` (13/10). The fork's code is upstream `main` at
-> `v3.3.1` plus one commit (version `0.3.5`), so server and fork are level.
+> `v3.4.2` plus one commit (version `0.3.6`), so the server is one step behind:
+> the `3.4.2` rehearsal is recorded below and the upgrade itself is not done yet.
 
 | | |
 |---|---|
@@ -43,6 +44,57 @@ On 02/11/2026 the guest restarted twice within two minutes, the first time
 abruptly (below). The cause is not established. The guest journal shows no panic,
 no out-of-memory kill and no disk error (the `fd0` I/O error is the virtual
 floppy), so the place to look is the Hyper-V host, which this repository cannot see.
+
+The guest restarted once more on 04/11/2026 at 16:42 (-03): the journal of the
+previous boot ends at 16:42:17 and the next boot starts at 16:42:29, so it was an
+orderly restart this time. The container came back by itself (`Up 25 hours` the
+next day) and the log holds no `ERROR` line. The cause is not established either.
+
+## Rehearsal for 3.3.1 to 3.4.2, 05/11/2026
+
+The range is `v3.3.1` to `v3.4.2` (five releases): three new migrations, V97 to
+V99. V98 creates `query_page_signals`, a small table, and V99 adds a nullable
+`observations.file_path` with a partial index; neither rewrites a table. **V97
+drops and rebuilds `pages_fts` and `observations_fts`** to stop treating `/` as a
+token character, so `ops.rs` and `ops` now match `crates/store/src/ops.rs`. That
+rebuild reads every page version and every observation, which is why this range
+is minutes and the last one was seconds.
+
+Rehearsal on a workstation, on the cold backup taken just before the `3.3.1`
+upgrade (schema 88, 45.7 GB), first brought to `3.3.1` and then to `3.4.2`. The
+token was a fake one and the copy was deleted afterwards:
+
+| | Result |
+|---|---|
+| `3.3.1` on the copy (V89 to V96) | applied within about a second; the counts were those of production on 02/11: 909 latest pages, 3,089 sessions, 839,396 observations |
+| `3.4.2` start to "ready" (V97 to V99) | **7 min 38 s** (20:40:14 to 20:47:52 UTC). The log has no per-migration times, but V98 and V99 are instant by their text, so this is V97 |
+| Write-ahead log | grew steadily to **5.37 GB** at the end of V97, then the checkpoint cut it back to 64 MB. `memory.sqlite` went from 45,736,001,536 to 45,743,325,184 bytes, **7 MB more**: the pages freed by the dropped indexes are reused. The workstation's free space dipped by up to 15 GB in the last minute and came back; I could not attribute all of it to the WAL, so treat 5.4 GB as the floor and 15 GB as the ceiling. On the server's XFS `/srv` (about 24 GB free once the backup is written) the script's watchdog stops the container below 4 GB |
+| Restart with nothing to migrate | healthy in **7 s**, no `ERROR` in the log |
+| Counts after | 909 latest pages, 3,089 sessions, 839,396 observations, workspaces `default` 138 / 866, `samirhv-shvia` 24 / 41, `shvia` 1 / 2: the same as before |
+| Index | `status`: FTS 61,172 / 61,172 pages and 839,396 / 839,396 observations, 0 latest pages missing an embedding. `PRAGMA quick_check` `ok`, and the FTS5 `integrity-check` `ok` on both indexes |
+| New tokenizer | `observations_fts` matched the phrase `memory sqlite` in 182 observations, `docker-compose yml` in 738 and `src main rs` in 573 |
+| HTTP | `workspaces` and `search` 200, 401 without the token, MCP `initialize` 200 (`serverInfo` `3.4.2`, 27 `memory_*` tools). A bare `server/discover` POST answers `-32601`, as the `3.3.1` production log already shows for the probes clients send |
+| Search API | seven queries (`sqlite`, `memory.sqlite`, `docker-compose.yml`, `upgrade-3.2.8.sh`, `src/main.rs`, `ai-memory`, `memory sqlite`) returned the same number of hits as production's `3.3.1`: 4, 0, 0, 0, 0, 5, 5 |
+| `ai-memory-web` probe | `array ()` with the **deployed** `0.1.6` code against schema 99, plus a positive control (a missing database path made it list the failures). The first run listed failures against the production database path, because the copied tree carried the production `bootstrap/cache/config.php`, which pins it; deleting that cache file in the copy made the probe read the rehearsal database |
+| Client `2.5.2` | its shell hooks stored one session with 5 observations (`session-start`, `user-prompt`, `post-tool-use`, `stop`, `session-end`) in `default/ensaio-hooks-teste`, created the summary page, left the spool empty, and redacted a fake `db_password` inside a Claude Code-shaped tool result (the `3.3.3` fix) |
+
+After the start the server ran its scheduled maintenance, which is not a fault:
+the forget sweep evicted 52 pages, the hollow-project sweep removed 4 empty
+project rows and 432 abandoned sessions were closed, so `default` read 135 / 814
+afterwards. The copy was three days older than the clock, and production's own
+sweep had evicted 25 pages at 15:08 UTC that day. The count of page versions also
+rose by 143 across the two starts (61,029 to 61,172) with the same 909 latest
+pages: the earliest rows touched were per-project `index.md` pages written at
+20:40:00 UTC, so I take them to be regenerated indexes. That was not checked
+further, because the copy is gone.
+
+**What it means for production.** The server runs about 3.5 to 4 times slower
+than this workstation (V77 to V88 took 4 min 34 s here and about 16 min there),
+so V97 should take **27 to 32 minutes**, plus about 4 minutes of cold backup and
+verification: **roughly 31 to 36 minutes down**, against 4 minutes for `3.3.1`.
+`/srv/ai-memory/upgrade-3.4.2.sh` is the `3.3.1` script with the tags changed and
+the expected schema 99 (it was only copied and syntax-checked; the diff against
+the `3.3.1` one is the header comments and that one line).
 
 ## Upgrading: 3.2.8 to 3.3.1 on 02/11/2026
 
