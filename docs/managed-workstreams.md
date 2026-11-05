@@ -154,6 +154,8 @@ tells the agent to read that session with `memory_read_session_observations`,
 newest first. `memory_briefing` (`recent_sessions`) and `memory_handoff_list`
 (`newer_unended_session`) expose the same pointer to clients whose session start
 injects nothing.
+Pass `recent_sessions_limit` to `memory_briefing` to raise its default five
+entries (clamped to 1–50) when checking active harnesses in a busy project.
 
 The dossier is evidence, not instructions: it is fenced as untrusted history,
 contains no hidden reasoning or unsupported/private records, and disappears
@@ -654,8 +656,20 @@ another workstream; adoption stays a bootstrap operation.
    non-final ledger segment, and only then finalizes the run on the newest
    session. Thus pre-clear turns keep their original native-session identity,
    while the next managed launch still resumes the conversation after the last
-   `/clear`. Each delivered
-   workstream packet begins with a versioned origin marker. If Claude Code
+   `/clear`.
+
+   For ID-selected runs, Claude's `SessionStart` with `source: "clear"` also
+   updates the live hook binding, so capture continues before the launcher
+   exits. The transition requires the same operator, harness and checkout,
+   an active lease and current Write access. Ordinary events cannot change
+   the binding; a replayed `clear` for an abandoned native session is
+   refused. The previous transcript remains in the workstream's
+   native-session history, so an in-session `/resume` back to it
+   (`SessionStart` with `source: "resume"`) moves the binding back under the
+   same checks. A `resume` is admitted only for a native session this
+   workstream already held and that no other live run currently holds.
+
+   Each delivered workstream packet begins with a versioned origin marker. If Claude Code
    persists that packet and its `Read` tool returns it, the Claude transcript
    normalizer excludes the marked result instead of feeding delivered history
    into the ledger again. It also recognizes the pre-marker packet header for
@@ -1416,6 +1430,41 @@ a renamed checkout, use an explicit harness and its documented session selector
 to seed the new managed workstream. Keep the old checkout path available until
 recovery is verified. Automatic discovery intentionally requires the recorded
 checkout to match exactly.
+
+### A repository that gained its remote after capture began
+
+A project's name comes from the git remote, or from the folder name when the
+checkout has no remote. Sessions captured before the remote was added stay in
+the folder-named project, while `ai-memory run` resolves the remote-derived
+one, so resuming one of those sessions cannot link it to the run. The server
+refuses the link with the `native_session_in_other_project` conflict, which
+names both projects (only for the operator and harness that recorded the
+session).
+
+When the folder-named project is the remote-derived project's old name and
+the remote-derived project has no sessions or pages yet, the repair loses
+nothing. The server moves the repository identity from the empty project onto
+the folder-named one, gives it the remote-derived name, and keeps the empty
+project as `<name>-split-<date>`. The project id stays, so sessions,
+observations and pages follow, and identity-based capture and later launches
+reach them. This client's checkout links and saved project binding are
+re-pointed too.
+
+On a terminal, `ai-memory run` explains this and offers the repair (default
+yes), then starts the session again. Closing the prompt's input without an
+answer cancels it; pressing Enter accepts the default. Off a terminal it stops
+before the agent starts and prints the command:
+
+```
+ai-memory repair-split --workspace <ws> --project-id <folder project id> \
+  --from-project-id <remote project id>
+```
+
+The same command repairs a pair that was renamed by hand, where renaming
+alone left the identity on the archived project. It refuses when the
+remote-derived project holds its own sessions or pages, or a managed run is
+still active in it, because joining them would hide data. Compare the two
+projects first ([lifecycle operations](lifecycle-ops.md)).
 
 ## Manual acceptance
 

@@ -114,6 +114,7 @@ async fn say(
                 title: "obs".into(),
                 body: body.into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -266,7 +267,7 @@ async fn a_habit_from_two_projects_becomes_a_global_entry_once() {
     let entries = fx
         .store
         .reader
-        .profile_entries(global.workspace_id, global.project_id, 50)
+        .profile_entries(global.workspace_id, global.project_id)
         .await
         .unwrap();
     let digest = render_digest(&entries, &Default::default(), 3_000, false, false).unwrap();
@@ -996,6 +997,58 @@ async fn a_forgotten_entry_is_not_recreated_until_said_again() {
     assert_eq!(profile_pages(&fx, "_global").len(), 1);
 }
 
+/// An entry the harvester wrote stays its own after the scope grows past 200
+/// pages. The scope read stopped at 200 rows in path order, so an entry
+/// sorting after them looked deleted by the user and was reported forgotten
+/// instead of being kept up to date (#1946).
+#[tokio::test]
+async fn an_entry_past_two_hundred_profile_pages_is_not_forgotten() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(&fx, alpha, "Always use pnpm in every project.", 1).await;
+    pass(&fx, &single_user()).await;
+    let entry = profile_pages(&fx, "_global")[0].0.clone();
+    let global = ai_memory_store::lookup_global_scope(&fx.store.reader)
+        .await
+        .unwrap()
+        .unwrap();
+    // Hand-written pages that sort ahead of the harvested entry.
+    for i in 0..200 {
+        fx.store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: global.workspace_id,
+                project_id: global.project_id,
+                path: PagePath::new(format!("profile/aaa/note-{i:03}.md")).unwrap(),
+                title: format!("Note {i}"),
+                body: format!("Hand-written note number {i}."),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(entry.as_str() > "profile/aaa/note-199.md", "{entry}");
+
+    let report = pass(&fx, &single_user()).await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(
+        report.entries_unchanged, 1,
+        "the entry past the old cap must still be seen as current: {report:?}"
+    );
+    assert!(
+        profile_pages(&fx, "_global")
+            .iter()
+            .any(|(path, _, _)| *path == entry)
+    );
+}
+
 /// A private profile only ever holds its own operator's words: Bob's profile
 /// never receives Alice's prompt, and Alice's holds hers (control).
 #[tokio::test]
@@ -1191,6 +1244,7 @@ struct FakeProfileLlm {
     merge_unchanged: bool,
     fail: bool,
     seen: Arc<Mutex<Vec<String>>>,
+    budgets: Arc<Mutex<Vec<(String, u32)>>>,
 }
 
 #[async_trait::async_trait]
@@ -1219,7 +1273,17 @@ impl LlmProvider for FakeProfileLlm {
         if self.fail {
             return Err(LlmError::NotConfigured("provider down".into()));
         }
+        let max_tokens = request.max_tokens;
         let system = request.system.unwrap_or_default();
+        let operation = if system.contains("You classify sentences") {
+            "classify"
+        } else {
+            "merge"
+        };
+        self.budgets
+            .lock()
+            .unwrap()
+            .push((operation.to_owned(), max_tokens));
         if system.contains("You classify sentences") {
             let payload = request.messages[0].content.clone();
             let count = payload.matches("\"index\"").count();
@@ -1263,8 +1327,20 @@ async fn the_llm_classifies_and_merges_when_configured() {
         merge_statement: "Use pnpm for every JavaScript project.".into(),
         ..FakeProfileLlm::default()
     };
-    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    let budgets = llm.budgets.clone();
+    let mut config = single_user();
+    config.settings.max_output_tokens = 4_000;
+    let report = pass_with(&fx, &config, Arc::new(llm)).await;
     assert!(report.llm_calls >= 2, "{report:?}");
+    let budgets = budgets.lock().unwrap();
+    assert!(
+        budgets.contains(&("classify".to_owned(), 4_000)),
+        "{budgets:?}"
+    );
+    assert!(
+        budgets.contains(&("merge".to_owned(), 4_000)),
+        "{budgets:?}"
+    );
     let pages = profile_pages(&fx, "_global");
     assert_eq!(pages.len(), 1, "{pages:?}");
     assert!(pages[0].0.starts_with("profile/tools/"), "{pages:?}");
@@ -1320,7 +1396,7 @@ async fn injected_instructions_stay_data() {
     let entries = fx
         .store
         .reader
-        .profile_entries(global.workspace_id, global.project_id, 50)
+        .profile_entries(global.workspace_id, global.project_id)
         .await
         .unwrap();
     let digest = render_digest(&entries, &Default::default(), 3_000, false, false).unwrap();

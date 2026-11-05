@@ -272,6 +272,37 @@ pub struct ManagedRunHookIdentity {
     pub owner_user: Option<String>,
     /// Startup always checks the checkout, even for an already linked session.
     pub session_start: bool,
+    /// The documented Claude SessionStart boundary this hook reports.
+    pub claude_boundary: ClaudeSessionBoundary,
+}
+
+/// A Claude Code SessionStart `source` that may repoint an ID-selected run
+/// already linked to another native session. Claude documents `clear` and
+/// `resume` separately from `startup` and `compact`:
+/// <https://code.claude.com/docs/en/hooks#sessionstart-input>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeSessionBoundary {
+    /// Any other event or source: the linked session must match exactly.
+    Other,
+    /// `/clear` started a fresh conversation with a never-seen native id.
+    Clear,
+    /// `/resume` returned to a conversation this workstream already held.
+    Resume,
+}
+
+impl ClaudeSessionBoundary {
+    /// The boundary a hook's agent, event and `source` describe.
+    #[must_use]
+    pub fn from_session_start(agent: AgentKind, session_start: bool, source: Option<&str>) -> Self {
+        if agent != AgentKind::ClaudeCode || !session_start {
+            return Self::Other;
+        }
+        match source {
+            Some("clear") => Self::Clear,
+            Some("resume") => Self::Resume,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// Read the opt-in scope without turning an arbitrary run ID into authority.
@@ -298,7 +329,11 @@ pub(crate) fn pinned_hook_scope(
     if run.state != "active"
         || run.agent != input.agent.as_str()
         || run.owner_user != input.owner_user
-        || ((linked || delivered) && run.native_session.as_deref() != Some(native.as_str()))
+        || ((linked || delivered)
+            && run.native_session.as_deref() != Some(native.as_str())
+            && !(input.claude_boundary != ClaudeSessionBoundary::Other
+                && input.session_start
+                && input.agent == AgentKind::ClaudeCode))
         || ((input.session_start || !linked) && input.cwd.as_deref() != Some(run.cwd.as_str()))
     {
         return Err(refused());
@@ -386,6 +421,33 @@ pub struct StoredManagedRunStatus {
     pub context_delivered: bool,
     /// State string.
     pub state: String,
+}
+
+/// The project that already holds the native session a managed run asked to
+/// link, when it is not the run's own project (#1993).
+///
+/// Only reported for a session with the run's harness and owner: the caller
+/// owns that session, so naming its project discloses nothing new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSessionHolder {
+    /// Workspace holding the session.
+    pub workspace: String,
+    /// Project holding the session.
+    pub project: String,
+    /// That project's id.
+    pub project_id: ProjectId,
+    /// Project the managed run was prepared in.
+    pub run_project: String,
+    /// The run project's id.
+    pub run_project_id: ProjectId,
+    /// Workspace of the run project.
+    pub run_workspace: String,
+    /// The run project's legacy folder-name key, if it has one.
+    pub run_legacy_name: Option<String>,
+    /// Sessions already recorded in the run project.
+    pub run_sessions: u64,
+    /// Pages (every version) already written in the run project.
+    pub run_pages: u64,
 }
 
 /// Checkout-local workstream metadata used by read-only discovery surfaces.
@@ -936,7 +998,14 @@ pub(crate) fn link_native_session(
         };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let linked = link_native_session_in_transaction(&tx, run_id, agent, &native_identity, now)?;
+    let linked = link_native_session_in_transaction(
+        &tx,
+        run_id,
+        agent,
+        &native_identity,
+        now,
+        ClaudeSessionBoundary::Other,
+    )?;
     tx.commit()?;
     Ok(linked)
 }
@@ -947,6 +1016,7 @@ fn link_native_session_in_transaction(
     agent: AgentKind,
     native_session_id: &NativeSessionIdentity,
     now: i64,
+    boundary: ClaudeSessionBoundary,
 ) -> StoreResult<bool> {
     let native_session_id = native_session_id.as_str();
     let run: Option<LinkRunRow> = tx
@@ -998,7 +1068,44 @@ fn link_native_session_in_transaction(
             .as_deref()
             .is_some_and(|linked| linked != native_session_id)
     {
-        return Ok(false);
+        if boundary == ClaudeSessionBoundary::Other
+            || !run.scope_by_id
+            || agent != AgentKind::ClaudeCode
+        {
+            return Ok(false);
+        }
+        let admitted = if boundary == ClaudeSessionBoundary::Clear {
+            // A clear starts a fresh conversation. Refuse an old binding
+            // (including another workstream's) so a delayed spool replay of a
+            // clear cannot rewind the run.
+            !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workstream_native_sessions \
+                 WHERE agent_kind = ?1 AND native_session_id = ?2)",
+                params![agent.as_str(), native_session_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            // A resume returns to an earlier conversation, so only one this
+            // workstream already held qualifies, and never one another live
+            // run currently holds: a parallel harness keeps its own session.
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workstream_native_sessions \
+                     WHERE workstream_id = ?1 AND agent_kind = ?2 AND native_session_id = ?3) \
+                 AND NOT EXISTS(SELECT 1 FROM managed_runs \
+                     WHERE id <> ?4 AND agent_kind = ?2 AND native_session_id = ?3 \
+                       AND state = 'active')",
+                params![
+                    run.workstream,
+                    agent.as_str(),
+                    native_session_id,
+                    run_id.as_bytes()
+                ],
+                |row| row.get::<_, bool>(0),
+            )?
+        };
+        if !admitted {
+            return Ok(false);
+        }
     }
     let workstream = run.workstream;
     let sync_through = run.sync_through;
@@ -1051,6 +1158,7 @@ fn link_native_session_in_transaction(
 pub(crate) fn link_or_adopt_native_session(
     conn: &mut Connection,
     input: &LinkOrAdoptManagedRunSession,
+    boundary: ClaudeSessionBoundary,
 ) -> StoreResult<ManagedRunSessionLink> {
     if input.native_session_id.trim().is_empty()
         || input.cwd.trim().is_empty()
@@ -1070,6 +1178,18 @@ pub(crate) fn link_or_adopt_native_session(
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     let supplied = ManagedRunBoundaryRow::read(&tx, input.supplied_run_id)?;
+
+    if boundary != ClaudeSessionBoundary::Other {
+        let live_pin: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_runs WHERE id = ?1 \
+             AND state = 'active' AND scope_by_id = 1 AND lease_expires_at > ?2)",
+            params![input.supplied_run_id.as_bytes(), now],
+            |row| row.get(0),
+        )?;
+        if input.agent != AgentKind::ClaudeCode || !live_pin {
+            return Ok(ManagedRunSessionLink::Refused);
+        }
+    }
 
     let selected = match supplied {
         Some(run) if run.state == "active" => {
@@ -1126,7 +1246,14 @@ pub(crate) fn link_or_adopt_native_session(
         }
     };
 
-    if !link_native_session_in_transaction(&tx, selected.0, input.agent, &native_identity, now)? {
+    if !link_native_session_in_transaction(
+        &tx,
+        selected.0,
+        input.agent,
+        &native_identity,
+        now,
+        boundary,
+    )? {
         tx.commit()?;
         return Ok(ManagedRunSessionLink::Refused);
     }
@@ -1184,8 +1311,14 @@ pub(crate) fn link_native_session_in_scope(
             },
         );
     }
-    let linked =
-        link_native_session_in_transaction(&tx, input.run_id, input.agent, &native_identity, now)?;
+    let linked = link_native_session_in_transaction(
+        &tx,
+        input.run_id,
+        input.agent,
+        &native_identity,
+        now,
+        ClaudeSessionBoundary::Other,
+    )?;
     tx.commit()?;
     Ok(if linked {
         ManagedRunSessionLink::Exact(input.run_id)
@@ -1625,6 +1758,69 @@ fn validate_finished_recovery(
 }
 
 /// Reader-side managed-run status.
+/// The other project holding `native_session_id` for this run's harness and
+/// owner, if any (see [`NativeSessionHolder`]).
+pub(crate) fn native_session_holder(
+    conn: &Connection,
+    run_id: ManagedRunId,
+    native_session_id: &str,
+) -> StoreResult<Option<NativeSessionHolder>> {
+    let session_id = ai_memory_core::SessionId::from_native(native_session_id);
+    conn.query_row(
+        "SELECT ws.name, p.name, p.id, rp.name, rp.id, rws.name, NULLIF(rp.legacy_name, ''), \
+                (SELECT COUNT(*) FROM sessions WHERE project_id = rp.id), \
+                (SELECT COUNT(*) FROM pages WHERE project_id = rp.id) \
+         FROM managed_runs mr \
+         JOIN workstreams w ON w.id = mr.workstream_id \
+         JOIN projects rp ON rp.id = w.project_id \
+         JOIN workspaces rws ON rws.id = w.workspace_id \
+         JOIN sessions s ON s.id = ?2 \
+         JOIN projects p ON p.id = s.project_id \
+         JOIN workspaces ws ON ws.id = s.workspace_id \
+         WHERE mr.id = ?1 AND s.agent_kind = mr.agent_kind \
+           AND s.actor_user IS mr.owner_user \
+           AND (s.workspace_id <> w.workspace_id OR s.project_id <> w.project_id)",
+        params![run_id.as_bytes(), session_id.as_bytes()],
+        |row| {
+            Ok((
+                (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ),
+                (
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ),
+                (row.get::<_, i64>(7)?, row.get::<_, i64>(8)?),
+            ))
+        },
+    )
+    .optional()?
+    .map(
+        |(
+            (workspace, project, project_id),
+            (run_project, run_project_id, run_workspace, run_legacy_name),
+            (run_sessions, run_pages),
+        )| {
+            Ok(NativeSessionHolder {
+                workspace,
+                project,
+                project_id: ProjectId::from_slice(&project_id)?,
+                run_project,
+                run_project_id: ProjectId::from_slice(&run_project_id)?,
+                run_workspace,
+                run_legacy_name,
+                run_sessions: u64::try_from(run_sessions).unwrap_or(0),
+                run_pages: u64::try_from(run_pages).unwrap_or(0),
+            })
+        },
+    )
+    .transpose()
+}
+
 pub(crate) fn run_status(
     conn: &Connection,
     run_id: ManagedRunId,

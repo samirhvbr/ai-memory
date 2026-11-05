@@ -28,6 +28,7 @@ const CLI_CLIENT_KIND: &str = "cli";
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
 pub(crate) struct ServerResponseError {
+    i18n: ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     path: String,
     status: reqwest::StatusCode,
@@ -48,23 +49,29 @@ impl ServerResponseError {
 
 impl fmt::Display for ServerResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} {}: server returned {}: {}",
-            self.method, self.path, self.status, self.body
-        )
+        formatter.write_str(&self.i18n.format(
+            "cli-http-server-response",
+            &[
+                ("method", self.method.to_string()),
+                ("path", self.path.clone()),
+                ("status", self.status.to_string()),
+                ("detail", crate::commands::show::terminal_body(&self.body)),
+            ],
+        ))
     }
 }
 
 impl std::error::Error for ServerResponseError {}
 
 fn server_response_error(
+    i18n: &ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     url: &reqwest::Url,
     status: reqwest::StatusCode,
     body: String,
 ) -> anyhow::Error {
     ServerResponseError {
+        i18n: i18n.clone(),
         method,
         path: url.path().to_owned(),
         status,
@@ -81,6 +88,7 @@ pub(crate) fn server_response_error_for_test(
     body: String,
 ) -> anyhow::Error {
     ServerResponseError {
+        i18n: ai_memory_core::i18n::Localizer::default(),
         method,
         path: path.to_owned(),
         status,
@@ -96,6 +104,7 @@ pub(crate) fn server_response_error_for_test(
 /// credentials in the URL never land in a message. `reqwest` does not carry
 /// the request method on the response, so callers supply it.
 async fn require_success(
+    i18n: &ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     resp: reqwest::Response,
 ) -> Result<reqwest::Response> {
@@ -105,12 +114,14 @@ async fn require_success(
     }
     let url = resp.url().clone();
     let body = resp.text().await.unwrap_or_default();
-    Err(server_response_error(method, &url, status, body))
+    Err(server_response_error(i18n, method, &url, status, body))
 }
 
 /// Resolved server target — origin URL + base-path prefix + optional bearer token.
 #[derive(Debug, Clone)]
 pub struct ServerEndpoint {
+    /// Human error/output language inherited from the command.
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Origin only (scheme + authority), any trailing slash and path
     /// stripped, e.g. `http://127.0.0.1:49374` or `http://192.168.0.90:49374`.
     pub url: String,
@@ -141,19 +152,21 @@ impl ServerEndpoint {
     ///    container as `serve`, which already reads the same env var via
     ///    clap to nest its router).
     pub async fn from_config_resolving_auth(config: &Config) -> Self {
-        let client = reqwest::Client::new();
+        let client = http_client();
         let token = crate::auth_bearer::resolve_bearer(
             &client,
             &config.oidc_device_token_path(),
             config.auth.bearer_token.as_deref(),
         )
         .await;
-        Self::build(
+        let mut endpoint = Self::build(
             Some(config.server_url.clone()),
             token,
             config.server_url_configured(),
             Some(config.base_path.clone()).filter(|s| !s.is_empty()),
-        )
+        );
+        endpoint.i18n = config.i18n.clone();
+        endpoint
     }
 
     /// Build for a target the spawning hook already resolved: its URL
@@ -209,6 +222,7 @@ impl ServerEndpoint {
             normalize_prefix(&url_path)
         };
         Self {
+            i18n: ai_memory_core::i18n::Localizer::default(),
             url: origin,
             base_path,
             auth_token: token.filter(|s| !s.is_empty()),
@@ -271,6 +285,18 @@ pub(crate) fn split_origin_and_path(raw: &str) -> (String, String) {
     (trimmed.to_string(), String::new())
 }
 
+/// `url` as a log line or error message may print it: without the
+/// `user:pass@` userinfo a URL can carry, and never the raw text of one that
+/// does not parse (it could hold that userinfo in a form the parser rejects).
+pub(crate) fn display_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "an unparsable URL".to_owned();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.to_string()
+}
+
 /// Whether `url` names a server on this machine: an `http`/`https` URL whose
 /// host is `localhost`, an address in `127.0.0.0/8`, or `[::1]`, carrying no
 /// user information.
@@ -304,6 +330,17 @@ pub(crate) fn is_loopback_url(url: &str) -> bool {
         .map_or(host == "localhost", |ip| ip.is_loopback())
 }
 
+/// Shared reqwest client for thin-client CLI subcommands. Redirects are
+/// disabled so a 3xx from an SSO portal or proxy cannot be followed: JSON
+/// GET/POST would otherwise consume a login page, a 307/308 would replay the
+/// body, and [`post_to_file`] would write that page as a backup tarball.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// GET `<endpoint>{path}` with optional query params, deserialise JSON.
 ///
 /// # Errors
@@ -314,7 +351,7 @@ pub async fn get_json<T: DeserializeOwned>(
     path: &str,
     query: &[(&str, &str)],
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let mut req = client.get(&url);
     if !query.is_empty() {
@@ -325,10 +362,10 @@ pub async fn get_json<T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::GET, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::GET, resp).await?;
     resp.json::<T>()
         .await
-        .with_context(|| format!("parsing JSON body from GET {url}"))
+        .with_context(|| format!("parsing JSON body from GET {}", display_url(&url)))
 }
 
 /// PATCH JSON body to `<endpoint>{path}`, deserialise JSON response.
@@ -340,17 +377,17 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
     path: &str,
     body: &B,
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.patch(&url).json(body));
     let resp = req
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::PATCH, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::PATCH, resp).await?;
     resp.json::<T>()
         .await
-        .with_context(|| format!("parsing JSON body from PATCH {url}"))
+        .with_context(|| format!("parsing JSON body from PATCH {}", display_url(&url)))
 }
 
 /// POST JSON body to `<endpoint>{path}`, deserialise JSON response.
@@ -371,27 +408,27 @@ pub async fn post_json_no_content<B: Serialize>(
     path: &str,
     body: &B,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url).json(body));
     let resp = req
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    require_success(reqwest::Method::POST, resp).await?;
+    require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
 /// POST an empty body and require a successful response.
 pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
     let resp = req
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    require_success(reqwest::Method::POST, resp).await?;
+    require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
@@ -405,7 +442,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
     query: &[(&str, &str)],
     body: &B,
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = build_url_with_query(endpoint, path, query)?;
     let req = client.post(&url);
     let req = endpoint.authenticate(req.json(body));
@@ -413,10 +450,10 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::POST, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     resp.json::<T>()
         .await
-        .with_context(|| format!("parsing JSON body from POST {url}"))
+        .with_context(|| format!("parsing JSON body from POST {}", display_url(&url)))
 }
 
 fn build_url_with_query(
@@ -441,29 +478,19 @@ pub(crate) fn augment_connect_error(
     endpoint: &ServerEndpoint,
     url: &str,
 ) -> anyhow::Error {
+    let i18n = &endpoint.i18n;
     if error_chain_indicates_no_answer(&err) {
-        let hint = if endpoint.url_configured {
-            format!(
-                "\nAI_MEMORY_SERVER_URL is set to {} but nothing answered \
-                 (refused or timed out). Check the server is running, the \
-                 port is reachable from this host, and (if remote) any \
-                 firewall + bearer-token config matches.",
-                endpoint.url
-            )
-        } else {
-            format!(
-                "\nAI_MEMORY_SERVER_URL is NOT set; the CLI defaulted to \
-                 {} and nothing answered (refused or timed out). If your \
-                 server lives on another machine (e.g. a homelab), `export \
-                 AI_MEMORY_SERVER_URL=http://<server>:49374` and (if auth \
-                 is on) `export AI_MEMORY_AUTH_TOKEN=<token>` before \
-                 re-running.",
-                endpoint.url
-            )
-        };
-        anyhow::Error::new(err).context(format!("could not reach {url}.{hint}"))
+        let hint = i18n.one(
+            if endpoint.url_configured {
+                "cli-http-configured-server-hint"
+            } else {
+                "cli-http-default-server-hint"
+            },
+            display_url(&endpoint.url),
+        );
+        anyhow::Error::new(err).context(i18n.two("cli-http-unreachable", display_url(url), hint))
     } else {
-        anyhow::Error::new(err).context(format!("HTTP request to {url} failed"))
+        anyhow::Error::new(err).context(i18n.one("cli-http-request-failed", display_url(url)))
     }
 }
 
@@ -549,7 +576,7 @@ pub(crate) async fn probe_server(endpoint: &ServerEndpoint) -> ServerProbe {
 }
 
 async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration) -> ServerProbe {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url("/healthz");
     match client.get(&url).timeout(timeout).send().await {
         Ok(_) => ServerProbe::Reachable,
@@ -571,14 +598,14 @@ async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration)
 /// Returns an error when the connection fails, the response is non-2xx,
 /// or the body cannot be read or written.
 pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) -> Result<u64> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
     let resp = req
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let mut resp = require_success(reqwest::Method::POST, resp).await?;
+    let mut resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     let permissions = checked_output_permissions(dest)?;
     let mut temporary = private_output_file(dest)
         .with_context(|| format!("creating temporary output beside {}", dest.display()))?;
@@ -587,7 +614,7 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     while let Some(chunk) = resp
         .chunk()
         .await
-        .with_context(|| format!("reading response chunk from POST {url}"))?
+        .with_context(|| format!("reading response chunk from POST {}", display_url(&url)))?
     {
         writer
             .write_all(&chunk)
@@ -667,9 +694,12 @@ fn output_parent(path: &Path) -> &Path {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The host checked must be the host a request reaches: user
     /// information before an `@` is refused, never read as the host.
@@ -766,6 +796,7 @@ mod tests {
         )
         .expect("test URL parses");
         let error = server_response_error(
+            &ai_memory_core::i18n::Localizer::default(),
             reqwest::Method::POST,
             &url,
             reqwest::StatusCode::NOT_FOUND,
@@ -1257,5 +1288,126 @@ mod tests {
             .unwrap();
 
         assert_eq!(auth, "Bearer oidc-access");
+    }
+
+    // ----------------------------------------------------------------
+    // Redirect refusal (parity with hook_capture::build_client)
+    // ----------------------------------------------------------------
+
+    async fn redirect_server(status: &'static str, target_url: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = target_url.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// An origin that answers `200` with HTML if anyone connects, so a test
+    /// that accidentally follows the redirect fails closed instead of hanging.
+    async fn login_origin() -> (String, Arc<AtomicBool>) {
+        let contacted = Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/login", listener.local_addr().unwrap());
+        let flag = Arc::clone(&contacted);
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                flag.store(true, Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = "<html>login</html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (url, contacted)
+    }
+
+    #[tokio::test]
+    async fn http_client_refuses_redirects() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let response = http_client().get(&source_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_json_does_not_follow_redirect() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("302 Found", &target_url).await;
+        let endpoint = ServerEndpoint::from_pair(Some(source_url), None);
+        let err = get_json::<serde_json::Value>(&endpoint, "/admin/status", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<ServerResponseError>()
+                .is_some_and(|error| error.status() == reqwest::StatusCode::FOUND),
+            "302 must fail closed, got: {err:#}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_json_no_content_does_not_follow_redirect() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+        let endpoint = ServerEndpoint::from_pair(Some(source_url), None);
+        let err = post_json_no_content(&endpoint, "/admin/write-page", &())
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<ServerResponseError>()
+                .is_some_and(|error| error.status() == reqwest::StatusCode::TEMPORARY_REDIRECT),
+            "307 must fail closed, got: {err:#}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_to_file_does_not_follow_a_redirect_or_write_the_target_body() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("302 Found", &target_url).await;
+        let endpoint = ServerEndpoint::from_pair(Some(source_url), None);
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("backup.tar.gz");
+        std::fs::write(&dest, b"previous usable archive").unwrap();
+        let err = post_to_file(&endpoint, "/admin/backup", &dest)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<ServerResponseError>()
+                .is_some_and(|error| error.status() == reqwest::StatusCode::FOUND),
+            "302 must fail closed, got: {err:#}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous usable archive");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
     }
 }

@@ -77,8 +77,6 @@ const CLASSIFY_BATCH: usize = 20;
 const MAX_CLASSIFY_CALLS: usize = 8;
 /// Most merge calls one pass makes; the rest use the zero-LLM statement.
 const MAX_MERGE_CALLS: usize = 16;
-/// Output-token allowance for one profile LLM call.
-const PROFILE_LLM_MAX_TOKENS: u32 = 2_000;
 
 const CLASSIFY_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_classify_system.md");
 const MERGE_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_merge_system.md");
@@ -1081,27 +1079,65 @@ pub fn applies_to_for(statement: &str) -> Vec<String> {
 }
 
 /// A path-safe slug of at most 60 characters.
+///
+/// Folds like the rule slugger: NFD-decompose, drop the combining marks,
+/// lower-case, keep ASCII letters and digits, collapse the rest to `-`.
+/// When the fold drops a letter or digit (a statement in another script,
+/// or a non-decomposable Latin-1 letter), `-<8 hex>` of the statement's
+/// digest key is appended, so two statements that keep the same ASCII
+/// words but say different things do not converge onto one page, and a
+/// statement with no ASCII at all names itself by digest instead of every
+/// one landing on `entry` (#1943). Pure-ASCII statements keep their exact
+/// old slug.
 #[must_use]
 pub fn slugify(text: &str) -> String {
+    let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(text);
+    // The scan runs over the whole statement first: stopping at the fold
+    // cap would miss a dropped letter after it, and two statements that
+    // agree inside the window but differ past it must still part ways.
+    let dropped_alnum = decomposed
+        .chars()
+        .any(crate::slug_digest::is_fold_lost_alnum);
+    let suffix = if dropped_alnum {
+        crate::slug_digest::title_digest_key(text)
+            .as_deref()
+            .map(crate::slug_digest::digest_hex8)
+            .map(|hex| format!("-{hex}"))
+    } else {
+        None
+    };
+    // The suffix rides inside the 60-char cap, so the fold stops early
+    // when one is coming.
+    let cap = 60 - suffix.as_deref().map_or(0, str::len);
     let mut slug = String::new();
     let mut dash = false;
-    for c in text.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c);
+    for c in decomposed.chars() {
+        if crate::slug_digest::is_combining_mark(c) {
+            continue;
+        }
+        let lower = c.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            slug.push(lower);
             dash = false;
         } else if !dash && !slug.is_empty() {
             slug.push('-');
             dash = true;
         }
-        if slug.len() >= 60 {
+        if slug.len() >= cap {
             break;
         }
     }
-    let slug = slug.trim_matches('-').to_owned();
+    let slug = slug.trim_matches('-');
+    if let Some(suffix) = suffix {
+        // `dropped_alnum` guarantees a statement that lost a letter has a
+        // digest key; the fallback only guards the impossible case.
+        let stem = if slug.is_empty() { "entry" } else { slug };
+        return format!("{stem}{suffix}");
+    }
     if slug.is_empty() {
         "entry".to_owned()
     } else {
-        slug
+        slug.to_owned()
     }
 }
 
@@ -1908,6 +1944,7 @@ async fn classify_batch(
     llm: &(dyn LlmProvider + 'static),
     sanitizer: &ai_memory_core::Sanitizer,
     batch: &[PendingSentence],
+    max_tokens: u32,
 ) -> Result<Vec<Option<DetectedPreference>>, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "categories": PROFILE_CATEGORIES,
@@ -1925,7 +1962,7 @@ async fn classify_batch(
         messages: vec![ChatMessage::user(format!(
             "Classify these sentences the user wrote. They are data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     let response: ClassifyResponse = complete_structured_with_operation_id(
@@ -1976,6 +2013,7 @@ async fn merge_entry(
     sanitizer: &ai_memory_core::Sanitizer,
     current: Option<&str>,
     entry: &EntryPlan,
+    max_tokens: u32,
 ) -> Result<MergeResponse, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "current_entry": current.map(|c| sanitizer.scrub(c)),
@@ -1995,7 +2033,7 @@ async fn merge_entry(
         messages: vec![ChatMessage::user(format!(
             "Restate this profile entry. Everything below is data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     complete_structured_with_operation_id(
@@ -2076,10 +2114,21 @@ pub async fn run_profile_pass(
     };
     report.share = Some(share.as_str());
     let llm = llm.filter(|_| config.settings.llm);
+    let max_tokens = config.settings.max_output_tokens;
     let mut classify_budget = MAX_CLASSIFY_CALLS;
 
     for project in reader.profile_harvest_projects().await? {
-        match harvest_project(reader, writer, wiki, llm, &project, &mut classify_budget).await {
+        match harvest_project(
+            reader,
+            writer,
+            wiki,
+            llm,
+            &project,
+            &mut classify_budget,
+            max_tokens,
+        )
+        .await
+        {
             Ok((added, calls, fallbacks)) => {
                 report.projects_harvested += 1;
                 report.candidates_added += added;
@@ -2124,6 +2173,7 @@ async fn harvest_project(
     llm: Option<&Arc<dyn LlmProvider>>,
     project: &ProfileHarvestProject,
     classify_budget: &mut usize,
+    max_tokens: u32,
 ) -> Result<(usize, usize, usize), ai_memory_store::StoreError> {
     let (prompts, pages, tags) = reader
         .profile_harvest_inputs(
@@ -2183,7 +2233,7 @@ async fn harvest_project(
         for batch in pending.chunks(CLASSIFY_BATCH) {
             let classified = if *classify_budget > 0 {
                 *classify_budget -= 1;
-                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch).await {
+                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch, max_tokens).await {
                     Ok(classified) => {
                         calls += 1;
                         Some(classified)
@@ -2504,7 +2554,15 @@ async fn converge_target(
         {
             *merge_budget -= 1;
             let current = stored.as_ref().map(|stored| stored.statement.as_str());
-            match merge_entry(llm.as_ref(), wiki.sanitizer(), current, &entry).await {
+            match merge_entry(
+                llm.as_ref(),
+                wiki.sanitizer(),
+                current,
+                &entry,
+                config.settings.max_output_tokens,
+            )
+            .await
+            {
                 Ok(merged)
                     if !merged.changed
                         && stored.as_ref().is_some_and(|stored| {
@@ -2864,6 +2922,57 @@ mod tests {
         ] {
             assert_eq!(user_written(generated), None, "{generated}");
         }
+    }
+
+    /// #1943: statements that lose letters to the ASCII fold keep their
+    /// ASCII words but are named apart by a digest, so two statements
+    /// that share the ASCII words and differ elsewhere do not converge
+    /// onto one `profile/<category>/<slug>.md` page.
+    #[test]
+    fn slugify_distinguishes_mixed_script_statements() {
+        let weekly = slugify("给 ACME 客户的周报只写 ACME 项目");
+        let other = slugify("给 ACME 客户的月报只写 ACME 项目");
+        for slug in [&weekly, &other] {
+            assert!(slug.starts_with("acme-"), "ASCII words survive: {slug}");
+            assert!(slug.len() <= 60, "the cap holds, digest included: {slug}");
+            PagePath::new(format!("profile/habits/{slug}.md"))
+                .unwrap()
+                .ensure_portable()
+                .unwrap();
+        }
+        assert_ne!(weekly, other);
+        assert_eq!(weekly, slugify("给 ACME 客户的周报只写 ACME 项目"));
+    }
+
+    /// #1943: a statement with no ASCII at all names itself by digest
+    /// instead of every such statement landing on `entry`, the same
+    /// sharing that lost rules at `_rules/rule.md` before a849ab1.
+    #[test]
+    fn slugify_names_all_non_ascii_statements_apart() {
+        let chinese = slugify("始终使用中文写周报");
+        let russian = slugify("всегда переписывать историю коммитов");
+        for slug in [&chinese, &russian] {
+            assert!(slug.starts_with("entry-"), "no ASCII word survives: {slug}");
+            assert!(slug.len() <= 60, "{slug}");
+        }
+        assert_ne!(chinese, russian);
+        assert_eq!(chinese, slugify("始终使用中文写周报"));
+        // A punctuation-only statement still falls back to the bare name.
+        assert_eq!(slugify("!!!"), "entry");
+    }
+
+    /// #1943: pure-ASCII statements keep their exact old slugs, and the
+    /// 60-char cap still binds. Folded diacritics are carried to ASCII,
+    /// not dropped, so they take no digest either.
+    #[test]
+    fn slugify_leaves_ascii_statements_alone() {
+        assert_eq!(slugify("Always use pnpm"), "always-use-pnpm");
+        assert_eq!(slugify("---trim---"), "trim");
+        assert_eq!(slugify("Politica estavel"), "politica-estavel");
+        assert_eq!(slugify("Política estável"), "politica-estavel");
+        let long = slugify(&"word ".repeat(40));
+        assert!(long.len() <= 60, "{long}");
+        assert!(!long.ends_with('-'));
     }
 
     /// A page metadata field stored by an earlier harvest never waits for

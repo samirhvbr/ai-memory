@@ -404,6 +404,23 @@ function Get-AiMemoryTomlFlag {
     return $null
 }
 
+function Get-AiMemoryTomlScopedFlag {
+    param([string] $File, [string] $Section, [string] $Key, [switch] $Exclude)
+    if (-not (Test-Path $File -PathType Leaf)) { return $null }
+    $inSection = $false
+    foreach ($line in Get-Content $File) {
+        $header = [regex]::Match($line, '^\s*\[\s*([^\]]+?)\s*\]\s*(#.*)?$')
+        if ($header.Success) {
+            $inSection = $header.Groups[1].Value.Trim() -eq $Section
+            continue
+        }
+        if (($Exclude -and $inSection) -or (-not $Exclude -and -not $inSection)) { continue }
+        $m = [regex]::Match($line, "^\s*$Key\s*=\s*`"?([^`"#]*)`"?\s*(#.*)?$")
+        if ($m.Success) { return $m.Groups[1].Value.Trim() }
+    }
+    return $null
+}
+
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
 # "0" for a falsy value, "1" for anything else, an absent key included.
 # Parity with `profile_flag_value` in hook_capture.rs.
@@ -591,6 +608,7 @@ function Get-AiMemoryMarkerQuery {
     $profileContribute = $null
     $profileConsume = $null
     $handoffOff = $false
+    $recoveryOff = $false
     $aliases = $null
     $identityQuery = ""
     $homeRouted = $false
@@ -631,8 +649,9 @@ function Get-AiMemoryMarkerQuery {
         # what it stored.
         $profileContribute = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "contribute")
         $profileConsume = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "consume")
-        # `[handoff] deliver_on_session_start = false`: sent only when explicitly falsy.
-        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "deliver_on_session_start")) -eq "0"
+        # The delivery key is independent in [handoff] and [recovery].
+        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start" -Exclude)) -eq "0"
+        $recoveryOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start")) -eq "0"
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
@@ -667,6 +686,7 @@ function Get-AiMemoryMarkerQuery {
     if ($profileContribute) { $qs += "&profile_contribute=$([uri]::EscapeDataString($profileContribute))" }
     if ($profileConsume) { $qs += "&profile_consume=$([uri]::EscapeDataString($profileConsume))" }
     if ($handoffOff) { $qs += "&handoff=0" }
+    if ($recoveryOff) { $qs += "&recovery=0" }
     return $qs
 }
 
@@ -796,15 +816,15 @@ function Invoke-AiMemoryDrainSpool {
         $code = 0
         $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest @NoProxy `
+            $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
                 -Uri ([string]$entry.url) `
                 -Headers $headers `
                 -ContentType "application/json" `
-                -Body ([Text.Encoding]::UTF8.GetBytes([string]$entry.body)) | Out-Null
-            $code = 200
+                -Body ([Text.Encoding]::UTF8.GetBytes([string]$entry.body))
+            $code = Get-AiMemoryResponseStatus $Response
         } catch {
             $response = $_.Exception.Response
             if ($response) {
@@ -911,11 +931,29 @@ function Clear-AiMemorySessionId {
 # ALL_PROXY proxy even for a loopback URL, so a sandbox with an empty NO_PROXY
 # (ai-jail) routes the hook to a proxy that answers 4xx. -NoProxy (PowerShell
 # 6+) connects directly, as the native hook and the shell bundle do. Windows
-# PowerShell 5.1 reads no environment proxy and has no -NoProxy. Splat the
-# result into every Invoke-WebRequest.
+# PowerShell 5.1 reads no environment proxy and has no -NoProxy.
+#
+# MaximumRedirection 0 matches the native hook (`Policy::none`) and the
+# generated TypeScript integrations (`redirect: "error"`): a 3xx from an SSO
+# portal, proxy or captive portal must not be followed, so a login page's 200
+# cannot count as delivery, a 307/308 cannot replay the POST, and a 302 body
+# cannot be injected as a handoff. Splat the result into every Invoke-WebRequest.
 function Get-AiMemoryNoProxy {
-    if ($PSVersionTable.PSVersion.Major -ge 6) { return @{ NoProxy = $true } }
-    return @{}
+    $splat = @{ MaximumRedirection = 0 }
+    if ($PSVersionTable.PSVersion.Major -ge 6) { $splat['NoProxy'] = $true }
+    return $splat
+}
+
+# Status of a completed Invoke-WebRequest. Windows PowerShell 5.1 can return
+# a 3xx object instead of throwing when MaximumRedirection is 0; PowerShell 7
+# throws. Mocks that omit StatusCode keep the historical "did not throw means
+# 2xx" default so existing tests stay valid.
+function Get-AiMemoryResponseStatus {
+    param($Response, [int] $Default = 200)
+    if ($null -eq $Response) { return $Default }
+    $code = $Response.StatusCode
+    if ($null -eq $code) { return $Default }
+    try { return [int]$code } catch { return $Default }
 }
 
 function Read-AiMemoryStdin {
@@ -1062,6 +1100,11 @@ function Invoke-AiMemoryHook {
     if ($env:AI_MEMORY_RUN_ID) {
         $QS += "&managed_run=$([Uri]::EscapeDataString($env:AI_MEMORY_RUN_ID))"
     }
+    # Per-execution opt-out of the automatic handoff (#1951), forwarded only
+    # for an explicit falsy value, as the native hook does.
+    if ($env:AI_MEMORY_AUTO_HANDOFF -and $env:AI_MEMORY_AUTO_HANDOFF.Trim().ToLowerInvariant() -in @("0", "false", "no", "off")) {
+        $QS += "&auto_handoff=0"
+    }
     $SessionQS = ""
     if ($Agent -eq "devin") {
         $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event
@@ -1092,15 +1135,20 @@ function Invoke-AiMemoryHook {
         $HookUrl = "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS&ingest_key=ps$([Guid]::NewGuid().ToString('N').Substring(0, 16))"
         $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest @NoProxy `
+            $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
                 -Uri $HookUrl `
                 -Headers $Headers `
                 -ContentType "application/json; charset=utf-8" `
-                -Body $BodyBytes | Out-Null
-            Invoke-AiMemoryKickDrain
+                -Body $BodyBytes
+            $Status = Get-AiMemoryResponseStatus $Response
+            if ($Status -ge 200 -and $Status -lt 300) {
+                Invoke-AiMemoryKickDrain
+            } elseif ($Status -lt 400 -or $Status -ge 500 -or $Status -eq 408 -or $Status -eq 425 -or $Status -eq 429) {
+                Write-AiMemorySpoolEvent -Url $HookUrl -Body $Payload
+            }
         } catch {
             $Status = 0
             if ($_.Exception.Response) {
@@ -1133,7 +1181,8 @@ function Invoke-AiMemoryHook {
                         -TimeoutSec 2 `
                         -Uri "$Server/brief?agent=$Agent$QS$BriefQS" `
                         -Headers $Headers
-                    if ($null -ne $Response -and $Response.Content) {
+                    $Status = Get-AiMemoryResponseStatus $Response
+                    if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {
                         $Wrapped = @{
                             hookSpecificOutput = @{
                                 hookEventName = "SubagentStart"
@@ -1171,6 +1220,16 @@ function Invoke-AiMemoryHook {
                 $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
             }
         } catch {
+        }
+        # A compaction's SessionStart (`source: "compact"`) is mid-session:
+        # claim no handoff, recovery snapshot or brief, and print the same
+        # empty reply as "no pending handoff" (parity with the native hook and
+        # `ai_memory_get_start_handoff`; the anchor is native-only).
+        if ($Event -eq "session-start" -and $ParsedPayload -and [string]$ParsedPayload.source -eq "compact") {
+            if ($AntigravityStartOutput -or $CopilotCliSessionStartOutput -or $SessionStartEnvelope) {
+                [Console]::Out.Write("{}")
+            }
+            return
         }
         $Shown = $null
         if ($GrokPostTool) {
@@ -1247,7 +1306,8 @@ function Invoke-AiMemoryHook {
                 -TimeoutSec 2 `
                 -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
                 -Headers $Headers
-            if ($null -ne $Response -and $Response.Content) {
+            $Status = Get-AiMemoryResponseStatus $Response
+            if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {
                 if ($GrokPostTool) {
                     $Wrapped = @{
                         hookSpecificOutput = @{
