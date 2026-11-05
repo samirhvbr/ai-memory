@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.6`
+**Current version:** `0.3.7`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `5d9660df` (`main`, `v3.4.2` plus 1 commit)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,30 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.7 - mem.shvia.org runs 3.4.2, after a cold backup and 35 minutes down
+
+The server moved from `3.3.1` to `3.4.2` on 05/11/2026, so it is level with the
+code this fork carries since `0.3.6`. `upgrade-3.4.2.sh` completed on its first
+run on the right machine: a verified cold backup of 873 MiB in 3 min 22 s, then V97
+to V99 in 31 min 48 s, ready at 21:50:54 UTC, **down 35 min 13 s** in all. That
+matches the 31 to 36 minutes the rehearsal predicted, and the shape was the one it
+showed: V97 rebuilds both full-text indexes, the write-ahead log peaked at 5.98 GB
+(5.37 GB on the rehearsal's smaller copy), and the database file grew by 596 MB
+because the new tokenizer indexes more terms. Every check matched before and
+after, directly and through Apache; the schema is 99, the index is complete (FTS
+61,323 / 61,323 pages and 887,171 / 887,171 observations), the container log has no
+`ERROR` line, and the `ai-memory-web` probe is clean.
+
+The command that starts the script was first typed in the root console of the
+application server by mistake; `blue3site` was untouched until the second attempt.
+The page in [`docs/mem-shvia-org.md`](docs/mem-shvia-org.md) now says to check the
+prompt, and records the timings, the rollback and what is still open: the clients
+are `2.x`, and nobody has checked whether observations stored before the `3.3.3`
+redaction fix hold a password printed by a tool.
+
+The upstream tags are still not pushed to this fork, so its Releases box still
+reads `v2.0.1`; publishing `v3.4.2` there is the owner's decision.
 
 ## 0.3.6 - the fork moves onto upstream main past v3.4.2
 

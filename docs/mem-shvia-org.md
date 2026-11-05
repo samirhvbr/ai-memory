@@ -2,10 +2,9 @@
 
 > **Status:** `ACTIVE` · Production runs the **upstream's published Docker image**,
 > not a build of this fork (the fork carries no code of its own). Since
-> 02/11/2026 16:38 UTC that image is **`3.3.1`** (schema 96). Before that it was
-> `3.2.8` (27/10) and `2.6.6` (13/10). The fork's code is upstream `main` at
-> `v3.4.2` plus one commit (version `0.3.6`), so the server is one step behind:
-> the `3.4.2` rehearsal is recorded below and the upgrade itself is not done yet.
+> 05/11/2026 21:50 UTC that image is **`3.4.2`** (schema 99). Before that it was
+> `3.3.1` (02/11), `3.2.8` (27/10) and `2.6.6` (13/10). The fork's code is upstream
+> `main` at `v3.4.2` plus one commit (version `0.3.7`), so server and fork are level.
 
 | | |
 |---|---|
@@ -13,8 +12,8 @@
 | Access | `ssh samir@100.64.100.125`, then `sudo` |
 | Public address | `https://mem.shvia.org`, an Apache vhost on the same machine proxying to `http://127.0.0.1:49374/` |
 | Deploy | `docker compose` in `/srv/ai-memory`. `docker-compose.yml` holds the bearer token (mode 600); `./data` is bind-mounted at `/data` |
-| Image | `akitaonrails/ai-memory:3.3.1`, **pinned on purpose**: an upgrade migrates the database one way |
-| Data | `data/db/memory.sqlite` is about 45.7 GB (42.6 GiB): 909 latest pages (61,080 versions) and 839,441 observations on 02/11/2026. The file grew by about 100 MB between 27/10 and 02/11. The wiki is about 0.6 GB. `/srv` has about 25 GB free, and the volume group has no free extents |
+| Image | `akitaonrails/ai-memory:3.4.2`, **pinned on purpose**: an upgrade migrates the database one way |
+| Data | `data/db/memory.sqlite` is about 46.4 GB (43.2 GiB): 867 latest pages (61,323 versions) and 887,171 observations on 05/11/2026. It grew by about 100 MB between 27/10 and 02/11, and by 596 MB on 05/11, almost all of it the larger full-text indexes the `3.4.2` tokenizer builds. The wiki is about 0.6 GB. `/srv` has about 24 GB free, and the volume group has no free extents |
 
 **Not** `shvia-site` (`100.64.100.242`, the app server), and **not** `170.233.231.20`
 (the public IP, which appears in `AI_MEMORY_ALLOWED_HOSTS` and was once read as the
@@ -94,7 +93,58 @@ so V97 should take **27 to 32 minutes**, plus about 4 minutes of cold backup and
 verification: **roughly 31 to 36 minutes down**, against 4 minutes for `3.3.1`.
 `/srv/ai-memory/upgrade-3.4.2.sh` is the `3.3.1` script with the tags changed and
 the expected schema 99 (it was only copied and syntax-checked; the diff against
-the `3.3.1` one is the header comments and that one line).
+the `3.3.1` one is the header comments and that one line). The run itself, below, took 35 min 13 s: V97 was 4.2 times slower
+than on the workstation, a little past the 3.5 to 4 assumed here.
+
+## Upgrading: 3.3.1 to 3.4.2 on 05/11/2026
+
+`/srv/ai-memory/upgrade-3.4.2.sh` is the `3.3.1` script with the two tags and the
+expected schema (99) changed; the diff against it is its header comments and that
+one line. The owner started it from the root console of `blue3site` with the same
+`systemd-run` command as before. **The first attempt was typed in the root console
+of the application server (`shvia-site`) by mistake**: `blue3site` was untouched
+(no unit, no log, the container still on `3.3.1` and healthy), and the run that
+counts started a few minutes later, at 21:15:31 UTC. The prompt of the console
+(`root@blue3site`) is what to check before pasting.
+
+| Step (UTC) | Time |
+|---|---|
+| Image pulled, server stopped | 21:15:36 to 21:15:41 |
+| Cold backup written and verified | 21:15:43 to 21:19:05 (3 min 22 s), `backup-3.3.1-20261105-181536.tar.zst`, 873 MiB |
+| `3.4.2` started, V97 to V99 running | 21:19:06 to 21:50:54, **31 min 48 s** (the rehearsal had taken 7 min 38 s: 4.2 times slower here) |
+| API answering 200, then healthy | 21:51:05, then 21:51:36; `DONE` at 21:51:40 |
+
+Downtime: **35 min 13 s** (21:15:41 to 21:50:54), against the 31 to 36 minutes
+the rehearsal predicted. The migration was disk-bound here: the container read
+the database cold at 6% CPU with IO pressure near 60%, and the write-ahead log
+grew at about 3 to 4 MB/s up to **5.98 GB** (the rehearsal peaked at 5.37 GB on a
+database 5% smaller), then the checkpoint cut it to 64 MB. `/srv` free space went
+from 25 GB to 17 GB at the lowest and came back to 24 GB. The database file grew
+from 45,820,325,888 to 46,416,343,040 bytes.
+
+Checks, before and after, directly and through Apache: `workspaces` 200, `search`
+200, 401 without the token, MCP `initialize` 200. Workspaces `default` 144 / 824,
+`samirhv-shvia` 24 / 41 and `shvia` 2 / 2 on both sides. Counts: 867 latest pages,
+3,127 sessions, 887,167 observations before and after; schema 88 is now **99**.
+`status` after the start: FTS 61,323 / 61,323 pages and 887,171 / 887,171
+observations, 5,037 embeddings with 0 latest pages missing one, the spool empty,
+9 hook events accepted and 9 stored with none failed. The container log has no
+`ERROR` line and one `WARN` (the standing one about the non-loopback plain-HTTP
+bind). The `ai-memory-web` probe printed `array ()`. This session's own MCP tools
+(`memory_status`, `memory_query`) answered through `mem.shvia.org`. The container
+then used 345 MiB and 0.03% CPU.
+
+Rollback, not needed: stop; delete `data/db`;
+`zstd -dc --long=27 backup-3.3.1-20261105-181536.tar.zst | tar -C /srv/ai-memory -xf - data`;
+restore `docker-compose.yml.bak-20261105-181536-pre-3.4.2`; start with the `3.3.1`
+image. The migrations are forward only. The archives now on the machine are the
+`2.1.2`, `2.6.6`, two `3.2.8` and this `3.3.1` one (about 4.9 GB on the same volume
+as the database); none was deleted.
+
+**Still to do.** The clients on each machine are `2.x` (this workstation's is
+`2.5.2`); they work with this server until `ai-memory upgrade` runs there. The
+`3.3.3` redaction fix only covers what is stored from now on: whether earlier
+observations hold a password printed by a tool was not checked.
 
 ## Upgrading: 3.2.8 to 3.3.1 on 02/11/2026
 
