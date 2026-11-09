@@ -295,6 +295,9 @@ from hook paths.
    activity, with no summary page and no usage. This keeps
    `open_session_count` from growing on sessions nobody continues, and it is
    narrower than a real end (see the session-usage row below).
+   Each session the sweep closes also gets a parked auto-improvement claim, so
+   the sweep never queues an LLM review. A real `SessionEnd` with new
+   observations, or a handoff that reopens the session, removes that claim.
    A session that is continued, meaning a new session starts in the same
    scope while the old one has been quiet for 15 minutes or more, is closed
    sooner on the client, including usage recovery. After that threshold the
@@ -422,6 +425,12 @@ same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
 handoffs from the exact cwd, bounding repeated SessionEnds before any receiver
 starts.
+A session that still has an open `memory_handoff_begin` handoff of its own
+ends without an automatic baton, and its turn checkpoints write none; writing
+that explicit handoff also expires the session's own open automatic batons
+(#2012). The startup block for a handoff with a source session names its
+`sessions/<id>.md` page, which opt-in SessionEnd consolidation rewrites after
+the baton was written.
 `GET /recap?session_id=` answers a prompt that starts with `reload context`
 (Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
 `PostToolUse`, OpenCode through its system/context hooks). It is read-only and
@@ -641,16 +650,16 @@ prunable rather than only after it ages in place.
 |---|---|
 | `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by (an explicit marker `identity` or a normalised git remote, resolved client-side), unique per workspace when set; empty until a capture claims the project. Phase-5 clients explicitly send `IdentityStyle::Path` (#1033) for remote-backed projects, naming them from the full repository path without the host (`acme-api`), and send explicit `host_path` for the pre-v3 opt-out. Server-side omission remains `HostPath` because old clients omitted that historical default; no new wire field is needed. Creation or authorized capture promotion uses that canonical name only when no different hostful identity claims it; otherwise resolution falls back to the existing hostful/legacy-safe name. V76 stores indexed canonical and v2-basename keys derived from that full identity: reads are no-create/no-rename, while an authorized explicit write through the canonical name promotes only `projects.name` in the same resolve-or-create writer transaction and preserves the UUID. Project `_meta.md` carries the optional full identity/source plus derived keys; clean reindex validates them and rebuilds the same UUID/name/coordinate lookup, while older manifests without identity remain valid. Ambiguous cross-forge or multi-candidate keys fail closed. A local marker may additionally send up to 16 validated former names as one transient `aliases` JSON-array query value: lookup stays inside its selected workspace, requires the checkout's full hostful git-remote identity to equal the stored row, returns reads without rename, and lets capture perform only the same authorized UUID-preserving canonical promotion. Aliases are not stored and remain distinct in the hook routing cache. The exact operator-home marker may additionally define bounded `[routes.identity."host/path"]` and `[routes.path."absolute-or-tilde-path"]` blocks: an exact hostful remote match wins the longest component-wise lexical path match, any reachable non-home local settings marker wins both, malformed or ambiguous route maps fail closed, and selected fields reuse the existing marker wire without a server/schema change. `AI_MEMORY_HOME` is authoritative for native callers; portable clients use `HOME`/`USERPROFILE`, and Docker compares its forwarded host cwd. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` (see `docs/users.md#per-project-access`). `projects.profile_contribute` / `profile_consume` (V74) record the marker's `[profile]` opt-outs, forwarded at session start; `profile_candidates`, `profile_harvest_marks` and `profile_entry_ledger` (V75) hold the profile pass's evidence, per-project read position and the entries it wrote. Reserved projects: `scratch`, `_global` (shared preferences; holds the single-user profile under `profile/`), `_profile` (a workspace profile) and `_profile.<user id>` (a private profile, always `restricted`); capture is never attributed to any of them (see `docs/cross-project-profile.md`). |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
-| `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
+| `pages_fts` | FTS5 virtual table over `(title, body, path_search)` plus the `title_parts` / `body_parts` spellings that turn `-`/`_` into spaces (V100, #2013), so a hyphenated token and each of its words both match; auto-synced by triggers. |
 | `pages_cjk_fts` | Derived unigram/bigram FTS5 index over the CJK runs in page title, body, and path. The writer updates it in the page transaction; startup repairs missing rows after an upgrade. Queried only when the bounded query contains Han, Kana, or Hangul. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
 | `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for automatic LLM consolidation. PreCompact / PostCompaction checkpoint jobs are queued whether or not the session has ended (a resumed session keeps `ended_at`); opt-in SessionEnd jobs need an *ended* session, and observation generations order the two. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. The worker starts whenever a consolidator is configured; SessionEnd enqueue stays behind `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`. A manual `memory_consolidate` writes its page out-of-band and then reconciles this table (flipping a `failed`/`pending`/`superseded` row for the session to `completed`, never touching a live `running` lease), so the operator does not see a `failed` job for a session that is in fact consolidated. |
-| `observations_fts` | FTS5 virtual table over raw observation `(title, body)`. Feeds the bounded `raw_hits` fallback and, through `[retrieval] observation_stream` (on by default), the observation-evidence RRF stream that votes for session pages. |
+| `observations_fts` | FTS5 virtual table over raw observation `(title, body)` with the same `title_parts` / `body_parts` spellings (V100, #2013). Feeds the bounded `raw_hits` fallback and, through `[retrieval] observation_stream` (on by default), the observation-evidence RRF stream that votes for session pages. |
 | `observations_cjk_fts` | Derived unigram/bigram companion for unspaced CJK observation text. It follows the same transactional write, scope, owner-visibility, raw fallback, timeline, and session-vote boundaries as `observations_fts`. |
 | `workstreams`, `managed_runs`, `workstream_native_sessions` | Optional lease state plus per-harness native source and delivery cursors for `ai-memory run`. |
 | `workstream_events`, `workstream_events_fts` | Append-only normalized visible transcript events and full-text search; immutable sanitized source batches also live under `raw/workstreams/`. |
 | `links` | Wikilink / markdown cross-references. `to_page_id` (a global PageId) is nullable for unresolved forward links. `to_workspace` / `to_project` carry a cross-project scope (NULL = the source page's own project). |
-| `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
+| `handoffs` | Typed cross-agent handoff records (open / accepted / expired). V101 `manual` marks a `memory_handoff_begin` handoff, which may now carry the caller's own session (#2014); a row with `manual = 1` or no `from_session_id` is manual: project-wide for cwd matching, preferred at delivery, and never refreshed or swept as an automatic baton. |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
 | `query_page_signals` | Opt-in (`[retrieval] query_signal_weight > 0`) query-scoped ranking associations (V98): one row per `(workspace, project, normalized-query hash, page version)` with the sanitized query text (≤256 chars), a distinct-session `signal_count` and the last writing session. Written only for write-authorized, session-aware callers after a read or `helpful` of the preceding query's hit; `not_helpful` deletes the row, `purge_session` deletes rows the session wrote last, and the project and page FKs cascade. |
@@ -658,7 +667,7 @@ prunable rather than only after it ages in place.
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version: consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Feeds a read-time, zero-LLM **belief-strength `confidence`** (`ai_memory_store::belief`, B1 / `docs/design-hindsight-borrowings.md` P2): a bounded `[0.0, 0.95]` function of distinct supporting sessions (breadth, not raw count), recency of the newest sighting, and live `contradicts` count. Exposed as `confidence` + `evidence_count` in `memory_query(explain=true)`, as `evidence_rows` in `memory_status`, and used to order the opt-in `settled_first` briefing, all **ranking-inert**. It folds into `PageAuthority` only behind `[retrieval] belief_authority_weight` (**default `0.0`/OFF, R2-gated**), as one bounded factor inside the `[0.55, 1.50]` clamp; a supersession always wins regardless of evidence (a superseded version is never boosted). |
 | `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`), extended by V90 with optional epistemic nature/evidence. Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
 | `pages.compacted_at` | V65 nullable A2 tier-down marker (`docs/design-memory-aging.md` §A2). Set when the forget-sweep extractively compacts a cold episodic page (opt-in `[decay] compact_cold_episodic`) instead of evicting it; derived at the single page-upsert choke point from a `compacted: true` frontmatter mirror, so the marker and compacted body land in one transaction. Additive `ADD COLUMN`, no backfill; the sweep populates it lazily. The sweep and curator skip a marked page so it is never re-compacted, re-evicted, or re-reported as cold. Reversible: the full pre-compaction body stays in git + the supersession chain. |
-| `session_usage` | V91 one row per session: cumulative input/output/cache-write/cache-read tokens the harness's own transcript reported at `session-end`, plus the last-seen model name. Written client-side (`ai-memory-cli`'s `session_usage` module reads the transcript; `hook.rs` splices it into the session-end body as `_ai_memory_usage`; the writer upserts with `MAX(existing, reported)` per column). Cascades with its session on purge/delete. Surfaced on the /web project page's Tokens stat and Sessions table; `None` (not zero) for a session whose harness never reported usage. |
+| `session_usage` | V91 one row per session: cumulative input/output/cache-write/cache-read tokens the harness's own transcript reported at `session-end` (for Claude Code, the session's transcript plus its subagents' under `<session>/subagents/`), plus the last-seen model name. Written client-side (`ai-memory-cli`'s `session_usage` module reads the transcript; `hook.rs` splices it into the session-end body as `_ai_memory_usage`; the writer upserts with `MAX(existing, reported)` per column). Cascades with its session on purge/delete. Surfaced on the /web project page's Tokens stat and Sessions table; `None` (not zero) for a session whose harness never reported usage. |
 | `token_calls` | V92 per-session native response identities with content-free input, output and cache counters. Live hooks merge partial/replayed responses with column-wise maxima in one writer transaction, then refresh cumulative session usage. Project reads authorize the project and apply session ownership before counting or ranking. V92 also converts historical Codex input totals to fresh input, excluding cache reads. |
 | `agent_messages.to_agent` | V93 optional registered harness recipient; NULL keeps the shared project inbox. Both claim guards enforce addressed delivery. |
 | `token_calls` context and `token_call_tools` | V94 nullable native turn/response coordinates and response time, plus bounded tool references keyed by session/response. One writer transaction persists counters, provenance and session totals; tools cascade with their response. Missing context stays unknown. Server-side UTC/model/harness/session/turn/tool filters run after scope/owner checks and before pagination. |
@@ -908,7 +917,10 @@ delegates tool calls to the configured HTTP server through rmcp's client
 transport. It uses the bearer `Config::load` resolved, or the install's stored
 hook key before a discovered root key, which it sends only to a loopback
 server. The server therefore keeps the same auth, scope resolver, and tool handlers as direct
-HTTP clients. It has two modes, chosen by the entry that launches it:
+HTTP clients. Its upstream leg runs on an older MCP revision, so the bridge
+restores the `resultType: "complete"` field the 2026-07-28 revision requires on
+the `tools/list` and `tools/call` results it forwards; rmcp drops it again for a
+stdio client on an older revision. It has two modes, chosen by the entry that launches it:
 
 - session-aware (Claude Code, `install-mcp --client claude-code
   --session-aware`, and every Claude Code entry on a token-file install; and
@@ -1153,6 +1165,9 @@ that touch the relevant area.
    in every domain row from day one. (basic-memory #783 / #834.)
 5. **Hooks are fire-and-forget.** Hook scripts hard-timeout at
    ≤200 ms; server returns 202 immediately or 429 when saturated.
+   The one exception is a 409 for a session the server already knows is
+   bound to another agent for that caller, decided from an in-memory view
+   (`SessionAgents`) with no database round trip (#2023).
    (agentmemory #221 / #143.) The router's filesystem probes of an event's
    cwd (git discovery, canonicalization) never run on an async worker: they
    go through `CwdProbes`, a blocking-pool path with four permits and a
@@ -1238,7 +1253,7 @@ contradiction_band_max = 0.75      # (lower/upper cosine-similarity edge). The b
 
 # Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
 # override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
-# AI_MEMORY_RUN_AUTOWIRE / AI_MEMORY_CLAUDE_TRUE_YOLO).
+# AI_MEMORY_RUN_AUTOWIRE).
 capture_assistant = false          # server-side opt-in: honor a Claude Code / Codex
                                    # client's sanitized assistant-final-message marker
                                    # on Stop (#196). Client half is baked separately by
@@ -1252,13 +1267,6 @@ run_autowire = true                # `ai-memory run <harness>` auto-installs tha
                                    # hooks + MCP on first launch if missing (idempotent,
                                    # one-time per harness+version+install location).
                                    # Also `--no-autowire`.
-claude_true_yolo = false           # opt-in: on a Claude `ai-memory run --yolo`, also
-                                   # silence the residual `--dangerously-skip-permissions`
-                                   # prompts (rm timeout/confirmation, PowerShell rm deny)
-                                   # and force `bypassPermissions` via `--settings`.
-                                   # Claude-only, no-op for every other harness. Also
-                                   # `--true-yolo`. See
-                                   # docs/design-yolo-safety-ai-jail.md.
 release_base_url = ""              # override the GitHub releases base URL that `ai-memory
                                    # upgrade` checks and downloads from (#801). Empty =
                                    # https://github.com/akitaonrails/ai-memory/releases.

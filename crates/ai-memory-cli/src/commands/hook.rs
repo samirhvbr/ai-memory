@@ -29,7 +29,7 @@ use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
 use crate::config::{Config, RuntimeEnv};
-use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
+use crate::server_profiles::{self, ProfileName, Route as HookRoute};
 
 use sha2::{Digest as _, Sha256};
 
@@ -215,8 +215,21 @@ fn compute_live_calls(
                 })
             }),
         _ => None,
-    };
-    path.and_then(|p| super::session_usage::extract_live_calls(&p, agent, data_dir, routing_key))
+    }?;
+    let batch = super::session_usage::extract_live_calls(&path, agent, data_dir, routing_key)?;
+    // Claude Code subagents write their own transcripts. Their responses ride
+    // only on the main conversation's events: `drop_subagent_captures` drops
+    // an event that carries `agent_id` (the router's `body_is_subagent`),
+    // usage included, after its cursor has moved. `agent_type` alone is a
+    // `claude --agent` main session, whose events keep them.
+    let subagent_event = json
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    if agent == AgentKind::ClaudeCode && !subagent_event {
+        return Some(batch.with_claude_subagents(&path, data_dir, routing_key));
+    }
+    Some(batch)
 }
 
 /// A stale interrupted-session candidate found in the session-start handoff
@@ -1928,10 +1941,22 @@ where
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
     let mut live_batch = None;
+    // Claude Code runs hooks inside subagents too, tagging their events with
+    // `agent_id` while `transcript_path` still names the main session's
+    // transcript (<https://code.claude.com/docs/en/hooks>, "Hooks in
+    // subagents"). The router may drop such an event, so it must not move the
+    // main transcript's cursor: the main conversation's next event reads the
+    // same lines (#2034).
+    let claude_subagent_event = agent_kind == AgentKind::ClaudeCode
+        && json
+            .get("agent_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|id| !id.trim().is_empty());
     if matches!(
         args.event.as_str(),
         "post-tool-use" | "stop" | "pre-compact" | "session-end"
-    ) {
+    ) && !claude_subagent_event
+    {
         live_batch = compute_live_calls(
             agent_kind,
             &json,
@@ -3054,41 +3079,6 @@ impl GlobBudget {
     }
 }
 
-/// Where one event is delivered (#992).
-#[derive(Debug)]
-enum HookRoute {
-    /// No marker selects a server: the install-time `--server-url`, exactly
-    /// as before profiles existed.
-    InstallDefault,
-    /// The marker's profile resolved; its URL and token replace the install's.
-    Profile(ResolvedServer),
-    /// The marker selects a profile that did not resolve. Nothing is emitted.
-    Rejected {
-        /// The selected name, when it is a valid one (safe to print).
-        name: Option<ProfileName>,
-        reason: Rejection,
-    },
-}
-
-impl HookRoute {
-    fn profile_name(&self) -> Option<&ProfileName> {
-        match self {
-            Self::InstallDefault => None,
-            Self::Profile(resolved) => Some(&resolved.name),
-            Self::Rejected { name, .. } => name.as_ref(),
-        }
-    }
-
-    /// Label for `--check-capture`. Never a URL, path, or token.
-    fn resolution(&self) -> &'static str {
-        match self {
-            Self::InstallDefault => "install-default",
-            Self::Profile(_) => "marker",
-            Self::Rejected { reason, .. } => reason.as_str(),
-        }
-    }
-}
-
 /// Resolve the route for one event.
 ///
 /// The payload's cwd decides; when the payload carries none, the hook
@@ -3104,25 +3094,9 @@ fn resolve_hook_route(
     let cwd = policy_cwd
         .map(str::to_owned)
         .or_else(|| process_cwd().map(|dir| dir.to_string_lossy().into_owned()));
-    let Some(selection) = cwd
-        .as_deref()
-        .and_then(|cwd| crate::marker::find_server_selection(cwd, home.as_deref()))
-    else {
-        return HookRoute::InstallDefault;
-    };
-    let Some(raw_name) = selection.name else {
-        return HookRoute::Rejected {
-            name: None,
-            reason: Rejection::UnreadableMarker,
-        };
-    };
-    match server_profiles::resolve(data_dir, &raw_name, &selection.marker_dir, home.as_deref()) {
-        Ok(resolved) => HookRoute::Profile(resolved),
-        Err(reason) => HookRoute::Rejected {
-            name: ProfileName::parse(&raw_name),
-            reason,
-        },
-    }
+    cwd.as_deref().map_or(HookRoute::InstallDefault, |cwd| {
+        server_profiles::route_for_cwd(data_dir, cwd, home.as_deref())
+    })
 }
 
 /// Whether the live hook would deliver events from `destination` to the same
@@ -3426,6 +3400,52 @@ mod tests {
     #[test]
     fn compute_backfill_usage_claude_code_without_cwd_is_none() {
         assert!(compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None).is_none());
+    }
+
+    /// #2031: Claude Code subagent responses ride only on the main
+    /// conversation's events. `drop_subagent_captures` drops a subagent's own
+    /// event, and the responses it carried with it.
+    #[test]
+    fn live_calls_add_subagent_responses_only_to_main_conversation_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        let line = |id: &str| {
+            let value = serde_json::json!({
+                "type": "assistant",
+                "message": {"id": id, "usage": {"input_tokens": 1, "output_tokens": 2}}
+            });
+            format!("{value}\n")
+        };
+        std::fs::write(&transcript, line("main-1")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), line("sub-1")).unwrap();
+        let data_dir = tmp.path().join("data");
+        let path = transcript.to_str().unwrap();
+        let calls = |payload: serde_json::Value| {
+            compute_live_calls(
+                AgentKind::ClaudeCode,
+                &payload,
+                Some("session"),
+                &RuntimeEnv::default(),
+                None,
+                &data_dir,
+                "route",
+            )
+            .unwrap()
+            .calls
+            .into_iter()
+            .map(|call| call.call_id)
+            .collect::<Vec<_>>()
+        };
+
+        let subagent_event = serde_json::json!({"transcript_path": path, "agent_id": "a1"});
+        assert_eq!(calls(subagent_event), ["main-1"]);
+        let main_event = serde_json::json!({"transcript_path": path});
+        assert_eq!(calls(main_event), ["main-1", "sub-1"]);
+        // `claude --agent` sets `agent_type` on the main session's own events.
+        let agent_session = serde_json::json!({"transcript_path": path, "agent_type": "reviewer"});
+        assert_eq!(calls(agent_session), ["main-1", "sub-1"]);
     }
 
     #[test]

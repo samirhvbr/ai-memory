@@ -51,7 +51,7 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let resp: DeletePageResponseBody = post_json(
         &endpoint,
         "/admin/delete-page",
@@ -67,7 +67,8 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     let status = if resp.deleted { "✓ deleted" } else { "no-op" };
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-delete-page-under",
             &[
                 ("value0", status.to_string()),

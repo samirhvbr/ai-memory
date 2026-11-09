@@ -267,9 +267,12 @@ fn parse_profile(table: &dyn toml_edit::TableLike) -> Result<Profile> {
 /// slashes — rejected here rather than on every hook request.
 fn validate_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('/');
-    let parsed = reqwest::Url::parse(trimmed).with_context(|| format!("`{raw}` is not a URL"))?;
+    // A URL may carry `user:password@` userinfo; keep it out of the error text,
+    // which lands on stderr/stdout (GHSA-6pmr-q79m-87vp item 4).
+    let shown = crate::commands::render_shared::mask_url_userinfo(raw);
+    let parsed = reqwest::Url::parse(trimmed).with_context(|| format!("`{shown}` is not a URL"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
-        bail!("`{raw}` is not an http:// or https:// URL with a host");
+        bail!("`{shown}` is not an http:// or https:// URL with a host");
     }
     Ok(trimmed.to_owned())
 }
@@ -336,6 +339,65 @@ pub(crate) fn resolve(
         }
     }
     with_token(data_dir, name, profile)
+}
+
+/// Which server a checkout's events and commands go to (#992, #2016).
+#[derive(Debug)]
+pub(crate) enum Route {
+    /// No marker selects a server: the install's own server (the hook's
+    /// install-time `--server-url`, a command's config), exactly as before
+    /// profiles existed.
+    InstallDefault,
+    /// The marker's profile resolved; its URL and token replace the install's.
+    Profile(ResolvedServer),
+    /// The marker selects a profile that did not resolve. Nothing is sent.
+    Rejected {
+        /// The selected name, when it is a valid one (safe to print).
+        name: Option<ProfileName>,
+        reason: Rejection,
+    },
+}
+
+impl Route {
+    pub(crate) fn profile_name(&self) -> Option<&ProfileName> {
+        match self {
+            Self::InstallDefault => None,
+            Self::Profile(resolved) => Some(&resolved.name),
+            Self::Rejected { name, .. } => name.as_ref(),
+        }
+    }
+
+    /// Label for `--check-capture`. Never a URL, path, or token.
+    pub(crate) fn resolution(&self) -> &'static str {
+        match self {
+            Self::InstallDefault => "install-default",
+            Self::Profile(_) => "marker",
+            Self::Rejected { reason, .. } => reason.as_str(),
+        }
+    }
+}
+
+/// The route for work done in `cwd`: the nearest marker on the walk that
+/// declares `server` decides, through [`resolve`]. Hooks route each event
+/// with it and checkout-scoped commands their requests, so both reach the
+/// same server for the same directory.
+pub(crate) fn route_for_cwd(data_dir: &Path, cwd: &str, home: Option<&Path>) -> Route {
+    let Some(selection) = crate::marker::find_server_selection(cwd, home) else {
+        return Route::InstallDefault;
+    };
+    let Some(raw_name) = selection.name else {
+        return Route::Rejected {
+            name: None,
+            reason: Rejection::UnreadableMarker,
+        };
+    };
+    match resolve(data_dir, &raw_name, &selection.marker_dir, home) {
+        Ok(resolved) => Route::Profile(resolved),
+        Err(reason) => Route::Rejected {
+            name: ProfileName::parse(&raw_name),
+            reason,
+        },
+    }
 }
 
 /// A registered profile's URL and stored token, without the `roots` check.

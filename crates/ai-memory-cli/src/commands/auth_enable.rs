@@ -252,13 +252,21 @@ fn rewire_clients(config: &Config, locate: ConfigLocator<'_>) -> Vec<ClientWirin
         let Some(path) = locate(client) else {
             continue;
         };
+        // A client config that fails to parse echoes its offending line, which
+        // can hold the inline bearer; this reason is printed to stdout (exit 0),
+        // so redact the credential out of it (GHSA-6pmr-q79m-87vp item 3).
+        let manual = |e: anyhow::Error| {
+            Wiring::Manual(crate::commands::render_shared::redact_config_echo(
+                &format!("{e:#}"),
+            ))
+        };
         let wiring = match install_mcp::existing_entry_endpoint(client, &path, ENTRY_NAME) {
             Ok(None) => continue,
-            Err(e) => Wiring::Manual(format!("{e:#}")),
+            Err(e) => manual(e),
             Ok(Some(url)) if bare_endpoint(&url) != ours => Wiring::OtherServer(url),
             Ok(Some(url)) => match rewire(config, client, &path, &ours, pinned_flavor(&url)) {
                 Ok(()) => Wiring::Rewired,
-                Err(e) => Wiring::Manual(format!("{e:#}")),
+                Err(e) => manual(e),
             },
         };
         outcome.push(ClientWiring {
@@ -360,7 +368,7 @@ fn print_outcome(i18n: &ai_memory_core::i18n::Localizer, outcome: &EnableOutcome
                 println!("{}", i18n.format("cli-auth-enable-mcp-client-targets-url-another-server-left-unchanged", &[("value0", client.to_string()), ("value1", display_url(url))]));
             }
             Wiring::Manual(reason) => {
-                println!("{}", i18n.format("cli-auth-enable-mcp-client-needs-a-manual-change-reason", &[("value0", client.to_string()), ("value1", reason.to_string())]));
+                println!("{}", crate::localization::format(i18n, "cli-auth-enable-mcp-client-needs-a-manual-change-reason", &[("value0", client.to_string()), ("value1", reason.to_string())]));
             }
         }
     }

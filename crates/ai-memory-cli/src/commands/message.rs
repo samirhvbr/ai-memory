@@ -118,7 +118,8 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
             std::io::stdin().read_to_string(&mut buf).map_err(|e| {
                 anyhow::anyhow!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-message-reading-message-body-from-stdin-e",
                         &[("value0", format!("{}", e))]
                     )
@@ -128,7 +129,7 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
         }
     };
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let resp: SendMessageResponse = post_json(
         &endpoint,
         "/admin/messages/send",
@@ -152,7 +153,8 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
 
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-message-sent-message-from-from-workspace-from-project-to",
             &[
                 ("value0", super::show::terminal_text(&resp.message_id)),
@@ -170,7 +172,7 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let mailbox = if args.outbox { "outbox" } else { "inbox" };
 
     let response: ListMessagesResponse = get_json(
@@ -193,7 +195,8 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     if response.messages.is_empty() {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-message-no-pending-mailbox-messages-for-workspace-project",
                 &[
                     ("value0", mailbox.to_string()),
@@ -208,7 +211,8 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-message-pending-mailbox-messages-for-workspace-project-oldest-first",
             &[
                 ("value0", mailbox.to_string()),
@@ -267,7 +271,7 @@ async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
     super::refuse_empty_explicit(args.id.as_deref(), "--id")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
 
     let resp: PopMessageResponse = post_json(
         &endpoint,
@@ -289,7 +293,8 @@ async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
     let Some(message) = resp.message else {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-message-no-pending-messages-in-workspace-project-s-inbox",
                 &[
                     ("value0", workspace.to_string()),
@@ -340,7 +345,8 @@ fn render_popped(
     let _ = writeln!(
         out,
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-message-popped-message-for-workspace-project",
             &[
                 (
@@ -463,7 +469,7 @@ async fn cancel(config: &Config, args: MessageCancelArgs) -> Result<()> {
 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
 
     let resp: CancelMessagesResponse = post_json(
         &endpoint,

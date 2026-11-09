@@ -84,11 +84,14 @@ fn write_grants(
     writeln!(
         out,
         "{}",
-        i18n.diagnostic(&format!(
-            "{}  {}  LEVEL",
-            pad_cell("PROJECT", project_w),
-            pad_cell("USERNAME", user_w)
-        ))
+        crate::localization::diagnostic(
+            i18n,
+            format!(
+                "{}  {}  LEVEL",
+                pad_cell("PROJECT", project_w),
+                pad_cell("USERNAME", user_w)
+            )
+        )
     )?;
     for g in grants {
         let project = format!("{}/{}", g.workspace, g.project);
@@ -188,7 +191,8 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
     match (resp.changed, resp.previous) {
         (false, _) => println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-grant-who-already-holds-on-project-nothing-changed",
                 &[
                     ("value0", who.to_string()),
@@ -199,7 +203,8 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
         ),
         (true, Some(previous)) => println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-grant-who-previous-on-project",
                 &[
                     ("value0", who.to_string()),
@@ -211,7 +216,8 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
         ),
         (true, None) => println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-grant-who-now-holds-on-project",
                 &[
                     ("value0", who.to_string()),
@@ -260,7 +266,8 @@ pub async fn revoke(ep: &ServerEndpoint, args: &UserRevokeArgs) -> Result<()> {
     if resp.revoked {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-grant-no-longer-holds-anything-on-project",
                 &[
                     ("value0", args.user.to_string()),
@@ -271,7 +278,8 @@ pub async fn revoke(ep: &ServerEndpoint, args: &UserRevokeArgs) -> Result<()> {
     } else {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-grant-held-nothing-on-project-nothing-changed",
                 &[
                     ("value0", args.user.to_string()),

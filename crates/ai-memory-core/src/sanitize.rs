@@ -438,21 +438,39 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ),
     // Bearer-style tokens.
     (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
-    // Vendor-prefixed API keys.
-    (r"sk-[A-Za-z0-9_\-]{16,}", "api_key"),
+    // Vendor-prefixed API keys. A letter right before the prefix means it
+    // ends a word (`task-…`, `disk-…`), so that is the one place a match may
+    // not start; only the `secret` group is redacted. A plain `\b` would also
+    // skip a key glued to `_`, a digit, a CJK character or a percent escape
+    // (`?key%3Dsk-…`), all of which a real key can follow.
+    (
+        r"(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})(?P<secret>sk-[A-Za-z0-9_\-]{16,})",
+        "api_key",
+    ),
     // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
     // full-access, but the scope is operator-chosen and routinely includes
-    // charges/refunds — not meaningfully safer than `sk_live_`.
-    (r"(?:sk|rk)_live_[A-Za-z0-9_\-]{16,}", "stripe_key"),
+    // charges/refunds — not meaningfully safer than `sk_live_`. Anchored like
+    // `api_key` above, so `task_live_…` and `network_live_…` stay intact.
+    (
+        r"(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})(?P<secret>(?:sk|rk)_live_[A-Za-z0-9_\-]{16,})",
+        "stripe_key",
+    ),
     // Every GitHub token prefix, not only personal-access: `gho_` (OAuth —
     // what `gh auth login` stores on disk), `ghu_` (user-to-server),
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
-    // ai-memory's own DB-user API keys (`aim_`) and web-session secrets
-    // (`ams_`): the prefix plus 43 base64url characters. The 40-character
-    // floor keeps snake_case identifiers that start with `aim_` intact.
-    (r"\b(?:aim|ams)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
+    // ai-memory's own keys: native DB-user (`aim_`), web-session (`ams_`), and
+    // external mcp-auth (`amk_`). Each is the prefix plus a 256-bit base64url
+    // secret (43 characters); the 40-character floor keeps snake_case
+    // identifiers that start with one of the prefixes intact. Deliberately
+    // left-unanchored: `strip_control` runs before matching and can glue a
+    // word, or the visible tail of a removed ANSI sequence (`…[32m`), straight
+    // onto the prefix, where a `\b` or non-letter anchor would then miss the
+    // key. The distinctive prefix plus a 40-character base64url tail makes a
+    // false positive on real text negligible — unlike the AWS rule below,
+    // whose `AKIA`/`ASIA` prefix is ordinary uppercase text.
+    (r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
     // Anchored to the exact published format — a 4-character prefix plus
@@ -463,7 +481,18 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // BEFORE storage and is irreversible: the observation loses the text with
     // no error and no way to recover it. The word boundaries keep a real key
     // from being missed when it sits inside punctuation.
-    (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "aws_key"),
+    //
+    // The left anchor also accepts a percent-encoded byte (`?key=%20AKIA…`),
+    // like the `sk-`/Stripe rules, so a key glued to an escape survives the
+    // strip. A letter removed from directly before the prefix (a stripped
+    // control character between two words) is still not matched: redacting
+    // `AKIA` mid-word is the irreversible uppercase-text destruction the floor
+    // above guards against, so that one case is left to the own-prefix rule's
+    // distinctive tail, which `AKIA` lacks.
+    (
+        r"(?:\b|%[0-9A-Fa-f]{2})(?P<secret>(?:AKIA|ASIA)[0-9A-Z]{16})\b",
+        "aws_key",
+    ),
     // Naked Google / Gemini API keys (legacy standard-key shape).
     (r"AIza[A-Za-z0-9_\-]{30,}", "google_api_key"),
     // Gemini authorization ("auth") keys. AI Studio has issued these instead
@@ -1116,6 +1145,57 @@ mod tests {
         let out = s().scrub("key=sk-or-v1-deadbeefcafebabe1234567890abcdef");
         assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("deadbeef"));
+    }
+
+    #[test]
+    fn keeps_identifiers_that_merely_contain_a_sk_fragment() {
+        for keep in [
+            "procedures/triage-llama-server-connection-canceled-log-pair-task-release-lines-and-correlate-client-clock.md",
+            "branch bible-qa-web@task-19-query-expansion",
+            "_rules/organize-dotfiles-docs-by-task-and-strip-trivial-prose.md",
+            "background-task-indexing-after-return",
+            "storage-on-disk-reclaimable-pct",
+            "task_live_progress_tracking_handler",
+            "network_live_streaming_dashboard",
+        ] {
+            let scrubbed = s().scrub(keep);
+            assert_eq!(scrubbed, keep, "{keep}");
+        }
+    }
+
+    #[test]
+    fn redacts_a_vendor_key_in_a_delimited_context() {
+        for key in [
+            "key=sk-or-v1-deadbeefcafebabe1234567890abcdef",
+            r#"{"stdout":"sk-FAKEfake0123456789abcdef"}"#,
+            "sk-abcdefghijklmnopqrstuvwxyz at line start",
+            "foo_sk-abcdefghijklmnopqrstuvwxyz",
+            "日本sk-abcdefghijklmnopqrstuvwxyz",
+            "https://x.test/?api_key%3Dsk-abcdefghijklmnopqrstuvwxyz",
+            "Authorization:%20sk-abcdefghijklmnopqrstuvwxyz",
+            "9sk-abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let scrubbed = s().scrub(key);
+            assert!(scrubbed.contains("[REDACTED:api_key]"), "{scrubbed}");
+            assert!(!scrubbed.contains("abcdefghijklmnop"), "{scrubbed}");
+        }
+        // Only the key is redacted; the character before it stays.
+        assert_eq!(
+            s().scrub("key=x sk-abcdefghijklmnopqrstuvwxyz"),
+            "key=x [REDACTED:api_key]"
+        );
+        assert_eq!(
+            s().scrub("?k%3Dsk-abcdefghijklmnopqrstuvwxyz"),
+            "?k%3D[REDACTED:api_key]"
+        );
+        for key in [
+            "stripe=rk_live_FAKEfakeFAKE1234",
+            "my_sk_live_FAKEfakeFAKE1234",
+            "?k%3Dsk_live_FAKEfakeFAKE1234",
+        ] {
+            let scrubbed = s().scrub(key);
+            assert!(scrubbed.contains("[REDACTED:stripe_key]"), "{scrubbed}");
+        }
     }
 
     #[test]
@@ -2453,6 +2533,46 @@ mod tests {
             "ams_ and aim_ are the key prefixes",
         ] {
             assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
+        }
+    }
+
+    /// `strip_control` runs before matching, so a word glued onto a key by a
+    /// stripped character used to leave the key whole: the `aim_`/`ams_` rule
+    /// and the AWS rule both required a left word boundary that the removal
+    /// had just destroyed, and `amk_` had no rule at all (GHSA-6pmr-q79m-87vp,
+    /// item 5). The own-prefix rule is now left-unanchored; the AWS rule
+    /// additionally accepts a percent-encoded byte.
+    #[test]
+    fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
+        let s = s();
+        let tail = "FAKEfake0123-_xy".repeat(3); // 48 base64url chars, > the 40 floor
+        for prefix in ["aim_", "ams_", "amk_"] {
+            let key = format!("{prefix}{tail}");
+            for glued in [
+                format!("title\u{7}{key}"),      // a removed BEL
+                format!("title\u{1b}[32m{key}"), // a removed ANSI colour code
+                format!("word%20{key}"),         // a percent-encoded byte
+                format!("prefixword{key}"),      // a letter directly before it
+            ] {
+                let out = s.scrub(&glued);
+                assert!(
+                    out.contains("[REDACTED:ai_memory_key]") && !out.contains(&tail),
+                    "glued key must be redacted: {glued:?} -> {out:?}"
+                );
+            }
+        }
+        // AWS: the percent-encoded byte is newly covered; a boundary case still
+        // works. (A letter removed from directly before `AKIA` stays unmatched
+        // on purpose — redacting it mid-word would destroy uppercase text.)
+        for aws in [
+            "url?k=%20AKIAFAKEFAKEFAKEFAKE",
+            "set AKIAFAKEFAKEFAKEFAKE here",
+        ] {
+            let out = s.scrub(aws);
+            assert!(
+                out.contains("[REDACTED:aws_key]") && !out.contains("FAKEFAKE"),
+                "AWS key must be redacted: {aws:?} -> {out:?}"
+            );
         }
     }
 }

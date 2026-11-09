@@ -25,7 +25,7 @@ use crate::http_client::{ServerEndpoint, get_json, post_json};
 /// Transport failures, a non-root token on a multi-user server, or an entry
 /// that does not exist.
 pub async fn run(config: &Config, args: ProfileArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let ep = ServerEndpoint::for_checkout(config).await?;
     match args.command {
         ProfileCommand::Status(scope) => status(&ep, &scope).await,
         ProfileCommand::List(scope) => list(&ep, &scope).await,
@@ -600,12 +600,22 @@ async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) ->
         .context(i18n.text("cli-profile-reading-the-profile-entries-for-this-project"))?;
     if !resp.consume {
         bail!(
-            "{}", i18n.format("cli-profile-workspace-project-sets-profile-consume-false-so-it-does-not-take-the-profile", &[("value0", workspace.to_string()), ("value1", project.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-profile-workspace-project-sets-profile-consume-false-so-it-does-not-take-the-profile",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string())
+                ]
+            )
+        );
     }
     if resp.lines.is_empty() {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-profile-no-profile-entries-apply-to-workspace-project-nothing-written",
                 &[
                     ("value0", workspace.to_string()),

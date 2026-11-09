@@ -167,18 +167,43 @@ fn secret_patterns() -> &'static [RedactionRule] {
                 .unwrap(),
                 replacement: "[REDACTED PRIVATE KEY]${end}",
             },
+            // GitHub tokens: left-unanchored like the server's rule, so a
+            // token glued onto a word by a stripped control character (a
+            // removed BEL, `…\x07ghp_…`) is still matched.
             RedactionRule {
                 regex: Regex::new(
-                    r"\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16})\b",
+                    r"(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})",
                 )
                 .unwrap(),
                 replacement: "[REDACTED CREDENTIAL]",
             },
-            // ai-memory's own `aim_` keys and `ams_` session secrets. Outside
-            // the `\b…\b` rule above: base64url can end in `-`, where a
-            // closing `\b` would leave the last character behind.
+            // AWS access-key IDs, anchored like the server's `aws_key` rule:
+            // a boundary or a percent-encoded byte before the exact 20-char
+            // shape. A letter removed from directly before `AKIA` stays
+            // unmatched on purpose — redacting `AKIA` mid-word would destroy
+            // ordinary uppercase text irreversibly.
             RedactionRule {
-                regex: Regex::new(r"\b(?:aim|ams)_[A-Za-z0-9_-]{40,}").unwrap(),
+                regex: Regex::new(r"(?P<pre>\b|%[0-9A-Fa-f]{2})(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+                    .unwrap(),
+                replacement: "${pre}[REDACTED CREDENTIAL]",
+            },
+            // Vendor `sk-` keys, anchored like the server's `api_key` rule: a
+            // letter right before the prefix means it ends a word (`task-…`),
+            // so only that may not start a match. A `\b` would also skip a key
+            // glued to `_`, a digit, a CJK character or a percent escape.
+            RedactionRule {
+                regex: Regex::new(r"(?P<pre>^|[^A-Za-z]|%[0-9A-Fa-f]{2})sk-[A-Za-z0-9_-]{16,}")
+                    .unwrap(),
+                replacement: "${pre}[REDACTED CREDENTIAL]",
+            },
+            // ai-memory's own keys: native `aim_`, web-session `ams_`, and
+            // external mcp-auth `amk_`. Left-unanchored, like the server's
+            // `ai_memory_key` rule: a 256-bit base64url tail after the prefix
+            // makes a false positive negligible, so matching the prefix even
+            // when a stripped control character or the visible tail of an ANSI
+            // sequence glues a word onto it is safe and necessary.
+            RedactionRule {
+                regex: Regex::new(r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}").unwrap(),
                 replacement: "[REDACTED CREDENTIAL]",
             },
             RedactionRule {

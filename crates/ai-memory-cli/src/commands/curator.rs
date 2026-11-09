@@ -42,7 +42,7 @@ pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
         );
     }
     let dry_run = args.dry_run || !args.stage;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let request = CuratorRequest {
@@ -95,7 +95,8 @@ fn print_human_report(
 ) {
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-curator-curator-dry-run-for-project",
             &[("value0", project.to_string())]
         )

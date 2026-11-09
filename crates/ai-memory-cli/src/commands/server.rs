@@ -8,6 +8,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::render_shared::mask_url_userinfo;
+use super::show::terminal_text;
 use crate::cli::{ServerAddArgs, ServerArgs, ServerCommand, ServerListArgs, ServerRemoveArgs};
 use crate::config::Config;
 use crate::server_profiles::{self, ProfileName};
@@ -99,15 +101,18 @@ fn add(
     writeln!(
         out,
         "{}",
-        i18n.diagnostic(&format!("Registered server profile `{name}`."))
+        crate::localization::diagnostic(i18n, format!("Registered server profile `{name}`."))
     )?;
     if outcome.roots_kept {
         writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!(
-                "Kept the roots already registered for `{name}`; pass --root to replace them."
-            ))
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "Kept the roots already registered for `{name}`; pass --root to replace them."
+                )
+            )
         )?;
     }
     if outcome.token_discarded {
@@ -123,10 +128,13 @@ fn add(
         writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!(
-                "No token is stored for `{name}`: repositories selecting it drop their capture \
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "No token is stored for `{name}`: repositories selecting it drop their capture \
              until one is added with `ai-memory server add {name} --url … --auth-token-stdin`."
-            ))
+                )
+            )
         )?;
     }
     let registry = server_profiles::load(data_dir)?;
@@ -140,11 +148,14 @@ fn add(
         writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!(
-                "Several profiles are registered, so a profile without --root is refused. \
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "Several profiles are registered, so a profile without --root is refused. \
              Add roots to: {}",
-                unrooted.join(", ")
-            ))
+                    unrooted.join(", ")
+                )
+            )
         )?;
     }
     Ok(())
@@ -164,7 +175,9 @@ fn list(
             .map(|(name, profile)| {
                 serde_json::json!({
                     "name": name.as_str(),
-                    "url": profile.url,
+                    // A profile URL may carry `user:password@` userinfo; never
+                    // print the credential (GHSA-6pmr-q79m-87vp item 4).
+                    "url": mask_url_userinfo(&profile.url),
                     "roots": profile.roots,
                     "token": token_state(data_dir, name),
                 })
@@ -187,9 +200,11 @@ fn list(
             out,
             "{}",
             i18n.diagnostic(&format!(
-                "{name}\n  url:   {}\n  roots: {roots}\n  token: {}",
-                profile.url,
-                token_state(data_dir, name)
+                "{}\n  url:   {}\n  roots: {}\n  token: {}",
+                terminal_text(name.as_str()),
+                terminal_text(&mask_url_userinfo(&profile.url)),
+                terminal_text(&roots),
+                terminal_text(token_state(data_dir, name))
             ))
         )?;
     }
@@ -215,13 +230,13 @@ fn remove(
         writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!("Removed server profile `{name}`."))
+            crate::localization::diagnostic(i18n, format!("Removed server profile `{name}`."))
         )?;
     } else {
         writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!("No server profile named `{name}`."))
+            crate::localization::diagnostic(i18n, format!("No server profile named `{name}`."))
         )?;
     }
     Ok(())
@@ -303,6 +318,52 @@ mod tests {
             assert!(listed.contains("stored"), "{listed}");
             assert!(listed.contains("missing"), "{listed}");
         }
+    }
+
+    /// GHSA-6pmr item 4: a profile URL may carry `user:password@` userinfo; it
+    /// is stored but never printed — not in the listing of a valid URL, and not
+    /// echoed back in a validation error.
+    #[test]
+    fn url_userinfo_is_never_printed_in_a_listing_or_a_validation_error() {
+        let dd = tempfile::tempdir().unwrap();
+        let root = dd.path().join("b").to_string_lossy().into_owned();
+        add_ok(
+            dd.path(),
+            add_args(
+                "team-b",
+                "https://alice:s3cr3tpassword@b.example",
+                &[&root],
+                None,
+            ),
+            None,
+        );
+        for json in [false, true] {
+            let listed = output(|out| {
+                list(
+                    &ai_memory_core::i18n::Localizer::default(),
+                    dd.path(),
+                    &ServerListArgs { json },
+                    out,
+                )
+            });
+            assert!(!listed.contains("s3cr3tpassword"), "json={json}: {listed}");
+            assert!(
+                listed.contains("[REDACTED]@b.example"),
+                "json={json}: {listed}"
+            );
+        }
+        // A rejected URL (wrong scheme) does not echo the userinfo back.
+        let mut out = Vec::new();
+        let err = add(
+            &ai_memory_core::i18n::Localizer::default(),
+            dd.path(),
+            add_args("bad", "ftp://alice:s3cr3tpassword@host", &[], None),
+            None,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("s3cr3tpassword"), "{err}");
+        assert!(err.to_string().contains("[REDACTED]@host"), "{err}");
     }
 
     #[test]

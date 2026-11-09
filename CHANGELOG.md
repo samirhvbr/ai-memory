@@ -11,6 +11,409 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.4] - 2026-11-08
+
+### Security
+
+- `ai-memory upgrade` (and any managed launch that refreshes the native host
+  client) now fails closed when the downloaded release archive does not match
+  its published checksum, instead of installing the unverified binary. The
+  `sha256sum -c` verification ran in a shell context where bash disables
+  errexit, so a mismatch fell through to the install. (GHSA-f43g-26gw-x9pw)
+- The previous-session history that `ai-memory run` hands the next harness on a
+  switch is now filtered through the checkout's `[capture] ignore_paths` and the
+  sanitizer, the same two filters every other path into memory uses. A file an
+  operator kept out of ai-memory, or a credential in a tool result, no longer
+  reaches the next agent through this dossier. (GHSA-h8wj-74hc-vjjp)
+- The capture sanitizer stripped control characters and terminal escapes before
+  matching, which could remove the word boundary an `aim_`/`ams_` key or an AWS
+  access-key id was matched against, so a key glued onto a word by a stripped
+  character was stored whole; the external `amk_` prefix had no rule at all.
+  The three ai-memory prefixes are now matched without a left boundary (their
+  distinctive 256-bit tail makes a false positive negligible) and `amk_` is
+  covered; the AWS rule also accepts a percent-encoded byte before the key. The
+  same fix lands in the `ai-memory-client` capture scrubber. Text already stored
+  is not rewritten, so a credential that was actually captured should be rotated
+  and the affected observations purged. (GHSA-6pmr-q79m-87vp)
+- The CLI no longer echoes a live bearer token or a URL's embedded credential
+  back to the terminal. `install-mcp`, `install-hooks` and `setup-agent` masked
+  nothing when they printed a ready-to-paste config snippet (no `--apply`), so
+  an inline `--auth-token` was shown verbatim; the Hermes and connection-pool
+  blocks printed the token even on `--apply`. The token is now masked to a
+  four-character prefix plus `[REDACTED]` on every printed path, while `--apply`
+  still writes the real key to the config file. A server-profile URL that
+  carries `user:pass@` is masked to `[REDACTED]@host` in `server list` and in
+  the validation error, and a config-parse failure report (`failure_report`,
+  `auth enable`'s manual-wiring fallback) redacts any `token`/`password`/`secret`
+  assignment or URL userinfo it echoes back. (GHSA-6pmr-q79m-87vp)
+- `ai-memory restore` no longer leaves the restored data group- or
+  world-readable on Unix. The tarball is extracted with the archive's
+  permission bits dropped, so under a normal umask the restored `db/` (the
+  SQLite database holding API-key hashes and session text) and `config.toml`
+  (the token pepper and provider credentials) landed at `0755`/`0644`. The
+  restore now creates its roots and staging directories owner-only, locks the
+  staged `wiki/` and `db/` roots and the two secret files down to the owner
+  before swapping them into place, and leaves an existing, possibly shared,
+  data dir's own permissions untouched. (GHSA-mhmf-rmgx-j388)
+- A session that crossed repositories mid-flight no longer leaks one project's
+  observations into another project's consolidated page. A session can hold
+  observations in more than one `(workspace, project)`; the bounded SessionEnd
+  reader gated on the scope but its snapshot queries then read every row of the
+  session id, so consolidating into project A could publish project B's
+  prompts, tool names and bodies into A's page. Every snapshot query now filters
+  by the bound scope, and `memory_consolidate` resolves and authorizes the write
+  target once, then binds the consolidation to exactly that scope
+  (`consolidate_session_in_scope`) instead of re-resolving it, which closes the
+  window in which a concurrent cross-project observation could move the write
+  after the grant check. (GHSA-xfgc-hc4c-wj7h)
+- A shared browser profile can no longer show one user another user's
+  restricted `/api/v1` data. Every `/api/v1` read is grant-filtered (#708), but
+  the workspace and project lists, the dependency graph, a project's page list,
+  its recent pages and a single page read were still sent `Cache-Control:
+  private, max-age=N`, so a browser could answer a later viewer from the first
+  viewer's cached copy without the server running the second viewer's grant
+  check. The list, graph and recent reads now use `private, no-store`, and the
+  single-page read `private, no-cache` with its `ETag` so `authorize_read` runs
+  on every revalidation. The server-rendered `/web` UI was not affected.
+  (GHSA-462j-m6hw-9gpf)
+- The macOS menu bar app no longer sends its saved bearer token to a server it
+  was not saved for. The Keychain held one token with no record of its server,
+  so changing the URL in Settings sent it to the new host, and with nothing
+  saved the data dir's root bearer (`auth-tokens/default`) went to whatever URL
+  was configured, including a remote one. Settings also applied the URL field
+  400 ms after each typing pause, so a half-typed address briefly became the
+  server receiving the token. A saved token is now bound to the server origin
+  it was saved for and sent only there; the data dir's root token is sent only
+  to a loopback server; and the URL applies on Return or when the window closes,
+  not while typing. An existing saved token keeps working with the server it was
+  already configured for. (GHSA-fqfw-62f9-3jhw)
+
+### Fixed
+
+- Approving an auto-improvement proposal that conflicts with a newer version of
+  its page no longer notifies non-blocking observer webhooks. The approval rolls
+  the file back and records nothing, but the observers were still sent the
+  proposal's content as if it had been written, so a mirror could copy a page
+  that never landed. Observers are now notified only when the approval writes
+  the page, as `docs/admission-webhooks.md` already described. (#2068)
+- Deleting a page no longer races a concurrent write to the same path. A plain
+  delete (`memory_delete_page`, `ai-memory delete-page`, lint cleanup) took only
+  the shared wiki lock, not the per-page lock that writes, restores and
+  reindexes hold from the file rename to the index update. A delete landing in
+  between could remove the file of a version the write had just recorded, or
+  tombstone the page while the new file stayed on disk and came back on the next
+  reindex. A delete now waits for that page's lock; other pages are not held up.
+  (#2067)
+- `install-hooks --agent cursor` now writes a `~/.cursor/hooks.json` Cursor can
+  load. Cursor strips `//` (and `/* */`) comments before parsing, with a regex
+  that ignores JSON string boundaries, so the `//` in the `https://`/`http://`
+  server URL truncated the line, parsing failed, and Cursor silently dropped the
+  whole file — no Cursor session was captured. Forward slashes are now escaped as
+  `\/`, which is valid JSON that survives the comment strip and decodes
+  unchanged (#2069).
+- Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative (#2052).
+- Corrected the 2.6.6 note that frontmatter reads exactly as before the
+  switch to `serde-saphyr`. A few YAML 1.1 shapes read otherwise, and a page
+  using one stopped indexing at that upgrade, with only a
+  `reconcile reindex failed` warning in the server log:
+  - a `#` glued to a closing quote or a block indicator
+    (`title: 'x'# note`, `>#x`) is refused; put a space before the `#`;
+  - U+2028 as a line break is refused; use a real line break;
+  - inside a value, U+0085 and U+2028 are now plain characters: a quoted
+    `x<U+0085>y` is no longer folded to `x y`, and the indentation after a
+    U+2028 in a block scalar is kept.
+
+  Tests now pin these readings. (#2040)
+- Fixed XLSX imports that appended pronunciation hints to shared and inline
+  cell values. Imported cells now keep their base text (#2048).
+- The legacy JSON recent-pages endpoint now orders and limits results in
+  SQLite using the project's existing recency index. Requests for a short
+  list no longer load and sort the whole project (#2051).
+- `ai-memory backup-agents` now also collects GitHub Copilot CLI skills, from
+  `$COPILOT_HOME/skills` (default `~/.copilot/skills`) and the repository's
+  `.github/skills`, the roots `install-skills --agent copilot-cli` writes, so
+  `restore-agents` puts them back in the same places and no longer loses them.
+  It follows `COPILOT_HOME` on the restoring machine and accepts no other
+  Copilot or `.github` destination (#2037).
+- A Claude Code subagent's tool event no longer reads the main conversation's
+  token usage. It read the main session's transcript, took the response that
+  started the subagent and moved the transcript cursor past it. With
+  `drop_subagent_captures = true` the router then dropped the event, so that
+  response never reached the token-usage ledger. The main conversation's
+  next event now reports it (#2034).
+- A Claude Code session's token usage now includes its subagents. Claude
+  Code writes each subagent's turns to its own transcript,
+  `<session>/subagents/agent-<id>.jsonl`, and the native hook read only the
+  session's transcript, so the Token usage ledger and the session totals
+  missed every subagent response. The hook now also reads those transcripts,
+  with a cursor for each, on the main conversation's events and within the
+  256 responses the server takes from one event. The session-end total and
+  the close of an abandoned session add them too, and the session keeps the
+  main conversation's model (#2031).
+- Generated TypeScript hooks now leave native OIDC spool entries queued for
+  `ai-memory hook-drain` to deliver with the right credentials. Their drain
+  previously posted those entries without a bearer and removed them after
+  a 401 from the gateway (#2050).
+- Honored Kiro's explicit `--v2` selector when a managed workstream last used
+  v3, so ai-memory no longer adds a conflicting `--v3` flag (#2049).
+- `purge-project` and `purge-session` without `--confirm` now ask for their
+  dry-run preview on the server the confirmed purge will use. In a checkout
+  whose `.ai-memory.toml` selects a server profile, the preview went to the
+  install's own server with the config bearer, so it could show another
+  server's counts, or none, for a purge that `--confirm` then ran on the
+  profile's server. A profile that does not resolve now fails the preview
+  closed with the hook's reason, as it already failed the confirmed purge
+  (#2056).
+- Fixed managed launches using the ambient directory's server instead of the
+  selected checkout's profile for workstreams, local state and transcripts,
+  including jail preflight and project-split repair. `resume` and `continue`
+  refuse a saved link whose checkout now selects another server (#2029).
+- Fixed ignored hook session-end events binding an agent in the mismatch
+  cache when the session does not exist. A later valid start can establish
+  the session under its real agent; persisted mismatches still fail closed
+  (#2029).
+- The workspace and project names a repository's `.ai-memory.toml` declares
+  no longer reach the terminal with their control characters. The scope note
+  every marker-scoped command prints, the workspace-only note, and 34 more CLI
+  lines that quote a workspace or project name (from the marker, a flag or the
+  server) printed them as written, so a cloned repository could retitle the
+  terminal or reorder a line with an OSC sequence or a bidi control. They now
+  go through the same neutralizing helper as the lines around `ai-memory run`,
+  and so do the folder paths in the "Next time" line a jailed run prints when
+  it quits (#2058).
+- DSH hooks no longer fail to fire on Windows. `install-hooks` and
+  `setup --agent dsh` wrote the bridge's `configPath` with a `\\?\` verbatim
+  prefix, which the Node plugin's `fs.readFileSync` resolves as a relative
+  path and fails to load, so no hooks registered. The generated `configPath`
+  is now a plain drive path (#2032).
+- Fixed a race in the TypeScript SDK where a tool call waiting on an
+  `initialize` response could re-adopt a session that a concurrent
+  `capabilities({ refresh: true })` had already superseded, routing later
+  calls to the retired session (HTTP 404). A superseded handshake no longer
+  overwrites the live session or sends its handshake notification (#2047).
+- Profile harvest no longer promotes a Claude desktop app sub-session's
+  agent-written brief as one of the user's habits. Its fixed shared-notes
+  footer, which ends in a `side-session-notes/` path, now marks the whole
+  first prompt as agent-written, so neither the brief nor its local
+  filesystem path reaches the profile or an evidence quote (#2041).
+- Grok backfill no longer drops a later byte-identical transcript record. Two
+  identical JSONL lines hashed to one record id, so the second reached ingest
+  under the first's key and was deduplicated away. Repeated records now carry
+  a deterministic occurrence suffix that agrees between a full backfill and an
+  incremental cursor replay, while every unique record keeps its
+  rewrite-stable id (#2053).
+- `merge_project` now preserves all recovery and session attributes on migrated
+  `ingest_keys` rows (`session_id`, `agent_kind`, `observation_kind`,
+  `event_identity`, and `recovery_retained`). Previously, only the original
+  four columns from schema V33 were copied, clearing those five fields to `NULL`
+  or `0` on the target project, causing premature TTL deletion of recovery keys
+  and false `StoreError::SessionCollision` errors on replay (#2061).
+- The Windows installer (`install.ps1`) no longer deletes an existing
+  destination. It refuses an existing directory, file or link before
+  downloading, copies the release into a new sibling staging directory and
+  publishes it only while the destination is still absent; a failed copy or
+  publication leaves the destination untouched and names the staging
+  directory to inspect (#2060).
+
+## [3.4.3] - 2026-11-06
+
+### Changed
+
+- `ai-memory run --yolo` is now the only yolo switch. For Claude it also
+  forces `bypassPermissions` over a `defaultMode` in your settings, which
+  used to need `--true-yolo`; other harnesses are unchanged. `--true-yolo`
+  still works as a hidden alias of `--yolo` (on `run`, `show`, `continue` and
+  `resume`) and prints a one-line note in a terminal. The `claude_true_yolo`
+  config key and `AI_MEMORY_CLAUDE_TRUE_YOLO` still load but are ignored;
+  `ai-memory run` asks you to remove them. The line printed after a jailed
+  run now repeats the launch with `--yolo`. Claude's own `ask` rules still
+  pause the run, and the `--yolo` warning and ai-jail offer are unchanged
+  (maintainer request).
+
+### Fixed
+
+- The abandoned-session sweep no longer queues an auto-improvement review for
+  every session it closes. Closing a session stamps `ended_at`, which made it a
+  scheduled review candidate, so the first sweep after an upgrade could queue
+  every long-idle session at once. The sweep now parks a claim for each session
+  it closes, in the same transaction. A real `SessionEnd` with new observations,
+  or a handoff that reopens the session, removes the claim. The experience pass
+  no longer counts these sessions, and manual `ai-memory auto-improve
+  --session-id` still reviews them (#2026).
+
+- The built-in `api_key` sanitizer rule no longer starts inside an ordinary
+  word. Because nothing anchored its left side, `sk-` matched inside
+  identifiers such as `task-release-…`, `disk-usage-…` and
+  `background-task-…`, and the captured text or wiki page kept
+  `ta[REDACTED:api_key]` instead of the word. That corruption is
+  irreversible, and it turned page paths, branch names and cross-references
+  into dead links. A match no longer starts right after an ASCII letter, so
+  a key after punctuation, a space, a digit, `_`, a CJK character or a
+  percent escape (`%3D`) is still redacted. The Stripe `sk_live_`/`rk_live_`
+  rule had the same flaw (`task_live_…`, `network_live_…`) and is anchored
+  the same way. The scrub shared by the relay and importer companions now
+  uses the same anchor, so it also redacts a key glued to `_`, a digit, a
+  CJK character or a percent escape (#2025).
+
+- `ai-memory mcp-bridge`, the stdio entry most clients use on a token-file
+  install, now includes `resultType: "complete"` in the `tools/list` and
+  `tools/call` results it forwards to a client on MCP revision 2026-07-28.
+  That revision requires the field, and a strict client such as
+  `@modelcontextprotocol/client` 2.2 rejected the tool list and reconnected
+  forever with no tools. Clients on an older revision still receive results
+  without it, and the direct HTTP endpoint already sent it (#2022).
+
+- The project page's tabs work again when the web UI is shown in a language
+  other than English. Their script looked up the tab bar by its English
+  accessible name, so a Portuguese page left every tab panel hidden. The
+  script now finds the tab bar by a fixed attribute, and a test rejects any
+  web UI script that selects elements by translated text (#2024).
+
+- A hook event whose session was first captured under another agent label is
+  no longer accepted with `202` and then dropped without a trace on every
+  delivery. The server logs the drop once per session, naming the agent that
+  holds the session, and answers that caller's later `POST /hook` events for
+  the session with `409` and `{"error":"agent_mismatch","bound_agent":"…"}`,
+  so a client can tell what happened. Only the session's own operator learns
+  the bound agent; another operator's events for the same id get the same
+  opaque drop as before. Every first-party hook client treats the 409 as
+  final, and the native client no longer spends retry attempts on it. Drops
+  still count under `dropped_collision` in `ai-memory status` (#2023).
+
+- A handoff begun with `memory_handoff_begin` from a client that forwards its
+  hook session id (the session-aware bridge, OpenCode 2) now records that
+  session, its harness and its cwd, as `memory_message_send` already did,
+  instead of `from_agent: "other"` and no session. The id counts only for a
+  session the server recorded in the handoff's project for the same operator.
+  The handoff stays a manual one (migration V101 adds a `manual` flag), so it is
+  still delivered ahead of automatic batons and never swept with them.
+  `memory_handoff_accept` now returns the row after the claim (`state:
+  "accepted"`, `accepted_at`, `accepted_by`) rather than the open row it read
+  before claiming it (#2014).
+
+- A session that ends, or finishes a turn checkpoint, while its own
+  `memory_handoff_begin` handoff is still open no longer leaves an automatic
+  template handoff beside it, and writing the explicit handoff expires that
+  session's earlier automatic one, so no stale pending handoff is left behind.
+  The startup handoff block now names the source session's
+  `sessions/<id>.md` page, where opt-in SessionEnd LLM consolidation writes the
+  session's open items after the template handoff was created (#2012).
+
+- `ai-memory upgrade` no longer rewrites the OpenCode 1 plugin after OpenCode
+  itself moved to 2.x. It probes the installed OpenCode first, so on 2.x it
+  writes `ai-memory-opencode2.ts` and removes the old `ai-memory.ts` that
+  OpenCode 2 refuses to load ("Plugin must export a default definition with an
+  id and an effect or setup function") (#1887).
+
+- After `/resume` or `/clear` in Claude Code, unscoped `memory_*` calls
+  through the session-aware `mcp-bridge` no longer fall back to
+  `default/scratch` (reads) or refuse with "the active-project pointer does
+  not match this caller" (writes). The bridge keeps its launch-time session
+  id, so its pointer lookup missed. It now sends its launch directory's
+  project in two headers, and the server uses that project only when the
+  session's own pointer does not resolve. A pointer the hooks published still
+  wins, the project is authorized like an explicit scope, and a directory
+  that resolves to no project keeps the old behaviour (#2005).
+
+- Commands that work on the checkout they run in (`run`, `resume`,
+  `continue`, `workstreams`, `doctor`, `search`, `read-page`, `write-page`,
+  `handoffs`, `message` and the other project-scoped commands) now reach the
+  server that the nearest `.ai-memory.toml` selects with `server = "<name>"`,
+  with that profile's stored token, the same way hooks route capture. Before,
+  they used the configured server and fell back to `127.0.0.1`. A profile
+  that does not resolve fails the command with the hook's reason instead of
+  falling back. Roots are matched against the directory as the shell names it
+  (`PWD`, when it is the same directory), as the hooks match the harness's
+  cwd, so a checkout under a symlink or macOS's `/var` routes the same for
+  both. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
+  profile-routed checkout because the jailed run cannot read the profile's
+  token (#2016).
+
+- A section that `memory_patch_page` adds now gets a blank line before and
+  after its heading, so the page no longer reads as one run-on block and
+  passes Markdown linters (MD022). The docs now say that an `end_of_page`
+  append means the end of the page that was read, so it lands before a
+  section the same batch adds (#2015).
+
+- `ai-memory run --jail` no longer shows two access checklists with ai-jail
+  3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
+  flags such as `--jail-map` no longer hide it, and ai-jail's own review is
+  the only one. What the session needs is passed as grants that ai-jail
+  applies without a prompt: the harness's login state, the `AI_MEMORY_*`
+  variables, and only that harness's own API key, so a Claude jail no longer
+  receives OpenAI or Gemini keys. A memory server on the same machine is
+  reached through one forwarded port instead of the full network. Before
+  launching, ai-memory asks ai-jail whether the sandbox can start and stops
+  with ai-jail's reason when it cannot or when saved access no longer matches
+  the machine. ai-memory's own screen keeps only the extra folders. Older
+  ai-jail releases, and Copilot and Command Code, keep the previous launch
+  (#2020).
+
+- A project name no longer turns ambiguous because an empty leftover project
+  holds it literally. When a remote-derived name such as `acme-api` matches
+  both the project that owns that repository and an empty project created
+  under the literal name, reads, writes and `memory_message_send` now reach
+  the repository owner. A leftover that holds data, or any restricted
+  candidate, still refuses, and the error now says which holder owns which
+  repository, which project name to pass instead, and the
+  `rename-project --project-id` command that moves an empty holder out of the
+  way. The server also logs such a leftover at startup (#2018).
+
+- A line printed while a command keeps going, such as a recoverable error
+  during `ai-memory run`, `uninstall`, `restore` or the project-split
+  repair, or a lifecycle hook warning, is now neutralized like the final
+  failure report, so a value read back from the server cannot reach the
+  terminal as an escape sequence. That covers the names these lines quote
+  too: workstream, project, workspace and server-profile names, session ids
+  read from harness transcripts, the lines `recover`, `resume`,
+  `continue`, `finalize-session` and `workstreams` print about them, and
+  any other command's line that quotes an error or a reason (`upgrade`,
+  `setup`, `doctor`, `install-hooks` and others). The sanitizer also covers the direction
+  marks (U+061C, U+200E/U+200F) and the zero-width space, word joiner and
+  byte-order mark (U+200B, U+2060–U+2064, U+FEFF) it used to keep. The
+  zero-width joiner and non-joiner still print, since emoji sequences and
+  Persian or Indic text need them (#2000, #2010).
+
+- `ai-memory handoffs --expire-all` now reports the sweep, and explains why
+  it refuses without `--confirm`, in the selected language, and neutralizes
+  terminal controls in the workspace and project it echoes. Those were the
+  last English-only lines in that command while the rest of it already
+  followed the catalogs (#2011).
+
+- Search now matches the parts of a hyphenated or underscored word: `alpha`
+  finds a note that writes `foo-bar-alpha`, `memory` finds `ai-memory`, and
+  the whole token keeps matching too. A `title:` or `body:` filter reaches
+  the parts as well. The page and observation search indexes gained a second
+  spelling of the same text (migration V100), so the tokenizer stays as it
+  was and no stored row changes. The first start after upgrading rebuilds
+  both indexes once, which takes longer on a large store, and they grow to
+  roughly twice their previous size. A 3.4.2 binary refuses a store this
+  release has upgraded, so keep a backup if you may need to go back (#2013).
+
+- The dashboard's icons no longer show as empty boxes on macOS. The three
+  shipped web fonts are Latin subsets, so the geometric and symbol
+  characters the templates use as icons fell through to the platform UI
+  font, which on macOS carries only 4 of the 17. The text font stacks now
+  name the symbol fonts macOS, Windows and Linux ship (Apple Symbols, Segoe
+  UI Symbol, Noto Sans Symbols 2, DejaVu Sans) after `system-ui`, so Latin
+  text keeps its font (#2003).
+
+- The forget sweep's decay cleanup no longer logs a failure when a session
+  is purged after the sweep has listed its decayed page and the purge could
+  not remove the page file. The leftover file is left unindexed, so the
+  purged summary stays deleted, and the cleanup finishes (#1999, #2007).
+
+### Security
+
+- `ai-memory restore` no longer brings back the parts of the wiki's git
+  directory that git runs or follows. It restores git's data (objects, refs,
+  logs, HEAD, the index) and writes a fresh git config; hooks, the archived
+  config, worktree and submodule metadata, alternates and any nested
+  repository are left out and named in the output. A backup from someone else
+  could otherwise make a later `git` command in the wiki run a program.
+  Reported by Daniel Pinto (@Cayan).
+  ([GHSA-w734-2f7h-6qcp](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-w734-2f7h-6qcp))
+
 ## [3.4.2] - 2026-11-05
 
 ### Added
@@ -4246,7 +4649,9 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.4...HEAD
+[3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
+[3.4.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.3
 [3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2
 [3.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.1
 [3.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.0

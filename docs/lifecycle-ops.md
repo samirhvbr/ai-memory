@@ -26,7 +26,7 @@ on a homelab box where mistakes are harder to undo.
 | `restore-page --path (--from REV \| --page-id UUID)` | ✅ yes | overwrites one markdown page version | yes (restore another retained version) | Restores one page from wiki git history or a retained SQLite page version, reindexes it, and writes a post-restore checkpoint. `--page-id` reaches source history preserved by `merge-project`; it does not restore other DB state. |
 | MCP `memory_restore_page` | ✅ yes | no (writes a new current version; the replaced one stays reachable) | yes (restore another checkpoint) | Lists a page's checkpoints, or writes one back through the `memory_write_page` path. Admin only, like `restore-page`. See [below](#mcp-memory_restore_page). |
 | `backup-agents --to` / `restore-agents --from <tarball>` | ✅ yes (client-side; never touches the server or its data dir) | no | yes (`restore-agents --apply` keeps timestamped copies of overwritten files) | Agent-config assets, not wiki/db: MCP configs (redacted unless `--include-secrets`), hook configs, instructions, skills, plugins. `restore-agents` is a dry run by default; `--apply` writes to disk and `--force` overwrites existing or differing targets. Non-MCP assets are restored verbatim and may contain secrets, so only `--apply` an archive whose source you trust. |
-| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. Keeps an existing `config.toml` and saves the backup's as `config.toml.from-backup` unless `--with-config` is passed. |
+| `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. Keeps an existing `config.toml` and saves the backup's as `config.toml.from-backup` unless `--with-config` is passed. From the wiki's `.git` it restores only git's data (objects, refs, logs, HEAD, the index) and writes a fresh git config; hooks, the archived config and anything else git would run or follow are left out and listed. |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
 
@@ -157,6 +157,14 @@ silently to the plain refusal with no preview line. A `404`/`403` (or any
 other unexpected status) prints the server's own error before the refusal
 instead, since the operator asked what would happen and the server has a
 real answer.
+
+The preview asks the server the confirmed purge will use. In a checkout whose
+`.ai-memory.toml` selects a server profile (`server = "<name>"`, see
+[marker-file.md](marker-file.md)), both go to that profile's URL with its
+stored token, never to the install's server with the config bearer. A profile
+that does not resolve fails the command before anything is sent, the same way
+the confirmed purge fails, and `AI_MEMORY_SERVER_URL` still picks the server
+for one command.
 
 A handoff this session only *accepted* (did not author) keeps its row and
 its text either way, confirmed or previewed, and loses only its

@@ -27,7 +27,7 @@ use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::commands::render_shared::{
-    bearer_header_value, hook_embedded_exe_path, shell_quote, yaml_single_quote,
+    bearer_header_value, hook_embedded_exe_path, mask_secret, shell_quote, yaml_single_quote,
 };
 use crate::config::{Config, DEFAULT_MCP_URL};
 use crate::local_auth::HookCredential;
@@ -205,7 +205,18 @@ pub(crate) fn run_with_opencode_dialect(
         }
         return apply_to_config_file(i18n, &args);
     }
-    let snippet = match args.client {
+    println!("{}", preview_snippet(args)?);
+    Ok(())
+}
+
+/// Render the print-only preview snippet for a client. The snippet goes to the
+/// terminal, not to a config file, so the inline bearer is masked here — it
+/// would otherwise sit in the scrollback, a CI log or an agent transcript. The
+/// `--apply` path renders from the real token and never calls this
+/// (GHSA-6pmr-q79m-87vp item 1).
+fn preview_snippet(mut args: InstallMcpArgs) -> Result<String> {
+    args.auth_token = args.auth_token.as_deref().map(mask_secret);
+    Ok(match args.client {
         McpClient::ClaudeCode => render_claude_code(&args, &resolve_config_file(&args)?)?,
         McpClient::Codex => render_codex(&args)?,
         McpClient::Grok => render_grok(&args)?,
@@ -238,9 +249,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::PrimeAgent => render_prime_agent(&args)?,
         McpClient::Cline => render_json_mcp_fragment(&args)?,
         McpClient::Freebuff => render_json_mcp_fragment(&args)?,
-    };
-    println!("{snippet}");
-    Ok(())
+    })
 }
 
 /// Wire a client to a server whose bearer lives in `[auth].bearer_token_file`
@@ -312,7 +321,16 @@ fn store_bridge_key(
         }
         Err(e) => {
             eprintln!(
-                "{}", i18n.format("cli-install-mcp-ai-memory-warning-could-not-store-the-key-under-e-keeping-it-in-the-mcp-entr", &[("value0", format!("{}", data_dir.display())), ("value1", format!("{:#}", e))]));
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-install-mcp-ai-memory-warning-could-not-store-the-key-under-e-keeping-it-in-the-mcp-entr",
+                    &[
+                        ("value0", format!("{}", data_dir.display())),
+                        ("value1", format!("{:#}", e))
+                    ]
+                )
+            );
             None
         }
     }
@@ -1221,7 +1239,15 @@ fn apply_to_config_file(
     }
     if matches!(args.client, McpClient::Droid) && (args.auth_token.is_some() || args.token_env_var)
     {
-        println!("{}", i18n.diagnostic(&format!("  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect.")));
+        println!(
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect."
+                )
+            )
+        );
     }
     if matches!(args.client, McpClient::Codex) && args.token_env_var {
         println!(
@@ -3029,6 +3055,33 @@ mod tests {
             stdio_bridge: false,
             bridge_data_dir: None,
         }
+    }
+
+    /// GHSA-6pmr item 1: the print-only preview masks the inline bearer so it
+    /// is not left in the terminal scrollback / CI log, for every client that
+    /// embeds it. Fails if `preview_snippet` renders from the raw token.
+    #[test]
+    fn preview_snippet_masks_the_inline_bearer() {
+        for client in [
+            McpClient::Cursor,
+            McpClient::ClaudeDesktop,
+            McpClient::Cline,
+            McpClient::GeminiCli,
+        ] {
+            let snippet = preview_snippet(args_with_token(client)).unwrap();
+            assert!(
+                !snippet.contains("test-token-deadbeef"),
+                "{client:?} leaked the token: {snippet}"
+            );
+            assert!(
+                snippet.contains("[REDACTED]"),
+                "{client:?} did not mask: {snippet}"
+            );
+        }
+        // Control: with no token, the snippet renders unchanged and carries no
+        // redaction marker.
+        let snippet = preview_snippet(args_for(McpClient::Cursor)).unwrap();
+        assert!(!snippet.contains("[REDACTED]"), "control masked: {snippet}");
     }
 
     #[test]
