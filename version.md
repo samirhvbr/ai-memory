@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.7`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `5d9660df` (`main`, `v3.4.2` plus 1 commit)
+**Current version:** `0.3.8`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `957b1dd0` (`main`, `v3.4.4`)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,37 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.8 - the fork moves onto upstream v3.4.4
+
+The fork was on upstream `main` at `5d9660df` (`v3.4.2` plus one docs commit).
+Upstream has since published `v3.4.3` (06/11/2026) and `v3.4.4` (08/11/2026), and
+`main` moved 161 commits. This sync merges upstream `main` at `957b1dd0`, which is
+the `v3.4.4` release commit itself. It came in as a merge again, merged clean, no
+upstream commit rewritten and no force-push. After it the tree differs from
+`upstream/main` in our three files (`version.md`, `docs/ci.md`,
+`docs/mem-shvia-org.md`) and nothing else.
+
+What the range brings that matters to the server, which still runs `3.4.2`:
+
+- **Migration V100** is the owner's PR #2019 (merged upstream on 06/11 with three
+  maintainer commits on top). It indexes the parts of a hyphenated or underscored
+  word, so `alpha` finds `foo-bar-alpha`. Like V97 it **drops and rebuilds both
+  full-text indexes** (`pages_fts` and `observations_fts`), and the changelog says
+  they grow to roughly twice their size. Neither the rebuild time on this
+  server's data nor the new index size has been measured yet; the V97 run took
+  31 min 48 s here, and V100 indexes each text twice.
+- **Migration V101** adds a `manual` flag to handoffs; nothing heavy.
+- **Security:** `v3.4.4` lists eight advisories and `v3.4.3` one (`ai-memory
+  restore` bringing back a backup's git hooks). Which of them reach this
+  installation has not been triaged.
+
+`mem.shvia.org` is still on the `3.4.2` image: the server follows the published
+image, not this branch, and moves only by the procedure in
+[`docs/mem-shvia-org.md`](docs/mem-shvia-org.md), after a rehearsal that measures
+V100 on a copy of production data. The upstream tags (`v3.4.3`, `v3.4.4`) were
+fetched here and not pushed, so the Releases box of this repository still reads
+`v2.0.1`.
 
 ## 0.3.7 - mem.shvia.org runs 3.4.2, after a cold backup and 35 minutes down
 
