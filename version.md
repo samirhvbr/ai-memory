@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.8`
+**Current version:** `0.3.9`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `957b1dd0` (`main`, `v3.4.4`)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,30 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.9 - the 3.4.4 rehearsal: V100 needs about 27 GB of free disk and the server has 24
+
+The server is still on `3.4.2`. Before moving it to `3.4.4` the range was rehearsed
+on a copy of production data, and it does not fit as things stand. V100, the
+owner's PR #2019, rebuilds both full-text indexes and indexes each text a second
+time: **22 min 40 s** on the workstation, a write-ahead log of **14.26 GB** (V97
+peaked at 5.98 GB in production), and a database file that went from 46.4 to
+**54.6 GB** while the whole log was still on disk. That is about 22.5 GB above the
+current database at the peak, plus 0.9 GB for the cold backup, and the script stops
+the container below 4 GB free: about 27.5 GB needed against 24 free, with no free
+extent in the volume group. The page index grew **2.7 times**, not the "roughly
+twice" the upstream changelog states. On the V97 ratio (3.5 to 4.2 times slower
+there) the downtime would be 85 to 100 minutes, an estimate.
+
+Checks on the migrated copy matched: the same 867 latest pages, 3,127 sessions and
+887,167 observations, the index complete, `quick_check` and the FTS5
+`integrity-check` `ok`, the endpoints answering. The copy was deleted afterwards.
+`upgrade-3.4.4.sh` is on the server and was not run; the way forward is a larger
+virtual disk for `blue3site` (about 30 GB more, an owner decision on the
+Hyper-V host), then the script. The same measurement showed that the 596 MB of
+growth on `3.4.2` was not the tokenizer, which the `0.3.7` entry had said: the
+index tables moved by 4 MB. [`docs/mem-shvia-org.md`](docs/mem-shvia-org.md) has the
+table, the estimate and a reading of the nine advisories in the range.
 
 ## 0.3.8 - the fork moves onto upstream v3.4.4
 
@@ -71,7 +95,7 @@ to V99 in 31 min 48 s, ready at 21:50:54 UTC, **down 35 min 13 s** in all. That
 matches the 31 to 36 minutes the rehearsal predicted, and the shape was the one it
 showed: V97 rebuilds both full-text indexes, the write-ahead log peaked at 5.98 GB
 (5.37 GB on the rehearsal's smaller copy), and the database file grew by 596 MB
-because the new tokenizer indexes more terms. Every check matched before and
+(0.3.9 corrects the reason given here: the index tables grew by 4 MB, so it was not the tokenizer, and the cause was not found). Every check matched before and
 after, directly and through Apache; the schema is 99, the index is complete (FTS
 61,323 / 61,323 pages and 887,171 / 887,171 observations), the container log has no
 `ERROR` line, and the `ai-memory-web` probe is clean.

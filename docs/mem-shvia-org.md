@@ -4,7 +4,9 @@
 > not a build of this fork (the fork carries no code of its own). Since
 > 05/11/2026 21:50 UTC that image is **`3.4.2`** (schema 99). Before that it was
 > `3.3.1` (02/11), `3.2.8` (27/10) and `2.6.6` (13/10). The fork's code is upstream
-> `main` at `v3.4.2` plus one commit (version `0.3.7`), so server and fork are level.
+> `main` at `v3.4.4` (version `0.3.9`), so the server is one release behind, **on purpose**:
+> `3.4.4` needs about 27 GB of free disk (23 for the migration, 4 for the script's
+> watchdog floor) and `/srv` has 24 (see the rehearsal of 09/11/2026).
 
 | | |
 |---|---|
@@ -13,7 +15,7 @@
 | Public address | `https://mem.shvia.org`, an Apache vhost on the same machine proxying to `http://127.0.0.1:49374/` |
 | Deploy | `docker compose` in `/srv/ai-memory`. `docker-compose.yml` holds the bearer token (mode 600); `./data` is bind-mounted at `/data` |
 | Image | `akitaonrails/ai-memory:3.4.2`, **pinned on purpose**: an upgrade migrates the database one way |
-| Data | `data/db/memory.sqlite` is about 46.4 GB (43.2 GiB): 867 latest pages (61,323 versions) and 887,171 observations on 05/11/2026. It grew by about 100 MB between 27/10 and 02/11, and by 596 MB on 05/11, almost all of it the larger full-text indexes the `3.4.2` tokenizer builds. The wiki is about 0.6 GB. `/srv` has about 24 GB free, and the volume group has no free extents |
+| Data | `data/db/memory.sqlite` is about 46.4 GB (43.2 GiB): 867 latest pages (61,323 versions) and 887,171 observations on 05/11/2026. It grew by about 100 MB between 27/10 and 02/11, and by 596 MB on 05/11 (the full-text index tables grew by only 4 MB, so it was not the tokenizer, and the cause was not found). The wiki is about 0.6 GB. `/srv` has about 24 GB free, and the volume group has no free extents |
 
 **Not** `shvia-site` (`100.64.100.242`, the app server), and **not** `170.233.231.20`
 (the public IP, which appears in `AI_MEMORY_ALLOWED_HOSTS` and was once read as the
@@ -48,6 +50,58 @@ The guest restarted once more on 04/11/2026 at 16:42 (-03): the journal of the
 previous boot ends at 16:42:17 and the next boot starts at 16:42:29, so it was an
 orderly restart this time. The container came back by itself (`Up 25 hours` the
 next day) and the log holds no `ERROR` line. The cause is not established either.
+
+## Rehearsal for 3.4.2 to 3.4.4, 09/11/2026: it does not fit the disk
+
+The range is `v3.4.2` to `v3.4.4` (two releases, 161 commits) and brings two
+migrations. **V100** is the owner's PR #2019 (merged upstream on 06/11 with three
+maintainer commits on top): it adds two generated columns, `title_parts` and
+`body_parts`, to `pages` and `observations` and drops and rebuilds both full-text
+indexes to index them, so `alpha` finds `foo-bar-alpha`. V101 adds a `manual` flag
+to handoffs and is instant. The same range also carries nine security advisories
+(see the end of this section).
+
+Rehearsal on a workstation, from the cold backup taken before the `3.4.2`
+upgrade (schema 88, 45.8 GB, sha256 checked), brought to `3.4.2` and then to
+`3.4.4`; no backup at schema 99 exists, so the first step repeats V97 to V99. The
+token was a fake one and the copy was deleted afterwards:
+
+| | Result |
+|---|---|
+| `3.4.2` start to "ready" (V97 to V99) | **11 min 40 s**. The rehearsal of 05/11, from another backup, took 7 min 38 s, so the same workstation varies by about 50% between runs. `memory.sqlite` went from 45,820,325,888 to 46,416,343,040 bytes, **+596 MB**, exactly what production grew on 05/11 (the 05/11 rehearsal had grown 7 MB; the reason for the difference was not found) |
+| `3.4.4` start to "ready" (V100, V101) | **22 min 40 s** (1,360 s) |
+| Write-ahead log | grew to **14.26 GB** (14,255,776,832 bytes), against 5.37 GB for V97, then the checkpoint cut it to 64 MB. At that moment the database file was already 54,647,263,232 bytes, **+8.23 GB**, with the whole log still on disk: the peak is about **22.5 GB above the current database** |
+| Index tables (sum of the `*_fts_*` shadow tables) | `pages_fts_data` 5,048,233,984 to 13,641,101,312 bytes (**2.7 times**, not the "roughly twice" of the changelog); `observations_fts_data` 288,391,168 to 513,912,832 (1.8 times). Between the start and V99 they had moved by 4 MB, which is why the 596 MB of V97 is not index |
+| Container | its writable layer stayed at 0 B: V100 writes only under `data/db` |
+| Counts | 867 latest pages (61,285 versions), 3,127 sessions, 887,167 observations; workspaces `default` 144 / 824, `samirhv-shvia` 24 / 41, `shvia` 2 / 2. The version count read 61,283 after the first start and 61,285 after the second, with the same 867 latest pages (not checked further) |
+| Index | `status`: FTS 61,285 / 61,285 pages and 887,167 / 887,167 observations, 0 latest pages missing an embedding. `PRAGMA quick_check` `ok` and the FTS5 `integrity-check` `ok` on both indexes (25 min 52 s on the 54.6 GB file) |
+| HTTP and search | `workspaces` 200, `search` 200, 401 without the token, MCP `initialize` 200. Queries returned `sqlite` 4, `memory` 50 (the limit), `ai-memory` 50, `upgrade` 2, `docker-compose` 1, `compose` 1, `run-managed` 0, `zebrafinch` 0. They were not compared with `3.4.2` on the same data, so this shows that search answers, not that V100 finds the parts of a word; upstream's tests cover that |
+
+**What it means for production.**
+
+- **Disk.** The peak is about 22.5 GB above the database, the cold backup adds
+  0.9 GB, and the script's watchdog stops the container below 4 GB free: about
+  **27.5 GB free are needed, and `/srv` has 24**, with no free extent in the volume
+  group (`VFree 0`). Run as it is, the migration would hit the watchdog near its
+  end, after more than an hour down. It would not be applied until the virtual disk
+  is larger. Afterwards the database is about 54.6 GB and `/srv` would have about
+  15 GB free, so the extra space is not only for this run.
+- **Time.** 22 min 40 s times the 3.5 to 4.2 seen on V97 is 79 to 95 minutes, plus
+  about 4 minutes of cold backup: **85 to 100 minutes down**. An estimate, not a
+  measurement, and the workstation's own variation (above) is wide.
+- **State.** `/srv/ai-memory/upgrade-3.4.4.sh` is on the server (mode 700) and
+  has **not been run**. Against `upgrade-3.4.2.sh` it differs in the header, the tags
+  (`3.4.2` to `3.4.4`), the expected schema (101) and the wait (14,400 s instead of
+  5,400 s). The server is still on `3.4.2`.
+
+**Security advisories in the range.** `v3.4.3` lists one and `v3.4.4` eight. Read
+from the changelog only, not from the code or the severity ratings: those that
+touch the server image are the cross-project leak in session consolidation
+(GHSA-xfgc-hc4c-wj7h), the capture sanitizer letting a key glued to a word through
+(GHSA-6pmr-q79m-87vp, which does not rewrite text already stored) and browser
+caching of restricted `/api/v1` reads (GHSA-462j-m6hw-9gpf, relevant only to a shared
+browser profile). The others concern the client (`ai-memory upgrade`, `ai-memory run`,
+the macOS app) or `ai-memory restore`, which the rollback here does not use.
 
 ## Rehearsal for 3.3.1 to 3.4.2, 05/11/2026
 
