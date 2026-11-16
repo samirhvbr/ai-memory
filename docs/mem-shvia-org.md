@@ -4,7 +4,7 @@
 > not a build of this fork (the fork carries no code of its own). Since
 > 05/11/2026 21:50 UTC that image is **`3.4.2`** (schema 99). Before that it was
 > `3.3.1` (02/11), `3.2.8` (27/10) and `2.6.6` (13/10). The fork's code is upstream
-> `main` at `v3.4.4` (version `0.3.9`), so the server is one release behind, **on purpose**:
+> `main` at `v3.4.7` (version `0.3.10`), so the server is one release behind, **on purpose**:
 > `3.4.4` needs about 27 GB of free disk (23 for the migration, 4 for the script's
 > watchdog floor) and `/srv` has 24 (see the rehearsal of 09/11/2026).
 

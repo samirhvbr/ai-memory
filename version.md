@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.9`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `957b1dd0` (`main`, `v3.4.4`)
+**Current version:** `0.3.10`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `fa0ec25d` (`main`, `v3.4.7`)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,29 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.10 - the fork moves onto upstream v3.4.7
+
+The fork was on upstream `v3.4.4`. Upstream has since published `v3.4.5`
+(10/11/2026), `v3.4.6` (13/11) and `v3.4.7` (15/11), and `main` moved 601 commits.
+This sync merges upstream `main` at `fa0ec25d`, the `v3.4.7` release commit. It came
+in as a merge, merged clean, no upstream commit rewritten and no force-push; the
+tree differs from `upstream/main` only in `version.md`, `docs/ci.md` and
+`docs/mem-shvia-org.md`.
+
+No migration was added: `V101` is still the last one, so the rehearsal of
+09/11/2026 (V100 and V101, 22 min 40 s, a 14.26 GB log, +8.23 GB of file) covers the
+database side of `3.4.7` as well. The three releases carry five more advisories, all
+read from the changelog only. The one that reaches the server image is the bundled
+SQLite update of `v3.4.5` (RUSTSEC-2026-0459, CVE-2026-119375), which came in with
+the owner's PR #2140. The rest concern the client (the MCP bridge's response-body
+limit), the macOS menu bar app, `ai-memory uninstall` for ZCode, the eval grader and
+the example backup script.
+
+`mem.shvia.org` is still on the `3.4.2` image, for the reason in `0.3.9`: the
+volume group has no free extent and `/srv` has about 22 GB free against the 27 GB
+the `V100` migration needs. The upstream tags (`v3.4.5` to `v3.4.7`) were fetched
+here and not pushed, so the Releases box still reads `v2.0.1`.
 
 ## 0.3.9 - the 3.4.4 rehearsal: V100 needs about 27 GB of free disk and the server has 24
 
