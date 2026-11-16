@@ -65,7 +65,6 @@ const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
 /// Per-execution opt-out of the automatic handoff (#1951): a falsy value
 /// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
 const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
-const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
@@ -625,10 +624,14 @@ fn session_id_query_suffix(
     agent: &str,
     event: &str,
     raw: &serde_json::Value,
+    session_id_pin: Option<&str>,
 ) -> String {
     let agent_kind = AgentKind::from_wire(agent);
     if !agent_needs_session_id_state(agent_kind) || payload_has_session_id(raw) {
         return String::new();
+    }
+    if let Some(session_id) = session_id_pin {
+        return format!("&session_id={}", url_encode(session_id));
     }
 
     let session_id = if event == "session-start" {
@@ -1344,12 +1347,31 @@ fn is_compaction_session_start(raw: &serde_json::Value) -> bool {
 /// Muse reports a `compact` source but publishes no output contract for it,
 /// and Cursor runs Claude Code's settings with unverified handling of the
 /// envelope, so neither gets an anchor.
+///
+/// A subagent's compaction gets none either: the anchor quotes the session's
+/// own prompts as the source of truth for the task, and in a subagent that is
+/// the parent's task, not the one it was given.
 fn injects_compaction_anchor(agent: AgentKind, raw: &serde_json::Value) -> bool {
     matches!(
         agent,
         AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid
     ) && is_compaction_session_start(raw)
         && ai_memory_hooks::agent_from_payload(raw) != Some(AgentKind::Cursor)
+        && !fired_in_a_subagent(raw)
+}
+
+/// Whether a hook fired inside a subagent (or an in-process teammate) rather
+/// than in the session's own agent, which share one `session_id`. Claude Code
+/// names it with `agent_id` (<https://code.claude.com/docs/en/hooks>, common
+/// input fields) and sends it on a subagent's `PreCompact` and post-compaction
+/// `SessionStart` since v2.1.323 (changelog: "Fixed `PreCompact`, `PostCompact`
+/// and post-compaction `SessionStart` hooks not receiving `agent_id` and
+/// `agent_type` when a subagent compacts"). `agent_type` alone marks nothing:
+/// it is also set on a main session started with `--agent`.
+fn fired_in_a_subagent(raw: &serde_json::Value) -> bool {
+    raw.get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
 }
 
 /// `GET /recap?mode=anchor`: the session's first and latest operator prompts,
@@ -1466,7 +1488,8 @@ fn hermes_in_gateway(runtime_env: &RuntimeEnv) -> bool {
 /// (`PROFILE_ID_RE` in `hermes_constants.py`) before it becomes a path
 /// component. Profiles live in `<root>/profiles/<name>` (`get_profile_dir` in
 /// `hermes_cli/profiles.py`), where the root is the gateway's `HERMES_HOME`,
-/// else `~/.hermes`; a standalone gateway of a named profile runs with that
+/// else the platform default (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes`
+/// elsewhere); a standalone gateway of a named profile runs with that
 /// profile's directory as its `HERMES_HOME`.
 fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
     if !hermes_in_gateway(runtime_env) || runtime_env.ignore_marker() {
@@ -1476,14 +1499,10 @@ fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) ->
         *name != HERMES_GATEWAY_HOST_PROFILE
             && crate::commands::path_util::is_hermes_profile_id(name)
     })?;
-    let hermes_home = crate::commands::path_util::agent_config_home(
-        runtime_env.var_os("HERMES_HOME"),
-    )
-    .or_else(|| {
-        runtime_env
-            .home_dir()
-            .map(|home| Path::new(home).join(".hermes"))
-    })?;
+    let hermes_home = crate::commands::path_util::hermes_home(
+        runtime_env,
+        runtime_env.home_dir().map(Path::new),
+    )?;
     let standalone = hermes_home.file_name() == Some(std::ffi::OsStr::new(profile))
         && hermes_home
             .parent()
@@ -1580,9 +1599,24 @@ where
     }
     let agent_kind = AgentKind::from_wire(&args.agent);
     let mut hook_event = HookEvent::parse(&args.event);
+    // As in the script hooks, an execution's explicit id bypasses the shared
+    // fallback slot; a native payload id remains authoritative.
+    let session_id_pin = runtime_env
+        .var_os("AI_MEMORY_SESSION_ID")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty());
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
-    // than server configuration. Hooks deliberately bypass Config::load.
-    let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
+    // than server configuration. Hooks deliberately bypass Config::load, and
+    // the captured runtime env (not a fresh global read) makes it injectable
+    // for tests, matching invariant #1.
+    let external_capture = runtime_env.capture_owner_active();
+    // An external-capture run shares its project with the owner's own
+    // interactive sessions, so no handoff-delivery front door may consume the
+    // baton: every `/handoff` fetch that would otherwise claim (SessionStart,
+    // Kimi's UserPromptSubmit, Hermes' pre_llm_call, Grok's PostToolUse) sends
+    // `claim=0`, and the server announces the baton as an offer instead,
+    // leaving it for an explicit `memory_handoff_accept` (#2148).
+    let claim_qs = if external_capture { "&claim=0" } else { "" };
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
         || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
@@ -1609,10 +1643,15 @@ where
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
         if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
-            clear_session_id(
-                &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
-                agent_kind,
-            );
+            let pinned = session_id_pin.is_some()
+                && parse_hook_payload(payload)
+                    .is_ok_and(|(_, json)| !payload_has_session_id(&json));
+            if !pinned {
+                clear_session_id(
+                    &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+                    agent_kind,
+                );
+            }
         }
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -1630,6 +1669,9 @@ where
             return Ok(());
         }
     };
+    let session_id_pin = session_id_pin
+        .as_deref()
+        .filter(|_| !payload_has_session_id(&json));
     // Read before the Hermes shaping below drops `extra` and `profile`.
     // A delegated child's lifecycle belongs to the parent's session: storing
     // it would open a session nothing ever finalizes, and its first turn
@@ -1728,6 +1770,13 @@ where
         }
         false
     };
+    // Gemini CLI appends the contents of every `@`-referenced file to the
+    // prompt it hands BeforeAgent and AfterAgent. Cut them here, so they never
+    // reach the spool, the wire or a log, whatever `ignore_paths` says about
+    // those files.
+    if ai_memory_hooks::strip_gemini_prompt_expansion(agent_kind, &mut json) {
+        payload = serde_json::to_string(&json)?;
+    }
     if ai_memory_hooks::cap_lifecycle_body_for_client(&mut json, hook_event) {
         payload = serde_json::to_string(&json)?;
     }
@@ -2017,7 +2066,7 @@ where
     let handoff_scoped = policy_cwd.is_some();
     let spool = hook_spool::spool_dir(&dd);
     let mut incremental_background_drain = false;
-    let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
+    let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json, session_id_pin);
     let managed_qs = managed_run_query_suffix();
     let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
     let hook_qs = format!("{qs}{session_qs}{managed_qs}{auto_handoff_qs}");
@@ -2128,7 +2177,10 @@ where
         // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
         // per turn, so its stored id is cleared by `finalize-session` (or
         // overwritten by the next session-start), never by a hook event.
-        if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
+        if AgentKind::from_wire(&args.agent) == AgentKind::Devin
+            && args.event == "session-end"
+            && session_id_pin.is_none()
+        {
             clear_session_id(&dd, AgentKind::Devin);
         }
 
@@ -2238,7 +2290,7 @@ where
                 |session_id| format!("&session_id={}", url_encode(session_id)),
             );
             let handoff_url = format!(
-                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{claim_qs}",
                 args.agent
             );
             if let Some(handoff) =
@@ -2415,7 +2467,7 @@ where
             qs.clone()
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
         let handoff =
@@ -2529,7 +2581,7 @@ where
             "&profile_digest=0"
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
         if let Some(handoff) =
@@ -2576,7 +2628,7 @@ where
                         format!("&session_id={}", url_encode(session_id))
                     });
                 let handoff_url = format!(
-                    "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                    "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{claim_qs}",
                     args.agent
                 );
                 // Only a real body consumes this session's one chance. An empty
@@ -3999,8 +4051,10 @@ mod tests {
             "tool_response": {"success": true, "output": "ok", "error": null}
         });
 
-        let first = session_id_query_suffix(data_dir, "devin", "session-start", &session_start);
-        let second = session_id_query_suffix(data_dir, "devin", "post-tool-use", &post_tool_use);
+        let first =
+            session_id_query_suffix(data_dir, "devin", "session-start", &session_start, None);
+        let second =
+            session_id_query_suffix(data_dir, "devin", "post-tool-use", &post_tool_use, None);
 
         assert!(first.starts_with("&session_id="), "{first}");
         assert_eq!(second, first);
@@ -4279,10 +4333,122 @@ mod tests {
             "hook_event_name": "PostToolUse"
         });
 
-        let suffix = session_id_query_suffix(tmp.path(), "devin", "post-tool-use", &with_session);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "devin", "post-tool-use", &with_session, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::Devin).is_none());
+    }
+
+    #[tokio::test]
+    async fn native_hook_honours_session_id_env_without_replacing_native_ids_or_fallback_state() {
+        for agent in [AgentKind::Devin, AgentKind::Zcode] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            store_session_id(&data_dir, agent, "existing-fallback-session");
+            let payload = serde_json::json!({
+                "cwd": tmp.path(),
+                "hook_event_name": "PostToolUse",
+                "tool_name": "exec",
+                "tool_input": {"command": "printf fixture"},
+                "tool_response": {"success": true, "output": "fixture"}
+            });
+
+            for (pin, native, expected) in [
+                ("launch/a 1", None, Some("launch%2Fa%201")),
+                ("launch-b", None, Some("launch-b")),
+                ("launch-c", Some("native-session"), None),
+                ("", None, Some("existing-fallback-session")),
+                ("   ", None, Some("existing-fallback-session")),
+            ] {
+                let mut payload = payload.clone();
+                if let Some(native) = native {
+                    payload["session_id"] = native.into();
+                }
+                let mut args = devin_hook_args("post-tool-use");
+                args.agent = agent.as_str().into();
+                let mut stdout = Vec::new();
+                run_with_payload_in_home(
+                    Some(data_dir.clone()),
+                    args,
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| panic!("a single tool event must not start a drainer"),
+                    None,
+                    RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_SESSION_ID", pin)]),
+                )
+                .await
+                .unwrap();
+
+                let entries = read_spooled_entries(&hook_spool::spool_dir(&data_dir));
+                let entry = entries.last().unwrap();
+                assert_eq!(
+                    query_param(&entry.url, "session_id"),
+                    expected,
+                    "{agent:?}: {pin:?}"
+                );
+                let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                assert_eq!(body.get("session_id").and_then(|id| id.as_str()), native);
+                assert_eq!(stdout, b"{}\n");
+                assert_eq!(
+                    stored_session_id(&data_dir, agent).as_deref(),
+                    Some("existing-fallback-session"),
+                    "an execution's pin must not replace another session's fallback slot"
+                );
+                // Unit-test spools hold at most three entries. Each case has
+                // already inspected its event; keep room for the next one.
+                for file in std::fs::read_dir(hook_spool::spool_dir(&data_dir)).unwrap() {
+                    let path = file.unwrap().path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_devin_session_end_keeps_the_unrelated_fallback_slot() {
+        for external_capture in [false, true] {
+            for (pin, native, expected) in [
+                ("pinned-run", None, Some("existing-fallback-session")),
+                ("", None, None),
+                ("pinned-run", Some("native-session"), None),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data_dir = tmp.path().join("data");
+                store_session_id(&data_dir, AgentKind::Devin, "existing-fallback-session");
+                let mut payload = serde_json::json!({"cwd": tmp.path()});
+                if let Some(native) = native {
+                    payload["session_id"] = native.into();
+                }
+                let mut env = vec![("AI_MEMORY_SESSION_ID", pin)];
+                if external_capture {
+                    env.push(("AI_MEMORY_CAPTURE_OWNER", "external-fixture"));
+                }
+                let mut stdout = Vec::new();
+                run_with_payload_in_home(
+                    Some(data_dir.clone()),
+                    devin_hook_args("session-end"),
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| Ok(()),
+                    None,
+                    RuntimeEnv::with_process_env_for_tests(&env),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    stored_session_id(&data_dir, AgentKind::Devin).as_deref(),
+                    expected,
+                    "external={external_capture}, pin={pin:?}, native={native:?}"
+                );
+                assert_eq!(stdout, b"{}\n");
+            }
+        }
     }
 
     #[test]
@@ -4290,7 +4456,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
-        let suffix = session_id_query_suffix(tmp.path(), "claude-code", "post-tool-use", &raw);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "claude-code", "post-tool-use", &raw, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::ClaudeCode).is_none());
@@ -4305,9 +4472,9 @@ mod tests {
         let data_dir = tmp.path();
         let bare = serde_json::json!({"hook_event_name": "SessionStart"});
 
-        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare);
-        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
-        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare);
+        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare, None);
+        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare, None);
+        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare, None);
 
         assert!(first.starts_with("&session_id="), "{first}");
         assert_eq!(after_stop, first);
@@ -4326,7 +4493,8 @@ mod tests {
             "hook_event_name": "PostToolUse"
         });
 
-        let suffix = session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::Zcode).is_none());
@@ -4342,7 +4510,7 @@ mod tests {
         // id is cleared by `finalize-session` (or overwritten by the next
         // session-start), never by Stop.
         let bare = serde_json::json!({"hook_event_name": "Stop"});
-        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
+        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare, None);
 
         assert_eq!(
             stored_session_id(data_dir, AgentKind::Zcode).as_deref(),
@@ -8364,6 +8532,111 @@ mod tests {
         );
     }
 
+    /// Under external capture (`AI_MEMORY_CAPTURE_OWNER` set) the owner's own
+    /// runs share the project with the captured harness, so EVERY handoff-
+    /// delivery front door must only *offer* the pending baton, never consume
+    /// it: each `/handoff` fetch carries `claim=0`. Covers all four doors that
+    /// would otherwise claim — SessionStart, Kimi's UserPromptSubmit, Hermes'
+    /// pre_llm_call and Grok's PostToolUse — so dropping `claim=0` from any one
+    /// bites here. A run without the variable claims as usual (#2148).
+    #[tokio::test]
+    async fn external_capture_offers_the_baton_at_every_handoff_front_door() {
+        // The recorded `GET /handoff` a hook sends for `agent`/`event` with a
+        // payload built against a per-case temp directory, under `runtime_env`.
+        async fn handoff_request(
+            agent: &str,
+            event: &str,
+            payload: impl FnOnce(&Path) -> String,
+            runtime_env: RuntimeEnv,
+        ) -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", "FRONT-DOOR-HANDOFF").await;
+            let args = HookArgs {
+                event: event.into(),
+                agent: agent.into(),
+                server_url: base.clone(),
+                auth_token: None,
+                project_strategy: None,
+                check_capture: false,
+                capture_assistant: false,
+                capture_mode: None,
+            };
+            let mut stdout = Vec::new();
+            run_with_payload_in_home(
+                Some(tmp.path().join("data")),
+                args,
+                payload(tmp.path()),
+                &mut stdout,
+                |_, _| Ok(()),
+                None,
+                runtime_env,
+            )
+            .await
+            .unwrap();
+            let mut recorded = Vec::new();
+            while let Some(request) = first_request(&mut requests).await {
+                recorded.push(request);
+            }
+            recorded
+                .into_iter()
+                .find(|request| request.starts_with("GET /handoff?"))
+                .unwrap_or_else(|| panic!("{agent}/{event} fetched no handoff"))
+        }
+
+        let capture = || {
+            RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_CAPTURE_OWNER", "owner.robot")])
+        };
+        let session_payload =
+            |cwd: &Path| serde_json::json!({ "session_id": "owner", "cwd": cwd }).to_string();
+
+        let start =
+            handoff_request("claude-code", "session-start", session_payload, capture()).await;
+        assert!(start.contains("claim=0"), "SessionStart: {start}");
+
+        let kimi = handoff_request(
+            "kimi-code",
+            "user-prompt-submit",
+            session_payload,
+            capture(),
+        )
+        .await;
+        assert!(kimi.contains("claim=0"), "Kimi UserPromptSubmit: {kimi}");
+
+        let hermes = handoff_request(
+            "hermes",
+            "user-prompt-submit",
+            |cwd| hermes_payload("pre_llm_call", cwd, pre_llm_call_extra(true)),
+            capture(),
+        )
+        .await;
+        assert!(hermes.contains("claim=0"), "Hermes pre_llm_call: {hermes}");
+
+        let grok = handoff_request(
+            "grok",
+            "post-tool-use",
+            |cwd| {
+                serde_json::json!({ "session_id": "owner", "cwd": cwd, "tool_name": "read_file" })
+                    .to_string()
+            },
+            capture(),
+        )
+        .await;
+        assert!(grok.contains("claim=0"), "Grok PostToolUse: {grok}");
+
+        // Control: without external capture the same start claims (no claim=0).
+        let normal = handoff_request(
+            "claude-code",
+            "session-start",
+            session_payload,
+            RuntimeEnv::with_process_env_for_tests(&[]),
+        )
+        .await;
+        assert!(
+            !normal.contains("claim=0"),
+            "a non-captured start still claims the baton: {normal}"
+        );
+    }
+
     #[tokio::test]
     async fn copilot_cli_session_start_prints_top_level_handoff_envelope() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11474,6 +11747,30 @@ mod tests {
         ));
     }
 
+    /// Claude Code 2.1.323 sends `agent_id` on a subagent's compaction, and
+    /// the session anchor is the parent's, so no agent injects it there. A
+    /// main session started with `--agent` carries `agent_type` alone and
+    /// keeps its anchor; a blank `agent_id` marks nothing.
+    #[test]
+    fn a_subagent_compaction_gets_no_anchor() {
+        let subagent = serde_json::json!({
+            "source": "compact",
+            "agent_id": "a7",
+            "agent_type": "Explore",
+        });
+        let main_with_agent = serde_json::json!({ "source": "compact", "agent_type": "reviewer" });
+        let blank_id = serde_json::json!({ "source": "compact", "agent_id": " " });
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Droid] {
+            assert!(!injects_compaction_anchor(agent, &subagent), "{agent:?}");
+            assert!(
+                injects_compaction_anchor(agent, &main_with_agent),
+                "{agent:?}"
+            );
+            assert!(injects_compaction_anchor(agent, &blank_id), "{agent:?}");
+        }
+        assert!(is_compaction_session_start(&subagent));
+    }
+
     /// A compaction `SessionStart` from an agent without a verified anchor
     /// contract (Muse, or Cursor running Claude Code's settings) is still
     /// mid-session: it must not claim a pending handoff, recovery snapshot or
@@ -11502,5 +11799,35 @@ mod tests {
             );
             assert!(recap_requests(&seen).is_empty(), "{name}: {seen:?}");
         }
+    }
+
+    /// A subagent's compaction `SessionStart` (Claude Code 2.1.323 adds the
+    /// subagent's `agent_id`) never fetches or prints the parent's anchor and
+    /// claims nothing, while the compaction itself still reaches the server.
+    #[tokio::test]
+    async fn subagent_compact_session_start_fetches_no_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+        let mut payload = session_start_payload(tmp.path(), "compacted-session", "compact");
+        payload["agent_id"] = "a7".into();
+        payload["agent_type"] = "Explore".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("session-start", &base),
+            payload,
+        )
+        .await;
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(!stdout.contains("post-compaction anchor"), "{stdout}");
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|r| r.starts_with("GET /handoff")),
+            "a compaction must not claim a handoff: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|r| r.starts_with("POST /hook")),
+            "the compaction itself is still captured: {seen:?}"
+        );
     }
 }

@@ -117,9 +117,10 @@ This section describes `plan` and `export`; `sync` adds the rules under
 
 - **API-only.** Documented read-only `/api/v1` endpoints (incremental
   `recent` listing with cursor paging, single-page reads with
-  `ETag`/`If-None-Match` revalidation; the legacy array listing is
-  accepted as a fallback). No admin routes, and `plan` and `export` never
-  write to the server. `401`/`403`/`404` become clear errors; page count
+  `ETag`/`If-None-Match` revalidation; when a legacy server returns a limited
+  `recent` array, the full `pages` listing is fetched instead). No admin routes,
+  and `plan` and `export` never write to the server. `401`/`403`/`404` become
+  clear errors; page count
   and body size are bounded per run.
 - **Path safety.** Every server-reported path is validated into a
   portable shape (ASCII, no traversal, no dotfiles, no reserved Windows
@@ -204,7 +205,9 @@ Safety rules:
 - **Deletes are opt-in.** Without `--propagate-deletes` a delete is only
   reported, and the page keeps its state entry so the next run reports it
   again. With it, a side is deleted only if it is unchanged since the last
-  sync; a delete against an edit is a conflict like any other. Pages gone
+  sync; a delete against an edit is a conflict like any other. When both
+  server version IDs are available, a newer version conflicts with a
+  repository delete even if only unexported metadata changed. Pages gone
   from both sides drop out of the state.
 - **Delete safety.** More than `--max-deletes` deletes (default 10) refuses
   the whole run. A pinned server page is never deleted unless `--prefer repo`

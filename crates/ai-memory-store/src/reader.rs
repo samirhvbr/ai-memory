@@ -255,11 +255,7 @@ pub const PAGE_KINDS: [&str; 10] = [
 pub(crate) fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     let arms: String = PATH_KINDS
         .iter()
-        .map(|(prefix, kind)| {
-            // `_` is a LIKE wildcard; escape it so `_rules/` matches only itself.
-            let prefix = prefix.replace('_', "\\_");
-            format!("WHEN {path_column} LIKE '{prefix}%' ESCAPE '\\' THEN '{kind}' ")
-        })
+        .map(|(prefix, kind)| format!("WHEN {path_column} GLOB '{prefix}*' THEN '{kind}' "))
         .collect();
     // The cast keeps a non-string frontmatter `kind` (`kind: 5`) readable as
     // text instead of failing the row.
@@ -295,6 +291,9 @@ mod page_kind_tests {
         assert_eq!(kind("_rules/a.md", "{}"), "rule");
         assert_eq!(kind("xrules/a.md", "{}"), "fact");
         assert_eq!(kind("profile/a.md", "{}"), "preference");
+        assert_eq!(kind("_RULES/a.md", "{}"), "fact");
+        assert_eq!(kind("Decisions/a.md", "{}"), "fact");
+        assert_eq!(kind("SESSIONS/a.md", "{}"), "fact");
         assert_eq!(kind("sessions/a.md", r#"{"kind":"custom"}"#), "custom");
         assert_eq!(kind("sessions/a.md", r#"{"kind":5}"#), "5");
     }
@@ -519,6 +518,7 @@ struct PageAuthority {
     /// Kind/tier penalty this page carries *because* it is a session page
     /// (`0.0` for every other kind). A `session_recall` query gives it back.
     session_penalty: f64,
+    cap: Option<f64>,
 }
 
 impl PageAuthority {
@@ -577,21 +577,29 @@ impl PageAuthority {
         // Negative tags are explicit curator instructions. They cap the
         // result's authority instead of merely cancelling a canonical path
         // boost, but they never remove the page from search.
-        if tags
+        let cap = if tags
             .iter()
             .any(|tag| tag == "do-not-answer-from" || tag == "test-fixture")
         {
-            factor = factor.min(0.55);
+            Some(0.55)
         } else if tags.iter().any(|tag| tag == "superseded") {
-            factor = factor.min(0.65);
+            Some(0.65)
         } else if tags.iter().any(|tag| tag == "historical") {
-            factor = factor.min(0.80);
-        }
+            Some(0.80)
+        } else {
+            None
+        };
+        let factor = factor.clamp(0.55, 1.50);
 
         Self {
-            factor: factor.clamp(0.55, 1.50),
+            factor: cap.map_or(factor, |cap| factor.min(cap)),
             session_penalty,
+            cap,
         }
+    }
+
+    fn capped(&self, factor: f64) -> f64 {
+        self.cap.map_or(factor, |cap| factor.min(cap))
     }
 
     fn adjust_rank(&self, rank: f64) -> f64 {
@@ -604,7 +612,7 @@ impl PageAuthority {
     /// other page lives in. Any other query leaves the factor alone.
     fn factor_for(&self, session_recall: bool, bonus: f64) -> f64 {
         if session_recall && self.session_penalty > 0.0 {
-            (self.factor + self.session_penalty + bonus).clamp(0.55, 1.50)
+            self.capped((self.factor + self.session_penalty + bonus).clamp(0.55, 1.50))
         } else {
             self.factor
         }
@@ -6411,6 +6419,41 @@ impl ReaderPool {
         .await
     }
 
+    /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
+    /// `sessions/<session_id>.md` page row. These are the scopes a re-home
+    /// (`move-session` of a session already rooted in the destination)
+    /// sweeps, so the wiki uses them to plan the matching file step.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_page_latest_scopes_outside(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let path = format!("sessions/{session_id}.md");
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT workspace_id, project_id FROM pages \
+                 WHERE path = ?1 AND is_latest = 1 \
+                   AND NOT (workspace_id = ?2 AND project_id = ?3) \
+                 ORDER BY workspace_id, project_id",
+            )?;
+            let rows = stmt.query_map(
+                params![path, workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (ws, proj) = row?;
+                out.push((WorkspaceId::from_slice(&ws)?, ProjectId::from_slice(&proj)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// The recorded `(workspace, project)` of a session that has not ended.
     /// A mid-session checkpoint writes its artifacts there, next to where the
     /// session's eventual end writes them, whatever scope the event resolved
@@ -7989,10 +8032,13 @@ impl ReaderPool {
                 "SELECT pg.path, f.kind, COUNT(*) AS signal_count, MAX(f.created_at) AS latest, \
                         (SELECT reason FROM page_feedback r \
                           WHERE r.page_id = f.page_id AND r.kind = f.kind \
+                            AND r.workspace_id = f.workspace_id \
+                            AND r.project_id = f.project_id \
                             AND r.reason IS NOT NULL \
                           ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reason \
                  FROM page_feedback f \
                  JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1{ttl} \
+                   AND pg.workspace_id = ?1 AND pg.project_id = ?2 \
                  WHERE f.workspace_id = ?1 AND f.project_id = ?2 \
                    AND f.kind IN ('stale', 'wrong') \
                  GROUP BY f.page_id, pg.path, f.kind \
@@ -9182,9 +9228,11 @@ impl ReaderPool {
                 };
                 let factor = match (belief_add, feedback_pen, signal_add) {
                     (None, None, None) => base,
-                    _ => (base + belief_add.unwrap_or(0.0) - feedback_pen.unwrap_or(0.0)
-                        + signal_add.unwrap_or(0.0))
-                    .clamp(0.55, 1.50),
+                    _ => authority.capped(
+                        (base + belief_add.unwrap_or(0.0) - feedback_pen.unwrap_or(0.0)
+                            + signal_add.unwrap_or(0.0))
+                        .clamp(0.55, 1.50),
+                    ),
                 };
                 hit.rank = apply_rank_multiplier(hit.rank, factor);
                 // `fused` stays the raw RRF sum; without the multiplier
@@ -9816,7 +9864,7 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn snapshot_to(&self, dest_path: PathBuf) -> StoreResult<()> {
         self.with_conn(move |conn| {
-            conn.backup(rusqlite::DatabaseName::Main, &dest_path, None)
+            conn.backup(rusqlite::MAIN_DB, &dest_path, rusqlite::backup::NO_PROGRESS)
                 .map_err(StoreError::from)
         })
         .await
@@ -11741,6 +11789,9 @@ impl ReaderPool {
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
             let ttl = not_expired("pg", "?2");
+            // A known observation need not be the newest activity. Aggregate
+            // the three values so missing sources stay null, without a zero
+            // fallback that would overtake a pre-epoch timestamp.
             let mut stmt = conn.prepare(&format!(
                 "SELECT w.id AS workspace_id, \
                         w.name AS workspace_name, \
@@ -11751,9 +11802,10 @@ impl ReaderPool {
                         (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id), \
                         (SELECT COUNT(*) FROM observations o WHERE o.project_id = p.id), \
                         (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id AND s.ended_at IS NULL), \
-                        COALESCE((SELECT MAX(o.created_at) FROM observations o WHERE o.project_id = p.id), \
-                            (SELECT MAX(s.started_at) FROM sessions s WHERE s.project_id = p.id), \
-                            MAX(pg.updated_at)) AS last_activity \
+                        (SELECT MAX(column1) FROM (VALUES \
+                            ((SELECT MAX(o.created_at) FROM observations o WHERE o.project_id = p.id)), \
+                            ((SELECT MAX(s.started_at) FROM sessions s WHERE s.project_id = p.id)), \
+                            (MAX(pg.updated_at)))) AS last_activity \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
@@ -13159,6 +13211,12 @@ impl ReaderPool {
                     since_created_at,
                     top_limit,
                 )?,
+                eval_gate_rejections: auto_improve_eval_gate_rejection_count(
+                    conn,
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                )?,
                 repeated_rejection_fingerprints: auto_improve_repeated_rejection_fingerprints(
                     conn,
                     workspace_id,
@@ -13953,6 +14011,10 @@ impl ReaderPool {
 
     /// Server-wide [`SessionConsolidationQueue`] state.
     ///
+    /// `failed` counts only the failures no newer generation of the same
+    /// session has completed since (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn session_consolidation_queue(&self) -> StoreResult<SessionConsolidationQueue> {
@@ -13970,10 +14032,18 @@ impl ReaderPool {
                     "pending" => queue.pending = n,
                     "running" => queue.running = n,
                     "completed" => queue.completed = n,
-                    "failed" => queue.failed = n,
                     _ => {}
                 }
             }
+            let failed: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM session_consolidation_jobs job \
+                     WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB}"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            queue.failed = u64::try_from(failed).unwrap_or(0);
             queue.last_completed_at_us = conn.query_row(
                 "SELECT MAX(completed_at) FROM session_consolidation_jobs \
                  WHERE state = 'completed'",
@@ -13992,7 +14062,9 @@ impl ReaderPool {
     }
 
     /// The most recent consolidation jobs that gave up, newest first,
-    /// bounded to `limit`.
+    /// bounded to `limit`. A failure a newer generation of the same session
+    /// has since completed is left out (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -14002,12 +14074,13 @@ impl ReaderPool {
     ) -> StoreResult<Vec<FailedConsolidationJob>> {
         let limit = i64::from(limit.clamp(1, 100));
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT session_id, attempts, COALESCE(completed_at, 0), \
-                        COALESCE(last_error, '') \
-                 FROM session_consolidation_jobs WHERE state = 'failed' \
-                 ORDER BY COALESCE(completed_at, 0) DESC LIMIT ?1",
-            )?;
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT job.session_id, job.attempts, COALESCE(job.completed_at, 0), \
+                        COALESCE(job.last_error, '') \
+                 FROM session_consolidation_jobs job \
+                 WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB} \
+                 ORDER BY COALESCE(job.completed_at, 0) DESC LIMIT ?1"
+            ))?;
             let rows = stmt.query_map([limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -14604,7 +14677,8 @@ impl ReaderPool {
     }
 
     /// What the harvester reads next from one project: user prompts and
-    /// curated pages past its marks, at most `limit` of each.
+    /// curated pages past its marks, at most `limit` of each plus the rest of
+    /// the last row's timestamp group.
     ///
     /// # Errors
     /// Propagates SQL or pool errors.
@@ -15015,6 +15089,22 @@ fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage>
     })
 }
 
+/// SQL predicate over a `session_consolidation_jobs` row aliased `job`: a
+/// failed job that still needs an operator.
+///
+/// A failed generation stops mattering once a newer generation of the same
+/// session completes: consolidation reads the session's current observations,
+/// so the newer page already covers everything the failed run would have
+/// written. Counting it anyway kept `/admin/status`, `status --json` and the
+/// health panel reporting sessions that were consolidated, and sent a #1692
+/// watchdog to re-run them. A failure newer than the last completed
+/// generation is still listed. Generation is the primary key's second column,
+/// so the probe is an index lookup.
+const UNRECOVERED_FAILED_CONSOLIDATION_JOB: &str = "job.state = 'failed' \
+     AND NOT EXISTS (SELECT 1 FROM session_consolidation_jobs newer \
+     WHERE newer.session_id = job.session_id AND newer.state = 'completed' \
+     AND newer.generation > job.generation)";
+
 /// SQL for [`PageMeta::created_at`]: when the page itself first appeared.
 ///
 /// `pages.created_at` is per version, so the latest row alone would report the
@@ -15300,6 +15390,24 @@ impl SessionObservationSnapshot<'_> {
         Ok(summary)
     }
 
+    /// Every observation of the session, whatever project each row landed in.
+    ///
+    /// The one read of this snapshot that is deliberately not bound to its
+    /// scope, and it returns a number, never a row. A digest is built only from
+    /// the snapshot's own scope, but `ended_observation_count` and the idle
+    /// end's stamp count the whole session, so the generation a digest is
+    /// stamped against has to be counted the same way, in the same snapshot.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn whole_session_observation_count(&self) -> StoreResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+            params![self.session_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Row count and the session's first and last `created_at` in one
     /// aggregate pass, without reading a row.
     ///
@@ -15371,70 +15479,53 @@ impl SessionObservationSnapshot<'_> {
     /// # Errors
     /// Propagates any SQL error.
     pub fn prompt_titles(&self, head: usize, tail: usize) -> StoreResult<SessionPromptTitles> {
-        let total = self.conn.query_row(
-            "SELECT COUNT(*) FROM observations \
-             WHERE session_id = ?1 AND kind = ?2 \
-               AND workspace_id = ?3 AND project_id = ?4",
-            params![
-                self.session_id,
-                ObservationKind::UserPrompt.as_str(),
-                self.workspace_id,
-                self.project_id,
-            ],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let total = usize::try_from(total).unwrap_or(usize::MAX);
-        if total <= head + tail {
-            return Ok(SessionPromptTitles {
-                total,
-                first: self.prompt_title_window(total, ObservationOrder::Asc)?,
-                last: Vec::new(),
-            });
-        }
-        let mut last = self.prompt_title_window(tail, ObservationOrder::Desc)?;
-        last.reverse();
-        Ok(SessionPromptTitles {
-            total,
-            first: self.prompt_title_window(head, ObservationOrder::Asc)?,
-            last,
-        })
-    }
-
-    /// The first `limit` user-prompt titles of the session in `order`.
-    ///
-    /// # Errors
-    /// Propagates any SQL error.
-    fn prompt_title_window(
-        &self,
-        limit: usize,
-        order: ObservationOrder,
-    ) -> StoreResult<Vec<String>> {
-        let direction = match order {
-            ObservationOrder::Asc => "ASC",
-            ObservationOrder::Desc => "DESC",
-        };
-        let sql = format!(
+        // Read every user-prompt title for the session, then drop the machine
+        // turns Claude Code routes through the prompt channel (`<task-notification>`,
+        // `<teammate-message …>`, the cross-session envelope, the post-compaction
+        // summary): they are not what the user asked, so they belong in neither
+        // the `## Prompts` list nor its count (#2149). Other scaffolding — an IDE
+        // context block, a shell prompt echoed into a paste — is still real
+        // session history and stays listed, as it always has. The filter is a
+        // leading-shape test, not SQL-expressible, and a session's titles are
+        // bounded and small, so windowing happens in Rust over the kept set.
+        let mut stmt = self.conn.prepare_cached(
             "SELECT title FROM observations \
              WHERE session_id = ?1 AND kind = ?2 \
-               AND workspace_id = ?4 AND project_id = ?5 \
-             ORDER BY created_at {direction}, rowid {direction} LIMIT ?3"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+               AND workspace_id = ?3 AND project_id = ?4 \
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
         let rows = stmt.query_map(
             params![
                 self.session_id,
                 ObservationKind::UserPrompt.as_str(),
-                i64::try_from(limit).unwrap_or(i64::MAX),
                 self.workspace_id,
                 self.project_id,
             ],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )?;
-        let mut out = Vec::with_capacity(limit);
+        let mut titles = Vec::new();
         for title in rows {
-            out.push(title?);
+            let title = title?;
+            if !ai_memory_core::looks_like_machine_turn(&title) {
+                titles.push(title);
+            }
         }
-        Ok(out)
+
+        let total = titles.len();
+        if total <= head + tail {
+            return Ok(SessionPromptTitles {
+                total,
+                first: titles,
+                last: Vec::new(),
+            });
+        }
+        let last = titles.split_off(total - tail);
+        titles.truncate(head);
+        Ok(SessionPromptTitles {
+            total,
+            first: titles,
+            last,
+        })
     }
 
     /// Walk the session's user prompts in capture order, one resident at a
@@ -15971,6 +16062,37 @@ fn auto_improve_group_counts(
         out.push(row?);
     }
     Ok(out)
+}
+
+fn auto_improve_eval_gate_rejection_count(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    since_created_at: i64,
+) -> rusqlite::Result<usize> {
+    let reasons = crate::auto_improve::EVAL_GATE_REJECTION_REASONS
+        .iter()
+        .map(|reason| format!("'{reason}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT COUNT(*)
+         FROM auto_improve_rejections r
+         LEFT JOIN auto_improve_proposals p ON p.id = r.source_proposal_id
+         WHERE r.workspace_id = ?1 AND r.project_id = ?2 AND r.created_at >= ?3
+           AND (r.source_proposal_id IS NULL OR COALESCE(p.kind, '') NOT IN ('curator_report', 'auto_improve_report'))
+           AND r.reason IN ({reasons})"
+    );
+    let count: i64 = conn.query_row(
+        &sql,
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            since_created_at
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
 fn auto_improve_rejection_group_counts(
@@ -17298,6 +17420,38 @@ mod tests {
         assert_eq!(authority_candidate_limit(10), 40);
         assert_eq!(authority_candidate_limit(1_000), 1_300);
         assert_eq!(authority_candidate_limit(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn negative_tags_cap_authority_under_session_recall() {
+        use super::PageAuthority;
+
+        let bonus = crate::RetrievalTuning::default().session_recall_bonus;
+        for (tag, cap) in [
+            ("do-not-answer-from", 0.55),
+            ("test-fixture", 0.55),
+            ("superseded", 0.65),
+            ("historical", 0.80),
+        ] {
+            let frontmatter = format!(r#"{{"tags":["{tag}"]}}"#);
+            let tagged = PageAuthority::from_stored(
+                "sessions/a.md",
+                "session",
+                "episodic",
+                false,
+                &frontmatter,
+            );
+            assert!(
+                tagged.factor_for(true, bonus) <= cap,
+                "{tag}: session recall lifted the factor to {} above its {cap} cap",
+                tagged.factor_for(true, bonus)
+            );
+        }
+
+        let untagged =
+            PageAuthority::from_stored("sessions/a.md", "session", "episodic", false, "{}");
+        assert!(untagged.factor_for(true, bonus) > untagged.factor_for(false, bonus));
+        assert_eq!(untagged.factor_for(false, bonus), untagged.factor);
     }
 
     /// Build an open handoff for the pure-selection tests. `manual` toggles

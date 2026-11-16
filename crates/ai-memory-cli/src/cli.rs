@@ -1083,17 +1083,18 @@ pub enum ProfileCommand {
     Status(ProfileScopeArgs),
     /// List the profile's entries.
     List(ProfileScopeArgs),
-    /// Print one entry (`profile/` prefix optional).
+    /// Print one entry (`profile/` prefix and `.md` suffix optional).
     Show {
-        /// Entry path, e.g. `tools/pnpm.md`.
+        /// Entry path, e.g. `tools/pnpm` or `tools/pnpm.md`.
         path: String,
         #[command(flatten)]
         scope: ProfileScopeArgs,
     },
-    /// Remove one entry (`profile/` prefix optional). Git keeps its history,
-    /// and the harvester leaves the topic alone until you state it again.
+    /// Remove one entry (`profile/` prefix and `.md` suffix optional). Git
+    /// keeps its history, and the harvester leaves the topic alone until you
+    /// state it again.
     Forget {
-        /// Entry path, e.g. `tools/pnpm.md`.
+        /// Entry path, e.g. `tools/pnpm` or `tools/pnpm.md`.
         path: String,
         #[command(flatten)]
         scope: ProfileScopeArgs,
@@ -2634,7 +2635,8 @@ pub enum AgentChoice {
     #[value(alias = "zai")]
     Zcode,
     /// Hermes Agent (Nous Research) — lifecycle hooks declared in the `hooks:`
-    /// block of `~/.hermes/config.yaml`. Hermes runs each `command` through
+    /// block of the Hermes home's `config.yaml` (`$HERMES_HOME`, else
+    /// `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes` elsewhere). Hermes runs each `command` through
     /// `shlex.split` with the event JSON on stdin and **no shell**, so
     /// ai-memory's native `hook` subcommand is invoked directly (exec form,
     /// like Zero and ZCode). ai-memory wires the tool events and the session
@@ -2644,7 +2646,7 @@ pub enum AgentChoice {
     /// including after resuming an old native session. When the community
     /// memory-provider plugin is installed under `$HERMES_HOME/plugins`, only
     /// the tool events are wired, since the plugin owns the rest.
-    /// `~/.hermes/config.yaml` is NOT written: it is YAML the installer would
+    /// That `config.yaml` is NOT written: it is YAML the installer would
     /// have to splice, and Hermes gates user hooks behind its own acceptance
     /// prompt (`hooks_auto_accept`), so `install-hooks --agent hermes` prints
     /// the ready-to-paste block.
@@ -3059,8 +3061,8 @@ pub enum McpClient {
     /// installed separately with `install-hooks --agent dsh`.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
-    /// Hermes Agent (Nous Research) — the `mcp_servers:` map of
-    /// `~/.hermes/config.yaml`. Print-only (--apply is refused): ai-memory has
+    /// Hermes Agent (Nous Research) — the `mcp_servers:` map of the Hermes
+    /// home's `config.yaml`. Print-only (--apply is refused): ai-memory has
     /// no YAML editor for that file, which the operator also edits. The entry
     /// is a stdio `ai-memory mcp-bridge --no-session-id`, so it carries no
     /// token. Lifecycle capture is installed separately with `install-hooks

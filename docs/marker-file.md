@@ -385,12 +385,16 @@ pages stay reachable on demand through `memory_query`, which unions them.
 subagent captures stored as usual. Top-level (non-subagent) sessions are
 always stored regardless, including Claude Code sessions launched with
 `--agent`: `agent_type` alone describes the selected agent, while a non-empty
-`agent_id` identifies a subagent. Claude Code reports a subagent under the
-parent's `session_id`, so only the events carrying `agent_id` (plus
+`agent_id` identifies a subagent. Claude Code, Codex, Qwen Code, Kimi Code and
+CodeBuddy report a subagent under the parent's `session_id`, so only the
+subagent's own events (those carrying `agent_id`, plus
 `SubagentStart`/`SubagentStop`) are dropped and the parent session's own
-prompts, Stop, SessionEnd and summary are kept. Grok's `subagentType` marker
-still identifies subagent captures. The OMP extension posts every event of a
-subagent session with `agent_id`, so the whole subagent session is dropped,
+prompts, Stop, SessionEnd and summary are kept. Cline puts `agent_id` on every
+event, the root agent's included, so a Cline event is a subagent's only when
+it carries a non-empty `parent_agent_id`, and only those events are dropped.
+Grok's `subagentType` marker still identifies subagent captures. The OMP
+extension posts every event of a subagent session with `agent_id`, so the
+whole subagent session is dropped,
 while an advisor's tool calls stay with the session they advise. This is
 per-project on purpose: there is no server-global
 switch, so opting one noisy project in never sheds subagent captures for the
@@ -474,10 +478,10 @@ so they reach the server your hooks capture to: `run`, `resume`, `continue`,
 `restore-page`, `handoffs`, `message`, `pending-writes`, `profile`, `lint`,
 `forget-sweep`, `curator`, `auto-improve`, `auto-improve-report`, `embed`,
 `bootstrap`, `backfill`, `repair-backfill-timestamps`, `repair-split`,
-`finalize-session`, `rename-project`, `move-project`, `move-session`,
-`purge-project` and `purge-session` (their preview without `--confirm`
-included). They use the profile's URL and stored token, never the bearer
-from your config, and they fail
+`finalize-session`, `rename-project`, `move-project`, `merge-project`,
+`move-session`, `purge-project` and `purge-session` (their preview without
+`--confirm` included). They use the profile's URL and stored token, never
+the bearer from your config, and they fail
 closed with the same reason the hook reports when the profile does not
 resolve. They match the profile's roots against the directory as your
 shell names it (`PWD`, when it is the same directory as the process's working
@@ -1318,8 +1322,8 @@ Before that lookup, a Hermes event takes `TERMINAL_CWD` (the session's
 `terminal.cwd`) in place of the process directory. A multiplexing Hermes
 gateway exports only its default profile's `terminal.cwd`, so a gateway event
 of a named profile routes instead by a marker in that profile's own Hermes
-home, `~/.hermes/profiles/<name>/.ai-memory.toml` (under the gateway's
-`HERMES_HOME` when set). It is a normal local marker: `workspace`, `project`,
+home, `<Hermes home>/profiles/<name>/.ai-memory.toml` (under the gateway's
+`HERMES_HOME` when set, else the platform default). It is a normal local marker: `workspace`, `project`,
 `[capture]` and `server` all apply. Without it the event keeps the gateway's
 directory. See [install.md](install.md#hermes-agent-nous-research).
 

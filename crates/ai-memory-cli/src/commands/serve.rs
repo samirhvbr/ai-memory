@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
-    ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint,
+    ScheduledAutoImproveSettings, SessionPageConsolidation, run_auto_improve_scheduler_tick,
+    run_embedding_backfill, run_lint,
 };
 use ai_memory_core::{ActiveProject, IdentityKey, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -1044,40 +1044,11 @@ async fn run_session_consolidation_worker(
         let session_id = job.session_id();
         let generation = job.generation();
         let attempts = job.attempts();
-        // An agent may have written the session page with its own model
-        // while the session was still open, before this job existed. Leave
-        // that page alone: the agent's own tool call, the Stop and the
-        // SessionEnd always land after it, so no observation count can tell
-        // a stale page from a current one.
-        match consolidator.session_page_written_by_agent(session_id).await {
-            Ok(true) => {
-                match writer.complete_session_consolidation(job).await {
-                    Ok(()) => info!(
-                        session = %session_id,
-                        generation,
-                        "session page was written by the agent; queued consolidation skipped",
-                    ),
-                    Err(error) => tracing::warn!(
-                        %error,
-                        session = %session_id,
-                        generation,
-                        "session consolidation skip could not complete the queue job",
-                    ),
-                }
-                #[cfg(test)]
-                completed.notify_one();
-                continue;
-            }
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                %error,
-                session = %session_id,
-                generation,
-                "could not read the session page before queued consolidation; consolidating",
-            ),
-        }
+        // The agent's own session page is kept, whether it was written while
+        // the session was open or lands during the completion: the write is
+        // conditional on the page version read before the check.
         let actor = session_consolidation_actor(&reader, session_id).await;
-        let consolidation = consolidator.consolidate_session(session_id, false, actor, None, None);
+        let consolidation = consolidator.consolidate_session_keeping_agent_page(session_id, actor);
         tokio::pin!(consolidation);
         let result = tokio::select! {
             () = cancel.cancelled() => {
@@ -1090,15 +1061,22 @@ async fn run_session_consolidation_worker(
         };
 
         match result {
-            Ok(outcome) => match writer.complete_session_consolidation(job).await {
+            Ok(consolidated) => match writer.complete_session_consolidation(job).await {
                 Ok(()) => {
-                    info!(
-                        session = %session_id,
-                        generation,
-                        attempts,
-                        path = %outcome.path,
-                        "queued LLM consolidation written",
-                    );
+                    match consolidated {
+                        SessionPageConsolidation::Consolidated(outcome) => info!(
+                            session = %session_id,
+                            generation,
+                            attempts,
+                            path = %outcome.path,
+                            "queued LLM consolidation written",
+                        ),
+                        SessionPageConsolidation::AgentPageKept => info!(
+                            session = %session_id,
+                            generation,
+                            "session page was written by the agent; queued consolidation skipped",
+                        ),
+                    }
                     #[cfg(test)]
                     completed.notify_one();
                 }
@@ -1949,17 +1927,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
-                .merge(
-                    web.protected
-                        .layer(axum::middleware::from_fn_with_state(
-                            auth_state.clone(),
-                            require_dual_auth,
-                        ))
-                        .layer(axum::middleware::from_fn_with_state(
-                            html_auth,
-                            html_auth_redirect_mw,
-                        )),
-                )
+                .merge(layer_protected_web(
+                    web.protected,
+                    auth_state.clone(),
+                    html_auth,
+                    web.api_cors,
+                ))
                 .merge(web.public.layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
@@ -2371,14 +2344,14 @@ async fn start_maintenance_scheduler(
                     let reader = reader.clone();
                     let wiki = wiki.clone();
                     let llm = llm.clone();
-                    let decay_lambda = decay.decay_params().lambda;
+                    let decay_params = decay.decay_params();
                     async move {
                         let started = std::time::Instant::now();
                         let outcome = run_scheduled_lint_tick(
                             &reader,
                             &wiki,
                             llm.as_ref(),
-                            decay_lambda,
+                            decay_params,
                             contradiction_band_min,
                             contradiction_band_max,
                         )
@@ -2890,7 +2863,7 @@ async fn run_scheduled_lint_tick(
     reader: &ReaderPool,
     wiki: &Wiki,
     llm: Option<&Arc<dyn LlmProvider>>,
-    decay_lambda: f64,
+    decay: ai_memory_store::DecayParams,
     contradiction_band_min: f32,
     contradiction_band_max: f32,
 ) -> Result<ScheduledLintTickOutcome> {
@@ -2910,7 +2883,7 @@ async fn run_scheduled_lint_tick(
             ai_memory_consolidate::LintOptions {
                 dry_run: false,
                 use_llm: false,
-                decay_lambda,
+                decay,
                 // The automatic scheduled lint stays rule-based: the A5
                 // contradiction detector is on for the user-invoked
                 // `memory_lint` / admin lint, not the background sweep.
@@ -3407,6 +3380,35 @@ async fn require_allowed_host(
     }
     tracing::warn!(host, allowed = ?allowed_hosts, "rejected request with disallowed Host header");
     (StatusCode::FORBIDDEN, "forbidden host\n").into_response()
+}
+
+/// Layer the dual-auth web surfaces (`/api/v1` and the builtin wiki) the way
+/// `serve` mounts them. Dual auth is innermost; the HTML login redirect wraps
+/// it so it sees the auth answers; the operator's `/api/v1` CORS policy is
+/// outermost, because a browser sends its CORS preflight without credentials
+/// and auth in front of the policy refused every one with 401.
+fn layer_protected_web(
+    protected: axum::Router,
+    auth_state: Arc<AuthState>,
+    html_auth: Arc<HtmlAuthRedirectConfig>,
+    api_cors: Option<ai_memory_web::ApiCors>,
+) -> axum::Router {
+    let router = protected
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            require_dual_auth,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            html_auth,
+            html_auth_redirect_mw,
+        ));
+    match api_cors {
+        Some(cors) => router.layer(axum::middleware::from_fn_with_state(
+            cors,
+            ai_memory_web::api_cors_mw,
+        )),
+        None => router,
+    }
 }
 
 /// Refuse browser requests from a foreign page on a server with no credential
@@ -6096,6 +6098,114 @@ mod tests {
         assert!(body.contains("Durable worker completed"), "{body}");
     }
 
+    /// A provider that writes a session page version while the worker's
+    /// completion is in flight, i.e. after the worker's agent-page check and
+    /// before its write. With `consolidated_by: agent` it stands in for a
+    /// concurrent `memory_write_page(session_id)`.
+    struct WritesSessionPageDuringCompletionLlm {
+        wiki: Wiki,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        frontmatter: serde_json::Value,
+        body: &'static str,
+    }
+
+    impl LlmProvider for WritesSessionPageDuringCompletionLlm {
+        fn name(&self) -> &'static str {
+            "writes-session-page-during-completion"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { panic!("only the structured call is expected") })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                self.wiki
+                    .write_page(WritePageRequest {
+                        workspace_id: self.workspace_id,
+                        project_id: self.project_id,
+                        path: PagePath::new(format!("sessions/{}.md", self.session_id)).unwrap(),
+                        frontmatter: self.frontmatter.clone(),
+                        body: self.body.into(),
+                        tier: Tier::Episodic,
+                        pinned: false,
+                        title: None,
+                        admission_ctx: None,
+                        author_id: None,
+                        actor: ai_memory_core::ActorContext::anonymous(),
+                        evidence: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+                Ok(serde_json::json!({
+                    "title": "Compiled session",
+                    "body_markdown": "Durable worker completed this session.",
+                    "tags": ["test"]
+                }))
+            })
+        }
+    }
+
+    /// The agent writes the session page while the worker's completion runs,
+    /// after the worker found no agent page: the worker's conditional write
+    /// backs off and the agent's page stays the latest version.
+    #[tokio::test]
+    async fn session_consolidation_worker_keeps_an_agent_page_written_during_the_completion() {
+        let (_tmp, store, wiki, workspace_id, project_id, session_id) =
+            session_with_written_page(serde_json::json!({"consolidated": true})).await;
+        let llm = Arc::new(WritesSessionPageDuringCompletionLlm {
+            wiki: wiki.clone(),
+            workspace_id,
+            project_id,
+            session_id,
+            frontmatter: serde_json::json!({"consolidated_by": "agent"}),
+            body: "# Agent page\n\nWritten by the agent during the completion.",
+        });
+        let body = run_worker_once(&store, wiki, llm, workspace_id, project_id, session_id).await;
+        assert!(body.contains("Written by the agent during"), "{body}");
+    }
+
+    /// Control: a version no agent wrote (a rule-based summary, a checkpoint)
+    /// landing during the completion is still replaced by the worker's page,
+    /// as before the write became conditional.
+    #[tokio::test]
+    async fn session_consolidation_worker_replaces_a_non_agent_page_written_during_the_completion()
+    {
+        let (_tmp, store, wiki, workspace_id, project_id, session_id) =
+            session_with_written_page(serde_json::json!({"consolidated": true})).await;
+        let llm = Arc::new(WritesSessionPageDuringCompletionLlm {
+            wiki: wiki.clone(),
+            workspace_id,
+            project_id,
+            session_id,
+            frontmatter: serde_json::json!({"consolidated": true}),
+            body: "# Rule-based page\n\nWritten by a rule-based writer during the completion.",
+        });
+        let body = run_worker_once(&store, wiki, llm, workspace_id, project_id, session_id).await;
+        assert!(body.contains("Durable worker completed"), "{body}");
+    }
+
     /// What the SessionEnd queue must do with a failure.
     #[derive(Clone, Copy)]
     enum QueueOutcome {
@@ -6493,7 +6603,7 @@ mod tests {
             &store.reader,
             &wiki,
             Some(&panic_llm),
-            ai_memory_store::DecayParams::default().lambda,
+            ai_memory_store::DecayParams::default(),
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         )
@@ -7245,6 +7355,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(absent_web.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A browser sends a CORS preflight without credentials. With dual auth
+    /// wrapping the `/api/v1` CORS policy, every preflight from an operator's
+    /// configured origin got 401 and no cross-origin client could call the
+    /// API at all. The policy must sit outside auth, scoped to `/api/v1`,
+    /// while every real request is still authenticated.
+    #[tokio::test]
+    async fn api_cors_preflight_is_answered_outside_auth_and_only_on_api_v1() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let origins = ["https://app.example.com".to_string()];
+        let web = split_web_routers(
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &origins,
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+                trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                runtime: None,
+                health: None,
+            },
+        )
+        .unwrap();
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let html_auth = web
+            .html_auth
+            .expect("builtin wiki mount must return html_auth");
+        let router = apply_host_layer(
+            layer_protected_web(web.protected, auth, html_auth, web.api_cors),
+            vec!["localhost".to_string()],
+        );
+        let send = |method: &str, uri: &str, origin: &str, bearer: bool| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Host", "localhost")
+                .header(header::ORIGIN, origin);
+            if method == "OPTIONS" {
+                req = req
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization");
+            }
+            if bearer {
+                req = req.header(header::AUTHORIZATION, "Bearer secret");
+            }
+            router.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let allowed = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let app = "https://app.example.com";
+
+        let preflight = send("OPTIONS", "/api/v1/projects", app, false)
+            .await
+            .unwrap();
+        assert!(
+            preflight.status().is_success(),
+            "preflight refused: {}",
+            preflight.status()
+        );
+        assert_eq!(allowed(&preflight).as_deref(), Some(app));
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+            "true"
+        );
+
+        // The real request is still authenticated, and its refusal is
+        // readable by the calling page.
+        let anonymous = send("GET", "/api/v1/projects", app, false).await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(allowed(&anonymous).as_deref(), Some(app));
+        let signed = send("GET", "/api/v1/projects", app, true).await.unwrap();
+        assert_eq!(signed.status(), StatusCode::OK);
+        assert_eq!(allowed(&signed).as_deref(), Some(app));
+
+        // An unlisted origin gets no grant, before or after auth.
+        let foreign = "https://evil.example";
+        let preflight = send("OPTIONS", "/api/v1/projects", foreign, false)
+            .await
+            .unwrap();
+        assert_eq!(allowed(&preflight), None);
+        let signed = send("GET", "/api/v1/projects", foreign, true)
+            .await
+            .unwrap();
+        assert_eq!(allowed(&signed), None);
+
+        // `/web` stays CORS-free and behind auth.
+        let preflight = send("OPTIONS", "/web", app, false).await.unwrap();
+        assert_eq!(preflight.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(allowed(&preflight), None);
+        let signed = send("GET", "/web", app, true).await.unwrap();
+        assert_eq!(signed.status(), StatusCode::OK);
+        assert_eq!(allowed(&signed), None);
     }
 
     #[tokio::test]

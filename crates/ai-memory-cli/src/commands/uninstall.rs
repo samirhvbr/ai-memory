@@ -12,7 +12,7 @@ use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
 use crate::commands::apply_shared::{PrivateBackup, apply_atomic_with_backup};
 use crate::commands::path_util::{
-    agent_config_home, claude_config_dir, claude_config_paths, home_dir,
+    agent_config_home, claude_config_dir, claude_config_paths, hermes_home, home_dir,
 };
 use crate::commands::user_service::{self, ServiceManager};
 use crate::commands::{agent_plugins, data_purge, install_hooks, install_mcp, openclaw_plugin};
@@ -21,9 +21,9 @@ use crate::localization::diagnostic;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
-    MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+    HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
-use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
+use ai_memory_core::{MARKER_END, find_managed_block};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -45,6 +45,9 @@ enum RewriteOp {
     /// Zero hooks.json — `hooks` array entries whose `id` carries the
     /// `ai-memory-` prefix.
     ZeroHooksJson,
+    /// ZCode `~/.zcode/cli/config.json` — `hooks.events` matcher-group
+    /// entries whose `statusMessage` carries the `ai-memory` signature.
+    ZcodeHooksJson,
     /// Kimi Code `[[hooks]]` rules inside config.toml.
     KimiCodeHooksToml,
     /// Kiro CLI v2 agent-config hooks with exact generated command signatures.
@@ -63,6 +66,9 @@ enum HookConfigShape {
     NestedHooksKey,
     /// Devin `hooks.v1.json`: the file itself is `{ "Event": [...] }`.
     FlatHookFile,
+    /// Cursor `hooks.json`: the nested shape, written back with every `/`
+    /// escaped so Cursor's comment stripper keeps the file.
+    CursorHooksFile,
 }
 
 /// Generated files that uninstall may delete after content re-validation.
@@ -195,7 +201,7 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
 /// produce no entry. `name`/`url` identify the MCP server.
 ///
 /// Harness homes (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`,
-/// `GROK_HOME`, `APPDATA`) come
+/// `GROK_HOME`, `HERMES_HOME`, `APPDATA`, `LOCALAPPDATA`) come
 /// from `env`, the environment `Config::load` captured (invariant #1).
 fn build_plan(
     i18n: &ai_memory_core::i18n::Localizer,
@@ -249,7 +255,7 @@ fn build_plan(
             ),
             (
                 install_hooks::cursor_hooks_path()?,
-                HookConfigShape::NestedHooksKey,
+                HookConfigShape::CursorHooksFile,
             ),
             (
                 install_hooks::gemini_settings_path()?,
@@ -314,6 +320,7 @@ fn build_plan(
             let removal = match shape {
                 HookConfigShape::NestedHooksKey => strip_ai_memory_hooks(&content)?,
                 HookConfigShape::FlatHookFile => strip_ai_memory_hooks_flat(&content)?,
+                HookConfigShape::CursorHooksFile => strip_cursor_hooks(&content)?,
             };
             push_rewrite(
                 &mut plan,
@@ -388,6 +395,23 @@ fn build_plan(
                 zero,
                 removal.removed_events,
                 RewriteOp::ZeroHooksJson,
+            );
+        }
+
+        // ZCode installs its capture under `hooks.events` in
+        // `~/.zcode/cli/config.json`; without this pass `uninstall --only hooks`
+        // reports "nothing to remove" while all six generated hooks stay live
+        // (GHSA-qmg7-f7fg-rg4x).
+        let zcode = install_hooks::zcode_config_path()?;
+        if zcode.exists() {
+            let content = std::fs::read_to_string(&zcode)
+                .with_context(|| format!("reading {}", zcode.display()))?;
+            let removal = strip_zcode_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                zcode,
+                removal.removed_events,
+                RewriteOp::ZcodeHooksJson,
             );
         }
 
@@ -571,6 +595,7 @@ fn build_plan(
         let appdata = env.var_os("APPDATA").map(PathBuf::from);
         let grok_home = install_mcp::grok_home_in(env.var_os("GROK_HOME")).ok();
         let copilot_home = install_mcp::copilot_home_in(env.var_os("COPILOT_HOME")).ok();
+        let hermes_home = hermes_home(env, home.as_deref());
         for root in skill_roots(
             &cwd,
             home.as_deref(),
@@ -578,6 +603,7 @@ fn build_plan(
             grok_home.as_deref(),
             copilot_home.as_deref(),
             claude_config_dir.as_deref(),
+            hermes_home.as_deref(),
         ) {
             for skill in MANAGED_SKILLS {
                 push_generated_delete(
@@ -625,20 +651,22 @@ fn build_plan(
     Ok(plan)
 }
 
-fn skill_roots(
+pub(super) fn skill_roots(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
     grok_home: Option<&Path>,
     copilot_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
+    hermes_home: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(14);
+    let mut roots = Vec::with_capacity(16);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
@@ -651,6 +679,7 @@ fn skill_roots(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
         push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
+        push_unique_skill_root(&mut roots, home.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
         for root in super::install_skills::antigravity_global_skill_roots(home) {
             push_unique_skill_root(&mut roots, root);
         }
@@ -665,6 +694,13 @@ fn skill_roots(
     // installs may predate the env var.
     if let Some(claude_config_dir) = claude_config_dir {
         push_unique_skill_root(&mut roots, claude_config_dir.join(SKILLS_DIR));
+    }
+    // Global Hermes skills install to `$HERMES_HOME/skills` (or the platform
+    // default, e.g. `%LOCALAPPDATA%\hermes\skills` on Windows). Sweep it
+    // alongside `~/.hermes/skills` so installs predating the env override or
+    // platform default are removed too.
+    if let Some(hermes_home) = hermes_home {
+        push_unique_skill_root(&mut roots, hermes_home.join(SKILLS_DIR));
     }
     roots
 }
@@ -768,10 +804,14 @@ fn apply_change(
                         RewriteOp::HooksJson(HookConfigShape::FlatHookFile) => {
                             strip_ai_memory_hooks_flat(&out)?.new_content
                         }
+                        RewriteOp::HooksJson(HookConfigShape::CursorHooksFile) => {
+                            strip_cursor_hooks(&out)?.new_content
+                        }
                         RewriteOp::AntigravityHooksJson => {
                             strip_antigravity_hooks(&out)?.new_content
                         }
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
+                        RewriteOp::ZcodeHooksJson => strip_zcode_hooks(&out)?.new_content,
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
@@ -1261,10 +1301,7 @@ fn strip_instructions_block(content: &str) -> (String, bool) {
     // managed block can't be matched as the real end delimiter (which would
     // leave an orphan tail behind, breaking the install->uninstall
     // round-trip).
-    let Some(start) = find_marker_line(content, MARKER_START, 0) else {
-        return (content.to_string(), false);
-    };
-    let Some(end_pos) = find_marker_line(content, MARKER_END, start) else {
+    let Some((start, end_pos)) = find_managed_block(content) else {
         return (content.to_string(), false);
     };
     let end = end_pos + MARKER_END.len();
@@ -1414,6 +1451,15 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
+/// Strip ai-memory's entries from Cursor's `hooks.json` and keep the escaped
+/// `\/` form install writes, so a `//` in a hook the user keeps does not make
+/// Cursor drop the whole file.
+fn strip_cursor_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removal = strip_ai_memory_hooks(content)?;
+    removal.new_content = install_hooks::escape_slashes_for_cursor_jsonc(&removal.new_content);
+    Ok(removal)
+}
+
 /// Remove ai-memory's entries from Zero's hooks.json `hooks` array. Zero
 /// hook entries are objects with an `id`; install writes ours with the
 /// `ai-memory-` prefix (issue #156), so the prefix IS the ownership
@@ -1435,6 +1481,68 @@ fn strip_zero_hooks(content: &str) -> Result<HookRemoval> {
             }
             !ours
         });
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
+/// Remove ai-memory's hook entries from ZCode's `~/.zcode/cli/config.json`
+/// `hooks.events` map (#512, GHSA-qmg7-f7fg-rg4x). Entries ai-memory wrote
+/// carry a `statusMessage` starting with `ai-memory`
+/// (`install_hooks::is_our_zcode_hook`), so ownership is proven by that
+/// signature alone and every sibling survives untouched: `hooks.enabled`,
+/// `hooks.maxOutputBytes`, other agents' hooks sharing a matcher group, and
+/// events ai-memory never wrote. A matcher group our own withdrawal empties is
+/// dropped (an empty group runs nothing and is pure downside under ZCode's
+/// strict validation); a group that was already empty, or still holds someone
+/// else's hooks, is left alone. An event key left with no matcher groups is
+/// removed, but the `hooks` block and its settings are not.
+fn strip_zcode_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(events) = root
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.as_object_mut())
+            .and_then(|hooks| hooks.get_mut("events"))
+            .and_then(|events| events.as_object_mut())
+        else {
+            return Ok(());
+        };
+        let names: Vec<String> = events.keys().cloned().collect();
+        for name in names {
+            let Some(groups) = events.get_mut(&name).and_then(|slot| slot.as_array_mut()) else {
+                continue;
+            };
+            let mut removed_from_event = false;
+            groups.retain_mut(|group| {
+                let Some(hooks) = group
+                    .as_object_mut()
+                    .and_then(|group| group.get_mut("hooks"))
+                    .and_then(|v| v.as_array_mut())
+                else {
+                    return true;
+                };
+                let before = hooks.len();
+                hooks.retain(|hook| !install_hooks::is_our_zcode_hook(hook));
+                let we_emptied = hooks.len() != before;
+                if we_emptied {
+                    removed_from_event = true;
+                }
+                // Drop a group only when our own withdrawal is what emptied it;
+                // a pre-existing empty group, or one still running someone
+                // else's hook, stays.
+                !(we_emptied && hooks.is_empty())
+            });
+            if removed_from_event {
+                removed_events.push(name.clone());
+            }
+            if groups.is_empty() {
+                events.remove(&name);
+            }
+        }
         Ok(())
     })?;
     Ok(HookRemoval {
@@ -1977,6 +2085,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::MARKER_START;
     #[cfg(unix)]
     use std::time::Duration;
 
@@ -2208,6 +2317,47 @@ mod tests {
         );
     }
 
+    /// The skill sweep finds a global Hermes skill under the HERMES_HOME
+    /// `Config::load` captured (invariant #1), not only ~/.hermes/skills.
+    #[test]
+    fn skill_sweep_uses_the_captured_hermes_home() {
+        let hermes_home = tempfile::tempdir().unwrap();
+        let skill = hermes_home
+            .path()
+            .join(SKILLS_DIR)
+            .join(MANAGED_SKILLS[0].relative_path);
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, MANAGED_SKILLS[0].content).unwrap();
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "HERMES_HOME",
+            hermes_home.path().to_str().unwrap(),
+        )]);
+        let args = UninstallArgs {
+            apply: false,
+            purge_data: false,
+            only: Some(crate::cli::UninstallOnly::Skills),
+            mcp_name: None,
+            mcp_url: String::new(),
+            yes: false,
+            profile: None,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let plan = build_plan(
+            &ai_memory_core::i18n::Localizer::default(),
+            &args,
+            data.path(),
+            &env,
+        )
+        .unwrap();
+        assert!(
+            plan.iter().any(|change| matches!(
+                change,
+                PlannedChange::DeleteFile { path, .. } if *path == skill
+            )),
+            "{plan:?}"
+        );
+    }
+
     /// Each installed plugin is removed through its own harness CLI, and one
     /// failure does not stop the next.
     #[test]
@@ -2250,17 +2400,17 @@ mod tests {
         let home = Path::new("/home/alice");
         let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
 
-        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None, None);
+        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None, None, None);
         assert!(
             roots.contains(&appdata.join("devin").join(SKILLS_DIR)),
             "{roots:?}"
         );
 
-        let without = skill_roots(cwd, Some(home), None, None, None, None);
+        let without = skill_roots(cwd, Some(home), None, None, None, None, None);
         assert_eq!(
             without.len(),
-            12,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × \
+            14,
+            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot/hermes × \
              project+global, plus Antigravity's two global roots)"
         );
         assert!(
@@ -2285,6 +2435,7 @@ mod tests {
             None,
             None,
             Some(Path::new("/stores/claude")),
+            None,
         );
         assert!(
             roots.contains(&PathBuf::from("/stores/claude/skills")),
@@ -2303,6 +2454,7 @@ mod tests {
             Some(Path::new("/home/alice")),
             None,
             Some(Path::new("/custom/grok")),
+            None,
             None,
             None,
         );
@@ -2387,6 +2539,7 @@ mod tests {
             None,
             Some(Path::new("/custom/copilot")),
             None,
+            None,
         );
         assert!(
             roots.contains(&PathBuf::from("/repo/.github/skills")),
@@ -2401,6 +2554,7 @@ mod tests {
         let default_home = skill_roots(
             Path::new("/repo"),
             Some(Path::new("/home/alice")),
+            None,
             None,
             None,
             None,
@@ -2421,6 +2575,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         for root in [
             "/home/alice/.gemini/config/skills",
@@ -2428,6 +2583,44 @@ mod tests {
         ] {
             assert!(roots.contains(&PathBuf::from(root)), "{root}: {roots:?}");
         }
+    }
+
+    /// `install-skills --agent hermes` writes `.hermes/skills` in the project
+    /// and `$HERMES_HOME/skills` (or the platform default) globally; uninstall
+    /// must sweep project, `~/.hermes/skills`, and relocated Hermes homes.
+    #[test]
+    fn skill_roots_sweep_hermes_project_home_and_relocated_roots() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+            Some(Path::new("/custom/hermes")),
+        );
+        for root in [
+            "/repo/.hermes/skills",
+            "/home/alice/.hermes/skills",
+            "/custom/hermes/skills",
+        ] {
+            assert!(roots.contains(&PathBuf::from(root)), "{root}: {roots:?}");
+        }
+
+        let default_home = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+            Some(Path::new("/home/alice/.hermes")),
+        );
+        let home_hermes_count = default_home
+            .iter()
+            .filter(|root| *root == Path::new("/home/alice/.hermes/skills"))
+            .count();
+        assert_eq!(home_hermes_count, 1);
     }
 
     #[test]
@@ -2497,6 +2690,15 @@ mod tests {
         assert!(stripped.contains("More notes."));
         assert!(!stripped.contains("BODY"));
         assert!(!stripped.contains(MARKER_START));
+    }
+
+    #[test]
+    fn strip_instructions_keeps_text_after_a_start_marker_without_its_end() {
+        let original = format!("# A\n{MARKER_START}\nmy notes\n");
+        let installed = format!("{original}\n{MARKER_START}\nBODY\n{MARKER_END}\n");
+        let (stripped, found) = strip_instructions_block(&installed);
+        assert!(found);
+        assert_eq!(stripped, original);
     }
 
     #[test]
@@ -2599,6 +2801,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
         assert!(v["hooks"].get("stop").is_none());
         assert_eq!(v["version"], 1, "sibling top-level key preserved");
+    }
+
+    #[test]
+    fn strip_cursor_hooks_keeps_the_kept_hooks_loadable_by_cursor() {
+        let content = r#"{
+      "version": 1,
+      "hooks": {
+        "stop": [
+          {"type":"command","command":"AI_MEMORY_HOOK_URL=https:\/\/h \/x\/stop.sh"},
+          {"type":"command","command":"curl -s https:\/\/example.com\/ping"}
+        ]
+      }
+    }"#;
+        let out = strip_cursor_hooks(content).unwrap();
+        assert_eq!(out.removed_events, vec!["stop".to_string()]);
+        assert!(
+            !out.new_content.contains("//"),
+            "a bare // makes Cursor drop the file: {}",
+            out.new_content
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        let stop = v["hooks"]["stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "only ours removed");
+        assert_eq!(stop[0]["command"], "curl -s https://example.com/ping");
     }
 
     #[test]
@@ -2735,6 +2961,62 @@ mod tests {
             serde_json::json!(true),
             "the top-level enabled flag is not ours to touch"
         );
+    }
+
+    #[test]
+    fn strip_zcode_hooks_withdraws_ours_and_preserves_everything_else() {
+        // SessionStart: an ai-memory group next to a third-party group, so the
+        //   emptied ai-memory group is dropped and the other one stays.
+        // Stop: ai-memory and a user hook share one matcher group, so the group
+        //   survives with only the user hook.
+        // PreToolUse: only ai-memory, so the whole event key is removed.
+        // Notify: a pre-existing empty group we never touched must stay.
+        let content = r#"{
+            "model": "m",
+            "hooks": {
+                "enabled": true,
+                "maxOutputBytes": 65536,
+                "events": {
+                    "SessionStart": [
+                        {"hooks": [{"type":"command","command":"ai-memory","args":["hook"],"statusMessage":"ai-memory session start"}]},
+                        {"hooks": [{"type":"command","command":"printf x","statusMessage":"user hook"}]}
+                    ],
+                    "Stop": [
+                        {"hooks": [
+                            {"type":"command","command":"ai-memory","args":["hook"],"statusMessage":"ai-memory stop"},
+                            {"type":"command","command":"printf y","statusMessage":"user stop"}
+                        ]}
+                    ],
+                    "PreToolUse": [
+                        {"hooks": [{"type":"command","command":"ai-memory","args":["hook"],"statusMessage":"ai-memory pre tool"}]}
+                    ],
+                    "Notify": [
+                        {"hooks": []}
+                    ]
+                }
+            }
+        }"#;
+        let out = strip_zcode_hooks(content).unwrap();
+        let mut removed = out.removed_events.clone();
+        removed.sort();
+        assert_eq!(removed, vec!["PreToolUse", "SessionStart", "Stop"]);
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert_eq!(v["model"], "m", "siblings survive");
+        assert_eq!(v["hooks"]["enabled"], true);
+        assert_eq!(v["hooks"]["maxOutputBytes"], 65536);
+        let events = &v["hooks"]["events"];
+        // SessionStart kept its one non-ours group only.
+        let ss = events["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 1);
+        assert_eq!(ss[0]["hooks"][0]["statusMessage"], "user hook");
+        // Stop kept the shared group with only the user hook.
+        let stop = events["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["statusMessage"], "user stop");
+        // PreToolUse was entirely ours and is gone.
+        assert!(events.get("PreToolUse").is_none(), "emptied event removed");
+        // A pre-existing empty group we did not touch stays.
+        assert_eq!(events["Notify"].as_array().unwrap().len(), 1);
     }
 
     // Devin's hooks.v1.json: the root object IS the event map (no "hooks"

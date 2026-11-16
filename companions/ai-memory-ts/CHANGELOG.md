@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `pages.update` preserves profile stack filters and enforcement metadata on
+  a body edit. `pages.write` and `pages.update` accept `appliesTo` and
+  `enforcedBy` for profile entries. (#2207)
+
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
   GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
   Node 22 and 24.
@@ -30,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initialized the MCP session before the first `callTool`, so raw tool calls
   work with `--http-stateful` without a preceding wrapped call. Raw calls
   still skip `tools/list` and schema checks. (#1816)
+
+- Restored `pages.read` and `pages.update` compatibility with servers that
+  predate the section metadata added in 3.3.0.
+
+- `api.page` accepts literal `%2e` and `%2e%2e` segments in stored page paths. (#2217)
 
 ### Added
 

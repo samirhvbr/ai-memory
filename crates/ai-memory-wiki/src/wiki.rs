@@ -930,10 +930,10 @@ impl Wiki {
     /// under the watcher-ignored `.ai-memory-tmp.` prefix and deleted once the
     /// rows are retired: left in place, the next reconciliation pass would
     /// re-index it as a fresh latest page in the source scope. A store failure
-    /// puts the file back where it was in both modes. When `from == to` (a
-    /// re-home of a session already rooted in the destination) there is no
-    /// file to relocate: the file step is skipped and only the store sweep
-    /// runs.
+    /// puts the files back where they were in both modes. The file step
+    /// follows the rows the store sweeps, not just `from`: for a re-home (the
+    /// session row already sits in the destination) that is every other
+    /// scope with a latest page row; see [`Self::plan_session_page_files`].
     ///
     /// # Errors
     /// Returns [`WikiError::DestinationPageExists`] when the destination
@@ -964,40 +964,33 @@ impl Wiki {
             None
         };
 
+        let sources = self
+            .plan_session_page_files_locked(session_id, from, to, pages)
+            .await?;
         let file_name = format!("{session_id}.md");
-        let src = project_path(
-            &self.root,
-            from.0,
-            from.1,
-            &PathBuf::from("sessions").join(&file_name),
-            Prepare::Inspect,
-        )?;
-        let parked = if from != to && src.is_file() {
+        // (original, where it now sits), in the order they were parked.
+        let mut parked: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for (_, _, src) in sources {
             let target = match pages {
-                PagesMode::Move => {
-                    let dst = project_path(
-                        &self.root,
-                        to.0,
-                        to.1,
-                        &PathBuf::from("sessions").join(&file_name),
-                        Prepare::Parents,
-                    )?;
-                    if dst.exists() {
-                        return Err(WikiError::DestinationPageExists(dst.display().to_string()));
-                    }
-                    dst
-                }
+                PagesMode::Move => project_path(
+                    &self.root,
+                    to.0,
+                    to.1,
+                    &PathBuf::from("sessions").join(&file_name),
+                    Prepare::Parents,
+                )?,
                 // Same directory, watcher-ignored name: invisible to
                 // reindex/reconcile, trivially renamed back on failure.
                 PagesMode::Regenerate => {
                     src.with_file_name(format!(".ai-memory-tmp.move-session.{file_name}"))
                 }
             };
-            self.git.rename_checked(&src, &target)?;
-            Some(target)
-        } else {
-            None
-        };
+            if let Err(e) = self.git.rename_checked(&src, &target) {
+                self.restore_parked_session_files(&parked, &e.to_string())?;
+                return Err(e);
+            }
+            parked.push((src, target));
+        }
 
         match self
             .writer
@@ -1005,18 +998,20 @@ impl Wiki {
             .await
         {
             Ok(summary) => {
-                let file = match (&parked, pages) {
-                    (None, _) => SessionPageFile::Absent,
-                    (Some(_), PagesMode::Move) => SessionPageFile::Moved,
-                    (Some(tmp), PagesMode::Regenerate) => {
-                        // The rows are retired; a leftover temp file is
-                        // ignored by the watcher, so this is best-effort.
-                        if let Err(e) = self.git.remove_file_checked(tmp) {
-                            tracing::warn!(
-                                error = %e,
-                                path = %tmp.display(),
-                                "move-session: could not remove parked session page file"
-                            );
+                let file = match pages {
+                    _ if parked.is_empty() => SessionPageFile::Absent,
+                    PagesMode::Move => SessionPageFile::Moved,
+                    PagesMode::Regenerate => {
+                        for (_, tmp) in &parked {
+                            // The rows are retired; a leftover temp file is
+                            // ignored by the watcher, so this is best-effort.
+                            if let Err(e) = self.git.remove_file_checked(tmp) {
+                                tracing::warn!(
+                                    error = %e,
+                                    path = %tmp.display(),
+                                    "move-session: could not remove parked session page file"
+                                );
+                            }
                         }
                         SessionPageFile::Removed
                     }
@@ -1027,18 +1022,119 @@ impl Wiki {
                 Ok(MoveSessionOutcome { summary, file })
             }
             Err(e) => {
-                if let Some(target) = parked
-                    && let Err(rollback_err) = self.git.rename_checked(&target, &src)
-                {
-                    return Err(WikiError::Io(std::io::Error::other(format!(
-                        "INCONSISTENT STATE: session page file moved but DB re-stamp failed ({e}) and moving it back also failed ({rollback_err}); manually move {} -> {}",
-                        target.display(),
-                        src.display()
-                    ))));
-                }
+                self.restore_parked_session_files(&parked, &e.to_string())?;
                 Err(e.into())
             }
         }
+    }
+
+    /// Put parked session page files back where they came from, newest
+    /// first. `cause` is the failure that triggered the rollback.
+    fn restore_parked_session_files(
+        &self,
+        parked: &[(PathBuf, PathBuf)],
+        cause: &str,
+    ) -> WikiResult<()> {
+        for (src, target) in parked.iter().rev() {
+            if let Err(rollback_err) = self.git.rename_checked(target, src) {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "INCONSISTENT STATE: session page file moved but DB re-stamp failed ({cause}) and moving it back also failed ({rollback_err}); manually move {} -> {}",
+                    target.display(),
+                    src.display()
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// The session page files a `move-session` will relocate (`Move`) or
+    /// remove (`Regenerate`), after the destination collision checks. The
+    /// admin dry run calls this so it predicts exactly what the confirmed
+    /// move does; [`Self::move_session_page`] re-runs it under the mutation
+    /// guard.
+    ///
+    /// The file plan follows the rows the store will sweep:
+    /// - `from` (when it differs from `to`): its file is handled whether or
+    ///   not a latest row is indexed there. A same-path file with no latest
+    ///   row is deliberate, not an oversight: left on disk, the watcher
+    ///   would index it as a new latest page in the source scope.
+    /// - a re-home (the session row already sits in `to`): every other scope
+    ///   holding a LATEST row at the path, because the store sweeps those
+    ///   rows whatever `from` the caller named. Files in scopes with no
+    ///   latest row are left alone there; the store does not touch them
+    ///   either.
+    ///
+    /// # Errors
+    /// [`WikiError::DestinationPageExists`] when `Move` finds a page file
+    /// already at the destination, or more than one source file competing
+    /// for it; store or I/O errors from the lookups.
+    pub async fn plan_session_page_files(
+        &self,
+        session_id: SessionId,
+        from: (WorkspaceId, ProjectId),
+        to: (WorkspaceId, ProjectId),
+        pages: PagesMode,
+    ) -> WikiResult<Vec<(WorkspaceId, ProjectId, PathBuf)>> {
+        self.plan_session_page_files_locked(session_id, from, to, pages)
+            .await
+    }
+
+    async fn plan_session_page_files_locked(
+        &self,
+        session_id: SessionId,
+        from: (WorkspaceId, ProjectId),
+        to: (WorkspaceId, ProjectId),
+        pages: PagesMode,
+    ) -> WikiResult<Vec<(WorkspaceId, ProjectId, PathBuf)>> {
+        let mut scopes = Vec::new();
+        if from != to {
+            scopes.push(from);
+        }
+        if let Some(reader) = &self.store_reader {
+            let rooted_in_target = reader
+                .find_session_scope(session_id)
+                .await?
+                .map(|(ws, proj, _)| (ws, proj))
+                == Some(to);
+            if rooted_in_target {
+                for scope in reader
+                    .session_page_latest_scopes_outside(session_id, to.0, to.1)
+                    .await?
+                {
+                    if !scopes.contains(&scope) {
+                        scopes.push(scope);
+                    }
+                }
+            }
+        }
+        let file_name = format!("{session_id}.md");
+        let mut sources = Vec::new();
+        for (ws, proj) in scopes {
+            self.inspect_project_tree(ws, proj)?;
+            let src = project_path(
+                &self.root,
+                ws,
+                proj,
+                &PathBuf::from("sessions").join(&file_name),
+                Prepare::Inspect,
+            )?;
+            if src.is_file() {
+                sources.push((ws, proj, src));
+            }
+        }
+        if pages == PagesMode::Move && !sources.is_empty() {
+            let dst = project_path(
+                &self.root,
+                to.0,
+                to.1,
+                &PathBuf::from("sessions").join(&file_name),
+                Prepare::Inspect,
+            )?;
+            if dst.exists() || sources.len() > 1 {
+                return Err(WikiError::DestinationPageExists(dst.display().to_string()));
+            }
+        }
+        Ok(sources)
     }
 
     /// Ensure the store rows for a scope exist **and** that the scope is
@@ -1549,6 +1645,8 @@ impl Wiki {
     /// Delete a single page file. When an admission chain is attached, it is
     /// notified (`op=delete`) BEFORE the file is removed, so a mirror can
     /// `git rm` the same path. A `Reject`-policy webhook aborts the delete.
+    /// Idempotent; returns `true` when a page existed and was removed, `false`
+    /// when the path held no page (nothing was changed).
     ///
     /// # Errors
     /// Returns [`WikiError`] on a filesystem error or a rejecting webhook.
@@ -1559,7 +1657,7 @@ impl Wiki {
         path: &PagePath,
         admission_ctx: Option<AdmissionContext>,
         author_id: Option<ai_memory_core::UserId>,
-    ) -> WikiResult<()> {
+    ) -> WikiResult<bool> {
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.read().await;
         // Same-path writers hold this from file rename through upsert; without
@@ -1579,7 +1677,6 @@ impl Wiki {
             },
         )
         .await
-        .map(|_| ())
     }
 
     /// Delete a page only when `expected_latest_id` is still its latest
@@ -1812,11 +1909,13 @@ impl Wiki {
             PageStoreRemoval::Delete {
                 author_id,
                 expected_latest_id: None,
-            } => self
-                .writer
-                .delete_page(workspace_id, project_id, path.clone(), author_id)
-                .await
-                .map(|()| true),
+            } => {
+                // A hand-edited file can exist before the watcher indexes it.
+                self.writer
+                    .delete_page(workspace_id, project_id, path.clone(), author_id)
+                    .await
+                    .map(|deleted| deleted || quarantined.is_some())
+            }
             PageStoreRemoval::Decay { expected_latest_id } => {
                 self.writer
                     .soft_delete_for_decay_if_latest(
@@ -3288,6 +3387,7 @@ impl Wiki {
                     .unwrap_or(false);
             markdown.frontmatter =
                 canonicalize_index_frontmatter(markdown.frontmatter, req.tier, req.pinned);
+            persist_explicit_title(&mut markdown.frontmatter, req.title.as_deref());
             conform_frontmatter_for_disk(
                 &self.abs_path(req.workspace_id, req.project_id, &req.path),
                 req.path.as_str(),
@@ -3643,6 +3743,8 @@ impl Wiki {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
         markdown.frontmatter = canonicalize_index_frontmatter(markdown.frontmatter, tier, pinned);
+        let explicit_title = explicit_title.map(|title| self.sanitizer.scrub(&title));
+        persist_explicit_title(&mut markdown.frontmatter, explicit_title.as_deref());
         conform_frontmatter_for_disk(
             &self.abs_path(workspace_id, project_id, &path),
             path.as_str(),
@@ -3654,8 +3756,6 @@ impl Wiki {
         // mutations and webhooks that rename or restructure the body
         // still get the right title/links extracted.
         let title = explicit_title
-            .clone()
-            .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links =
             crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
@@ -4150,6 +4250,18 @@ fn conform_frontmatter_for_disk_keeping(
     ai_memory_core::okf::stamp_generated_at(&mut markdown.frontmatter, &at);
 }
 
+// An explicit title keeps its existing precedence over webhook changes. It
+// must also live in Markdown, or the watcher replaces the indexed title on its
+// first reindex and creates another version of an otherwise unchanged page.
+fn persist_explicit_title(frontmatter: &mut serde_json::Value, title: Option<&str>) {
+    if let Some(title) = title {
+        if !frontmatter.is_object() {
+            *frontmatter = serde_json::json!({});
+        }
+        frontmatter["title"] = serde_json::Value::String(title.to_string());
+    }
+}
+
 fn canonicalize_index_frontmatter(
     frontmatter: serde_json::Value,
     tier: Tier,
@@ -4302,6 +4414,10 @@ fn rollback_or_inconsistent<E: std::fmt::Display>(
 }
 
 fn quarantine_file(git: &GitAdapter, path: &Path) -> WikiResult<Option<PathBuf>> {
+    // A path with no page at it can still be the parent of other pages.
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Ok(None);
+    }
     let Some(parent) = path.parent() else {
         return Err(WikiError::Io(std::io::Error::other(
             "page path has no parent (cannot quarantine delete)",
@@ -4313,7 +4429,15 @@ fn quarantine_file(git: &GitAdapter, path: &Path) -> WikiResult<Option<PathBuf>>
     let (_file, quarantine) = tmp.keep().map_err(|e| e.error)?;
     git.remove_file_checked(&quarantine)?;
     match git.rename_checked(path, &quarantine) {
-        Ok(()) => Ok(Some(quarantine)),
+        Ok(()) => match std::fs::symlink_metadata(&quarantine) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(quarantine)),
+            metadata => {
+                // An external edit can change the file type during the rename.
+                git.rename_checked(&quarantine, path)?;
+                metadata?;
+                Ok(None)
+            }
+        },
         Err(e) => {
             let _ = git.remove_file_checked(&quarantine);
             Err(e)
@@ -6524,6 +6648,117 @@ mod tests {
             wiki.read_page(ws, proj, &path).unwrap().body,
             "checkpoint body"
         );
+    }
+
+    async fn assert_title_matches_disk_and_reindex(
+        wiki: &Wiki,
+        store: &Store,
+        mut request: WritePageRequest,
+        expected: &str,
+    ) {
+        for batch in [false, true] {
+            request.path = PagePath::new(format!("notes/title-{batch}.md")).unwrap();
+            let id = if batch {
+                wiki.apply_batch(vec![request.clone()]).await.unwrap()[0]
+            } else {
+                wiki.write_page(request.clone()).await.unwrap()
+            };
+            let disk = wiki
+                .read_page(request.workspace_id, request.project_id, &request.path)
+                .unwrap();
+            assert_eq!(
+                derive_title(&disk.frontmatter, &disk.body, &request.path),
+                expected,
+                "disk title (batch={batch})"
+            );
+            let indexed = store.reader.page_meta_by_id(id).await.unwrap().unwrap();
+            assert_eq!(indexed.title, expected, "indexed title (batch={batch})");
+            assert_eq!(
+                wiki.reindex_page(
+                    request.workspace_id,
+                    request.project_id,
+                    request.path.clone()
+                )
+                .await
+                .unwrap(),
+                id,
+                "an unchanged file must not mint another version (batch={batch})"
+            );
+            let rewritten = if batch {
+                wiki.apply_batch(vec![request.clone()]).await.unwrap()[0]
+            } else {
+                wiki.write_page(request.clone()).await.unwrap()
+            };
+            assert_eq!(
+                rewritten, id,
+                "an identical rewrite must remain idempotent (batch={batch})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_titles_survive_admission_and_reindex_for_single_and_batch_writes() {
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/mutate",
+            post(|Json(mut payload): Json<serde_json::Value>| async move {
+                payload["page"]["frontmatter"]["title"] = "Webhook title".into();
+                Json(serde_json::json!({ "page": payload["page"] }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "title-normalizer".into(),
+                url: format!("http://{addr}/mutate"),
+                timeout_ms: 1000,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::WritePage],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+        let mut request = req(
+            ws,
+            proj,
+            "notes/title.md",
+            "# Body title\n",
+            serde_json::json!({ "title": "Requested title" }),
+        );
+        request.title = Some("Requested title".into());
+        assert_title_matches_disk_and_reindex(&wiki, &store, request.clone(), "Requested title")
+            .await;
+        request.title = None;
+        assert_title_matches_disk_and_reindex(&wiki, &store, request, "Webhook title").await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_titles_keep_their_precedence_without_admission_for_single_and_batch_writes() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        for frontmatter in [
+            serde_json::Value::Null,
+            serde_json::json!({ "title": "Frontmatter title" }),
+        ] {
+            let mut request = req(ws, proj, "notes/title.md", "# Body title\n", frontmatter);
+            for title in [
+                "Explicit title",
+                "ANTHROPIC_API_KEY=sk-ant-title-fixture-1234567890abcdef",
+            ] {
+                request.title = Some(title.into());
+                let expected = wiki.sanitizer().scrub(title);
+                assert_title_matches_disk_and_reindex(&wiki, &store, request.clone(), &expected)
+                    .await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -9477,6 +9712,106 @@ mod tests {
         );
     }
 
+    /// `delete_page` reports whether it removed a page, even if the watcher
+    /// has not indexed the Markdown yet. An absent path returns `false`.
+    #[tokio::test]
+    async fn delete_page_reports_whether_a_page_existed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+
+        let absent = PagePath::new("profile/workflow/never-push.md").unwrap();
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
+            "deleting a path that holds no page must report nothing was removed"
+        );
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "profile/workflow/never-push.md",
+            "Never push.",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            wiki.delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
+            "deleting an existing page must report it was removed"
+        );
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
+            "deleting the now-gone page again must report nothing was removed"
+        );
+
+        let unindexed = PagePath::new("profile/workflow/hand-edited.md").unwrap();
+        let file = wiki.abs_path(ws, proj, &unindexed);
+        std::fs::write(&file, "# Hand-edited\n").unwrap();
+        assert!(
+            wiki.delete_page(ws, proj, &unindexed, None, None)
+                .await
+                .unwrap(),
+            "deleting an unindexed Markdown page must report it was removed"
+        );
+        assert!(!file.exists());
+
+        let namespace = PagePath::new("profile/workflow").unwrap();
+        let child = wiki.abs_path(ws, proj, &namespace).join("keep.md");
+        std::fs::write(&child, "# Keep\n").unwrap();
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &namespace, None, None)
+                .await
+                .unwrap(),
+            "a directory containing pages is not itself a page"
+        );
+        assert!(child.is_file(), "the child page must remain in place");
+
+        let former_page = PagePath::new("profile/workflow/former-page").unwrap();
+        let latest = wiki
+            .write_page(req(
+                ws,
+                proj,
+                former_page.as_str(),
+                "A page replaced by a directory.",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let former_file = wiki.abs_path(ws, proj, &former_page);
+        std::fs::remove_file(&former_file).unwrap();
+        std::fs::create_dir(&former_file).unwrap();
+        let child = former_file.join("keep.md");
+        std::fs::write(&child, "# Keep\n").unwrap();
+
+        assert!(
+            wiki.delete_page_if_latest(ws, proj, &former_page, latest, None, None)
+                .await
+                .unwrap(),
+            "the indexed page still existed"
+        );
+        assert!(
+            child.is_file(),
+            "deleting the index entry preserves its children"
+        );
+    }
+
     /// #643 end-to-end: stop the server inside the window the issue
     /// describes — a project created after startup, so no backfill has ever
     /// seen it — and `reindex` still rebuilds it from the wiki tree alone.
@@ -10312,6 +10647,77 @@ mod tests {
             store.reader.session_project_ids(sid).await.unwrap(),
             Some((ws, src))
         );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_rehome_puts_stray_file_back_when_store_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+        // The session row sits in the destination; its page (and file) is a
+        // stray in `src`. A latest row without a file in the destination
+        // lets the disk step succeed and only the SQL step refuse.
+        store
+            .writer
+            .move_session(sid, ws, dst, PagesMode::Regenerate, None, true)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: src,
+                path: path.clone(),
+                title: "stray".into(),
+                body: "stray body".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![],
+                author_id: None,
+                expires_at: None,
+                entities: vec![],
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: dst,
+                path: path.clone(),
+                title: "taken".into(),
+                body: "already here".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![],
+                author_id: None,
+                expires_at: None,
+                entities: vec![],
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(wiki.abs_path(ws, src, &path).exists());
+
+        let err = wiki
+            .move_session_page(sid, (ws, dst), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WikiError::Store(ai_memory_store::StoreError::PagePathTaken { .. })
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(
+            wiki.abs_path(ws, src, &path).exists(),
+            "the stray file must be back after the store refused"
+        );
+        assert!(!wiki.abs_path(ws, dst, &path).exists());
+        assert!(leftover_tempfiles(wiki.abs_path(ws, src, &path).parent().unwrap()).is_empty());
     }
 
     #[tokio::test]

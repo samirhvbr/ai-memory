@@ -185,6 +185,8 @@ impl RoutingFields {
 
 impl HomeRoutes {
     fn parse(text: &str, home: &Path) -> Result<Self, ()> {
+        // A BOM is not whitespace to `trim`, and would hide a first-line header.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let saw_route_syntax = text
             .lines()
             .any(|line| recognizable_route_syntax(line.trim()));
@@ -415,6 +417,12 @@ pub(crate) fn path_contains(root: &Path, candidate: &Path) -> bool {
 }
 
 fn parse_absolute_selector(raw: &str) -> Result<PathSelector, ()> {
+    // A Windows verbatim path (`\\?\C:\work`, `\\?\UNC\server\share`) names the
+    // same location as its plain form but would otherwise be read here as a UNC
+    // path with server `?` and share `C:`. `fs::canonicalize` and some harnesses
+    // report that spelling, so fold it to the plain form before parsing, or a
+    // profile root and the checkout it admits stop matching on Windows.
+    let raw = crate::commands::path_util::strip_windows_verbatim_prefix(raw);
     let replaced = raw.replace('\\', "/");
     let (root, rest) = if let Some(rest) = replaced.strip_prefix("//") {
         let mut parts = rest.split('/').filter(|part| !part.is_empty());
@@ -2599,6 +2607,25 @@ project = "infra" # this is fine
         );
     }
 
+    /// The home marker's route tables need the same BOM handling: a BOM on a
+    /// first-line route header left its fields orphaned, and the whole home
+    /// routing file was refused as malformed.
+    #[test]
+    fn a_bom_cannot_hide_a_first_line_home_route_header() {
+        let home = Path::new("/home/operator");
+        let routes = HomeRoutes::parse(
+            "\u{feff}[routes.path.\"~/src/api\"]\nroute_workspace = \"acme\"\nroute_project = \"api\"\n",
+            home,
+        )
+        .unwrap();
+        let (route, _) = routes
+            .select("/home/operator/src/api", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.workspace, "acme");
+        assert_eq!(route.project, "api");
+    }
+
     #[test]
     fn encoding_noise_cannot_hide_a_server_key() {
         let tmp = TempDir::new().unwrap();
@@ -2662,6 +2689,42 @@ project = "infra" # this is fine
         assert!(path_contains(
             Path::new("/work/team-b"),
             Path::new("/work/team-b/repo")
+        ));
+    }
+
+    /// A Windows verbatim path (`\\?\C:\...`, which `fs::canonicalize` and some
+    /// harnesses report) names the same location as its plain form. Either side
+    /// of a containment check may carry it, so a profile root registered as a
+    /// verbatim path must still admit a plain-drive checkout and vice versa
+    /// (#2186). Parsed textually, so this holds on every host. Without the
+    /// verbatim fold, `\\?\C:\work` reads as UNC server `?` / share `C:` and
+    /// matches neither.
+    #[test]
+    fn path_contains_folds_windows_verbatim_prefixes() {
+        assert!(path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"C:\work\team-b"),
+            Path::new(r"\\?\C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"\\?\C:\work\team-b\repo")
+        ));
+        assert!(path_contains(
+            Path::new(r"\\?\UNC\server\share\work"),
+            Path::new(r"\\server\share\work\repo")
+        ));
+        // The component boundary and the drive still bind after folding.
+        assert!(!path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"C:\work\team-bb\repo")
+        ));
+        assert!(!path_contains(
+            Path::new(r"\\?\C:\work\team-b"),
+            Path::new(r"D:\work\team-b\repo")
         ));
     }
 }

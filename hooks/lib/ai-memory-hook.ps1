@@ -65,7 +65,7 @@ function Test-AiMemoryMarkerDeclaresSettings {
     }
     if ([regex]::IsMatch($text, '(?m)^\s*aliases\s*=')) { return $true }
     if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
-    foreach ($key in @("default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start")) {
+    foreach ($key in @("default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start", "inbox_notice_on_prompt")) {
         if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
     }
     return $false
@@ -708,6 +708,21 @@ function Get-AiMemoryStateDir {
 # bundle consume one another's entries on a shared data dir. A down server
 # then costs latency instead of the event.
 
+# Bearer token the server minted into `<data dir>/auth-tokens/default`
+# (`[auth].bearer_token_file`). A hook installed without a baked token relies
+# on it; the native exe reads it, so this wrapper must too or its POST is a
+# silent 401 (#2134). Empty when absent or unreadable.
+function Get-AiMemoryStoredToken {
+    try {
+        $path = Join-Path (Join-Path (Get-AiMemoryStateDir) "auth-tokens") "default"
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "" }
+        $token = [IO.File]::ReadAllText($path).Trim()
+        return $token
+    } catch {
+        return ""
+    }
+}
+
 function Get-AiMemorySpoolDir {
     return (Join-Path (Get-AiMemoryStateDir) "hook-spool")
 }
@@ -815,6 +830,10 @@ function Invoke-AiMemoryDrainSpool {
         }
         $code = 0
         $NoProxy = Get-AiMemoryNoProxy
+        # The drain runs behind the hook call, so its own deadline is a retry
+        # budget rather than a latency bound; see the capture site below and
+        # row 11c of `docs/security-boundaries.md` for the 200 ms invariant's
+        # PowerShell exception.
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
@@ -901,9 +920,26 @@ function New-AiMemorySessionId {
     return "$Agent-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$PID"
 }
 
+function Get-AiMemoryNativeSessionId {
+    param([object] $ParsedPayload)
+    if ($null -eq $ParsedPayload) { return $null }
+    foreach ($Name in @(
+        "session_id", "sessionId", "sessionID", "session", "conversationId", "taskId"
+    )) {
+        $Property = $ParsedPayload.PSObject.Properties[$Name]
+        if ($null -ne $Property -and $Property.Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Property.Value)) {
+            return $Property.Value.Trim()
+        }
+    }
+    return $null
+}
+
 function Get-AiMemorySessionIdQuery {
-    param([string] $Agent, [string] $Event)
-    if ($env:AI_MEMORY_SESSION_ID) {
+    param([string] $Agent, [string] $Event, [string] $NativeSessionId = "")
+    if (-not [string]::IsNullOrWhiteSpace($NativeSessionId)) {
+        return ""
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:AI_MEMORY_SESSION_ID)) {
         return "&session_id=$([uri]::EscapeDataString($env:AI_MEMORY_SESSION_ID))"
     }
 
@@ -912,7 +948,7 @@ function Get-AiMemorySessionIdQuery {
     if ($Event -ne "session-start" -and (Test-Path $Path -PathType Leaf)) {
         $SessionId = (Get-Content $Path -TotalCount 1 -ErrorAction SilentlyContinue)
     }
-    if (-not $SessionId) {
+    if ([string]::IsNullOrWhiteSpace($SessionId)) {
         $SessionId = New-AiMemorySessionId -Agent $Agent
         $Parent = Split-Path $Path -Parent
         New-Item -ItemType Directory -Force -Path $Parent -ErrorAction SilentlyContinue | Out-Null
@@ -922,7 +958,10 @@ function Get-AiMemorySessionIdQuery {
 }
 
 function Clear-AiMemorySessionId {
-    param([string] $Agent)
+    param([string] $Agent, [string] $NativeSessionId = "")
+    if ($Agent -eq "devin" -and -not [string]::IsNullOrWhiteSpace($env:AI_MEMORY_SESSION_ID) -and [string]::IsNullOrWhiteSpace($NativeSessionId)) {
+        return
+    }
     $Path = Get-AiMemorySessionIdPath -Agent $Agent
     Remove-Item -Force -ErrorAction SilentlyContinue $Path
 }
@@ -1087,6 +1126,16 @@ function Invoke-AiMemoryHook {
     if (($Agent -eq "claude-code" -or $Agent -eq "dsh") -and $Event -eq "stop" -and $Payload -and $Payload.Contains('"last_assistant_message"')) {
         return
     }
+    # Gemini CLI's AfterAgent carries the reply as prompt_response.
+    if ($Agent -eq "gemini-cli" -and $Event -eq "stop" -and $Payload -and $Payload.Contains('"prompt_response"')) {
+        return
+    }
+    # Gemini CLI appends the contents of every @-referenced file to the prompt
+    # it hands BeforeAgent, and the fallback cannot cut them out of the JSON, so
+    # such a prompt is dropped rather than posted or spooled with them.
+    if ($Agent -eq "gemini-cli" -and $Event -eq "user-prompt" -and $Payload -and $Payload.Contains('--- Content from referenced files ---')) {
+        return
+    }
     $Cwd = Resolve-AiMemoryCwd -Payload $Payload -Agent $Agent
     if (Test-AiMemoryServerRouted -Cwd $Cwd) {
         if ($AntigravityStartOutput) { [Console]::Out.Write("{}") }
@@ -1105,9 +1154,16 @@ function Invoke-AiMemoryHook {
     if ($env:AI_MEMORY_AUTO_HANDOFF -and $env:AI_MEMORY_AUTO_HANDOFF.Trim().ToLowerInvariant() -in @("0", "false", "no", "off")) {
         $QS += "&auto_handoff=0"
     }
+    $HookParsedPayload = $null
+    $HookNativeSessionId = $null
+    try {
+        $HookParsedPayload = $Payload | ConvertFrom-Json
+        $HookNativeSessionId = Get-AiMemoryNativeSessionId -ParsedPayload $HookParsedPayload
+    } catch {
+    }
     $SessionQS = ""
     if ($Agent -eq "devin") {
-        $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event
+        $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event -NativeSessionId ([string]$HookNativeSessionId)
     }
     # Every request names this client: an unauthenticated server reached
     # through a non-loopback host name refuses a handoff fetch without the
@@ -1115,8 +1171,10 @@ function Invoke-AiMemoryHook {
     $Headers = @{}
     $Headers["X-AI-Memory-Client"] = "hook-ps"
 
-    if ($env:AI_MEMORY_AUTH_TOKEN) {
-        $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
+    $BearerToken = $env:AI_MEMORY_AUTH_TOKEN
+    if (-not $BearerToken) { $BearerToken = Get-AiMemoryStoredToken }
+    if ($BearerToken) {
+        $Headers["Authorization"] = "Bearer $BearerToken"
     }
 
     # Capture producer path, with the shell bundle's offline-spool parity
@@ -1134,6 +1192,11 @@ function Invoke-AiMemoryHook {
         # GUID's hex fits the server's key grammar.
         $HookUrl = "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS&ingest_key=ps$([Guid]::NewGuid().ToString('N').Substring(0, 16))"
         $NoProxy = Get-AiMemoryNoProxy
+        # Invariant #5's 200 ms budget is a POSIX-bundle property. Cold start
+        # here can exceed it before this request is opened at all
+        # (`docs/design-windows-ci.md`), so this bundle keeps its own
+        # capture deadline and spools what it cannot deliver. Recorded as the
+        # deliberate exception in `docs/security-boundaries.md` row 11c.
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
@@ -1162,7 +1225,7 @@ function Invoke-AiMemoryHook {
         }
     }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
-        Clear-AiMemorySessionId -Agent $Agent
+        Clear-AiMemorySessionId -Agent $Agent -NativeSessionId ([string]$HookNativeSessionId)
     }
 
     # A subagent runs inside its parent's session, so its brief comes from the
@@ -1205,22 +1268,13 @@ function Invoke-AiMemoryHook {
     # Without a directory the handoff stays open for memory_handoff_accept
     # (parity with the native hook and `ai_memory_get_handoff`).
     if ($FetchHandoff -and $Cwd) {
+        $ParsedPayload = $HookParsedPayload
+        $NativeSessionId = $HookNativeSessionId
         $NativeSessionQS = ""
-        $NativeSessionId = $null
-        try {
-            $ParsedPayload = $Payload | ConvertFrom-Json
-            $NativeSessionId = @(
-                $ParsedPayload.session_id,
-                $ParsedPayload.sessionId,
-                $ParsedPayload.sessionID,
-                $ParsedPayload.session,
-                $ParsedPayload.conversationId
-            ) | Where-Object { $_ } | Select-Object -First 1
-            if ($NativeSessionId) {
-                $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
-            }
-        } catch {
+        if ($NativeSessionId) {
+            $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
         }
+        $HandoffSessionQS = if ($NativeSessionQS) { $NativeSessionQS } else { $SessionQS }
         # A compaction's SessionStart (`source: "compact"`) is mid-session:
         # claim no handoff, recovery snapshot or brief, and print the same
         # empty reply as "no pending handoff" (parity with the native hook and
@@ -1299,12 +1353,18 @@ function Invoke-AiMemoryHook {
         if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
         }
+        # An external-capture run shares its project with the owner's own
+        # interactive sessions, so it offers the baton rather than consuming it
+        # (#2148): claim=0 makes the server announce the handoff for an explicit
+        # memory_handoff_accept. Parity with the native hook and the shell bundle.
+        $ClaimQS = ""
+        if (Test-AiMemoryCaptureOwnedExternally) { $ClaimQS = "&claim=0" }
         $NoProxy = Get-AiMemoryNoProxy
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$HandoffSessionQS$BriefQS$ProfileQS$ClaimQS" `
                 -Headers $Headers
             $Status = Get-AiMemoryResponseStatus $Response
             if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {

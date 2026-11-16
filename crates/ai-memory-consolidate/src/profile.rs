@@ -628,10 +628,10 @@ pub struct DetectedPreference {
 /// existed.
 pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
+        || ai_memory_core::looks_like_machine_turn(body)
         || ai_memory_core::looks_like_codex_instructions(body)
         || ai_memory_core::looks_like_codex_generated_prompt(body)
         || looks_like_codex_assessor_transcript_line(body)
-        || looks_like_claude_cross_session_message(body)
         || looks_like_claude_plugin_prompt(body)
         || looks_like_desktop_side_session_brief(body)
     {
@@ -672,16 +672,6 @@ fn looks_like_codex_assessor_transcript_line(body: &str) -> bool {
             || rest.starts_with("system:")
             || rest.starts_with("tool exec call:")
             || rest.starts_with("tool exec result:"))
-}
-
-/// Claude Code presents local cross-session traffic as a synthetic user turn.
-/// Match this one tag by name: widening `looks_like_markup_block` to every tag
-/// with attributes would also discard real `<pasted_content ...>` prompts.
-fn looks_like_claude_cross_session_message(body: &str) -> bool {
-    body.trim_start()
-        .strip_prefix("<cross-session-message")
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|next| next == '>' || next.is_ascii_whitespace())
 }
 
 /// Claude Code's exact wrapper for a plugin that submits a prompt between
@@ -2177,6 +2167,69 @@ pub async fn run_profile_pass(
     Ok(report)
 }
 
+/// Classify `batch`, halving any part whose answer is cut at the output
+/// budget and classifying the halves instead. The fixed batch size cannot
+/// know how verbose a model is or how long the sentences are, so a full batch
+/// can outgrow `max_tokens`; a retry at the same size would truncate again.
+/// Every attempt spends `budget`.
+///
+/// Returns one verdict per sentence, then the calls the LLM answered and the
+/// calls that fell back. A verdict is `None` when no answered call covered the
+/// sentence (budget spent, a non-truncation error, or a single sentence that
+/// still truncates), so the caller uses the zero-LLM detector there.
+async fn classify_splitting(
+    llm: &(dyn LlmProvider + 'static),
+    sanitizer: &ai_memory_core::Sanitizer,
+    batch: &[PendingSentence],
+    max_tokens: u32,
+    budget: &mut usize,
+) -> (Vec<Option<Option<DetectedPreference>>>, usize, usize) {
+    let mut out = vec![None; batch.len()];
+    let (mut calls, mut fallbacks) = (0, 0);
+    let mut work: Vec<std::ops::Range<usize>> = Vec::new();
+    work.push(0..batch.len());
+    while let Some(range) = work.pop() {
+        if *budget == 0 {
+            // A batch never tried keeps its old accounting; a split whose
+            // halves the budget cannot cover is a truncated call that fell
+            // back.
+            if range.len() < batch.len() {
+                tracing::warn!(
+                    "profile classification budget ran out while splitting a truncated batch; using the zero-LLM detector"
+                );
+                fallbacks += 1;
+            }
+            break;
+        }
+        *budget -= 1;
+        let part = &batch[range.clone()];
+        match classify_batch(llm, sanitizer, part, max_tokens).await {
+            Ok(classified) => {
+                calls += 1;
+                for (slot, verdict) in out[range].iter_mut().zip(classified) {
+                    *slot = Some(verdict);
+                }
+            }
+            Err(ai_memory_llm::LlmError::TruncatedResponse { .. }) if part.len() > 1 => {
+                let mid = range.start + part.len() / 2;
+                tracing::debug!(
+                    sentences = part.len(),
+                    "profile classification hit the output budget; splitting the batch"
+                );
+                // Popped from the end: the first half goes on last so it runs
+                // first.
+                work.push(mid..range.end);
+                work.push(range.start..mid);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "profile classification failed; using the zero-LLM detector");
+                fallbacks += 1;
+            }
+        }
+    }
+    (out, calls, fallbacks)
+}
+
 /// Harvest one project from its marks. Returns new candidates, LLM calls and
 /// LLM fallbacks.
 async fn harvest_project(
@@ -2244,25 +2297,20 @@ async fn harvest_project(
     }
     if let Some(llm) = llm {
         for batch in pending.chunks(CLASSIFY_BATCH) {
-            let classified = if *classify_budget > 0 {
-                *classify_budget -= 1;
-                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch, max_tokens).await {
-                    Ok(classified) => {
-                        calls += 1;
-                        Some(classified)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "profile classification failed; using the zero-LLM detector");
-                        fallbacks += 1;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            for (idx, sentence) in batch.iter().enumerate() {
-                let found = match &classified {
-                    Some(items) => items.get(idx).cloned().flatten(),
+            let (classified, answered, failed) = classify_splitting(
+                llm.as_ref(),
+                wiki.sanitizer(),
+                batch,
+                max_tokens,
+                classify_budget,
+            )
+            .await;
+            calls += answered;
+            fallbacks += failed;
+            for (sentence, verdict) in batch.iter().zip(classified) {
+                let by_llm = verdict.is_some();
+                let found = match verdict {
+                    Some(found) => found,
                     None => classify_sentence(&sentence.sentence),
                 };
                 if let Some(found) = found {
@@ -2272,7 +2320,7 @@ async fn harvest_project(
                         &found,
                         sentence.observed_at,
                         sentence.contributor.clone(),
-                        if classified.is_some() { 0.6 } else { 0.5 },
+                        if by_llm { 0.6 } else { 0.5 },
                     ));
                 }
             }
@@ -2897,6 +2945,19 @@ mod tests {
                              from-name=\"review\" from-mode=\"bypass\">\n\
                              Always use npm.\n</cross-session-message>";
         assert_eq!(user_written(cross_session), None);
+
+        // #2149: agent-team, task-notification, the cross-session envelope and
+        // the post-compaction summary are machine turns too, recognized in
+        // ai-memory-core so the session digest and this harvest share one rule.
+        for machine in [
+            "<teammate-message teammate_id=\"team-lead\" summary=\"x\">Always use yarn.",
+            "<task-notification>\n<status>completed</status>\nAlways force-push.",
+            "Another Claude session sent a message. It is shown below.\nAlways use npm.",
+            "This session is being continued from a previous conversation that ran out of \
+             context. Always use npm.",
+        ] {
+            assert_eq!(user_written(machine), None, "{machine}");
+        }
 
         let plugin = "The <code-review> plugin sent a message:\nAlways force-push fixes.\n\
                       This is how Claude Code surfaces a prompt a plugin submits between turns.";

@@ -23,7 +23,8 @@ Markdown links in an exported bundle. Reindexing the extracted concept files
 preserves their link targets.
 
 Backup and OKF export downloads replace their output only after the whole
-response arrives. An interrupted download keeps the previous archive intact.
+response arrives and its first bytes match the gzip signature. An interrupted
+download or a response without that signature keeps the previous archive intact.
 New files and replacement symlinks are private; existing regular files keep
 their permissions and still require write access. Read-only files and
 directory destinations are refused. A symlink target is never changed.
@@ -92,6 +93,16 @@ existing `_meta.md` scope manifest is unchanged: it is ai-memory's
 identity record, and `index.md` is the OKF-facing description. Nothing in
 the current tree writes `index.md`, so that reserved name is free.
 `log.md` is not adopted: git is the log.
+
+OKF v0.2 §3.1 reserves `index.md` and `log.md` at every level. If a concept
+page (one with real frontmatter) occupies one of those names at any depth,
+the export refuses with that page's path rather than silently dropping it;
+rename the page and export again. A frontmatter-less file at a reserved name
+is raw capture, not a concept, and is skipped.
+
+Export excludes the project's root `_pending/` proposal staging directory.
+An identically named directory below a concept family, such as
+`notes/_pending/`, contains ordinary concept pages and is included.
 
 The hooks *do* write a raw per-month event ledger at the project root
 (`log-YYYY-MM.md`: `## [ts] event | title` lines, no frontmatter). It
