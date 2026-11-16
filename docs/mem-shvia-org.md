@@ -51,6 +51,61 @@ previous boot ends at 16:42:17 and the next boot starts at 16:42:29, so it was a
 orderly restart this time. The container came back by itself (`Up 25 hours` the
 next day) and the log holds no `ERROR` line. The cause is not established either.
 
+## The clients, measured on 15/11/2026
+
+What the server holds says which client machine and agent still report, which a
+client's own configuration cannot. Read-only, on the live database (`PRAGMA
+query_only`), grouping `sessions` by `agent_kind` and by the first part of `cwd`
+(`/home/` is the Linux workstation, `/Users/` the MacBook):
+
+| Origin | Sessions | Last one |
+|---|---|---|
+| Claude Code, Linux workstation (`samirb3`) | 1,705 | live (observations arriving seconds ago) |
+| Claude Code, MacBook | 1,043 | **10/09/2026**: nothing for 66 days |
+| Codex, any machine | **0, ever** | n/a |
+| `other` without a `cwd` (ShvIA Web chat turns: only `user-message` and `assistant-response` events) | 403 | 06/11/2026, in bursts on 20/10, 02/11 and 06/11 |
+
+A session id is stored as the raw 16 bytes of the UUID, so `hex(id)` finds it; that
+was checked against the session that ran the query before trusting an empty result
+for Codex.
+
+**Codex captured nothing because its hooks had no server URL.** Every hook was
+`trusted` (asked from `codex app-server`, `hooks/list`), but they were the Claude
+Code scripts, and those read `AI_MEMORY_HOOK_URL`, defaulting to
+`http://127.0.0.1:49374`, where nothing listens. Claude Code gets that variable
+from the `env` block of its `settings.json`; Codex runs hooks from its app-server
+daemon, which is started detached and inherited the shell's `AI_MEMORY_SERVER_URL`
+and token but not `AI_MEMORY_HOOK_URL` (`shell_environment_policy.set` in Codex's
+`config.toml` applies to the commands Codex runs, not to its hooks). The scripts
+would also have recorded every Codex session as `claude-code`.
+
+**What the `3.4.7` client changed, tested before it touched anything.** A throwaway
+`3.4.2` server with an empty store and the generated hooks of `3.4.7` in a fake
+`HOME`: both agents' events were stored by the old server, with `agent_kind`
+`codex` and `claude-code` respectively, four observations each and no error. The
+installer bakes `AI_MEMORY_HOOK_URL=<url>` into each hook command (shell hooks) or
+the server URL (native hooks), so the daemon's environment no longer matters, and
+`ai-memory upgrade` re-stages only the agents that already have a directory under
+`~/.local/share/ai-memory/hooks/`: Codex had none, so it needed its own
+`install-hooks --agent codex --apply`.
+
+Two traps found on the way. The installer **adds** the new Codex hooks next to the
+old script entries instead of replacing them, so the old ones have to be removed by
+hand or every event is captured twice, one of them as the wrong agent. And the
+wrapper forwards `CLAUDE_CONFIG_DIR` into its container: a test of `install-hooks`
+in a fake `HOME` must unset `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, or the installer
+targets the real path (here it was stopped only by a permission error).
+
+Done on the workstation: wrapper, image and native client on `3.4.7`; Claude Code
+hooks refreshed in both configuration directories (`~/.claude` and
+`~/.claude-pessoal`, the `env` block kept); Codex hooks replaced by the seven native
+`--agent codex` ones. Codex reports them as `modified` and skips them until the
+person trusts them in `/hooks`, which is the person's decision; until then it
+captures nothing, as before. Still open: that trust, the MacBook (silent since
+10/09, no access from here), and the ShvIA side: `anna` exports only when
+`AI_MEMORY_URL` is set, which it is not, and ShvIA Web sends through each person's
+`ai_memory_servers` row, checked with `shvia:ai-memory:verificar-destinos`.
+
 ## Rehearsal for 3.4.2 to 3.4.4, 09/11/2026: it does not fit the disk
 
 The range is `v3.4.2` to `v3.4.4` (two releases, 161 commits) and brings two

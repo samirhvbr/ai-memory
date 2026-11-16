@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.10`
+**Current version:** `0.3.11`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `fa0ec25d` (`main`, `v3.4.7`)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,20 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.11 - the clients measured: Codex never captured, the MacBook went silent on 10/09
+
+Reading the server's own `sessions` table by agent and by `cwd` showed what the
+clients' configuration hides: Claude Code on the Linux workstation is live, the
+MacBook's last session is from 10/09/2026, and **Codex has no session at all**.
+The Codex hooks were trusted but ran the Claude Code scripts, which need
+`AI_MEMORY_HOOK_URL` and default to a loopback address; Codex's daemon does not
+have that variable. The workstation now runs the `3.4.7` client (tested first
+against a throwaway `3.4.2` server): Claude Code hooks refreshed in both
+configuration directories and Codex wired with its own native hooks, which Codex
+holds back until they are trusted in `/hooks`. The MacBook and the ShvIA side are
+still to check. [`docs/mem-shvia-org.md`](docs/mem-shvia-org.md) has the query, the
+cause, the two installer traps and what is left.
 
 ## 0.3.10 - the fork moves onto upstream v3.4.7
 
