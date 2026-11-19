@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Updated the locked `libz-sys` to `1.1.33` for RUSTSEC-2026-0544 and
+  documented the transitive `chrono` maintenance advisory in the dependency
+  checks. Backported from [upstream #2347](https://github.com/akitaonrails/ai-memory/issues/2347).
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
