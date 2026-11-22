@@ -13,10 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- Updated the locked `url` to `2.5.9` for RUSTSEC-2026-0592, preventing
-  recursive origin handling from overflowing the stack on nested `blob:`
-  input. The advisory was published after this dependency backport's original
-  successful CI run. ([#1](https://github.com/samirhvbr/ai-memory/pull/1))
+- Updated the locked `url` to `2.5.9` in the root, desktop, importer, relay,
+  and wikisync workspaces for RUSTSEC-2026-0592, preventing recursive origin
+  handling from overflowing the stack on nested `blob:` input. The advisory
+  was published after this dependency backport's original successful CI run.
+  ([#1](https://github.com/samirhvbr/ai-memory/pull/1))
 - Updated the locked `libz-sys` to `1.1.33` for RUSTSEC-2026-0544 and
   documented the transitive `chrono` maintenance advisory in the dependency
   checks. Backported from [upstream #2347](https://github.com/akitaonrails/ai-memory/issues/2347).
