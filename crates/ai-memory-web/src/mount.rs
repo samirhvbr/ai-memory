@@ -1339,6 +1339,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -1353,6 +1354,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

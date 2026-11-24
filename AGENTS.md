@@ -189,7 +189,7 @@ Core design:
   raw-observation fallback.
 - **LLM is opt-in.** Zero-LLM mode still captures, searches (FTS5), and
   writes rule-based summaries. Providers (Anthropic, Anthropic OAuth,
-  OpenAI, OpenAI/Codex OAuth, GitHub Copilot, Gemini, OpenCode,
+  OpenAI, OpenAI/Codex OAuth, GitHub Copilot, Gemini, Vertex AI, OpenCode,
   OpenAI-compatible endpoints, Cursor Agent CLI) enable consolidation, lint,
   and the auto-improvement loop.
 - **Per-project isolation by construction**: every row and page is keyed
@@ -208,13 +208,13 @@ or prompt routing for learning review.
   workspace resolver 3. The authoritative workspace version is
   `workspace.package.version` in `Cargo.toml`.
 - **Async runtime:** `tokio` (full features).
-- **MCP/HTTP:** `rmcp` 3.8 (server SDK; MCP 2026-07-28 plus the legacy
+- **MCP/HTTP:** `rmcp` 3.9 (server SDK; MCP 2026-07-28 plus the legacy
   initialize handshake) + `axum` 0.8 for MCP HTTP, hooks,
   admin, `/api/v1`, and the built-in `/web` UI; `tower` / `tower-http`.
 - **Store:** `rusqlite` (bundled SQLite, backup API), `refinery`
   migrations, FTS5, `parking_lot`.
 - **Wiki:** atomic markdown writes (tmp + rename + fsync),
-  `notify-debouncer-full` watcher, `git2` with vendored libgit2
+  event-driven `notify` watcher, `git2` with vendored libgit2
   checkpoints.
 - **LLM:** typed providers in `ai-memory-llm` behind `LlmProvider` /
   `Embedder` traits; `reqwest` (rustls) for provider HTTP.
@@ -850,7 +850,7 @@ Additional boundary rules:
 - **Branch model.** `main` is the patch line: it takes fixes and docs only
   (`[Unreleased]` holds only `### Fixed`), and patch tags are cut from it.
   Additive work targets the standing `release/X.Y` branch for the next
-  minor or major (currently `release/3.5`; 3.4.0 shipped from `main`). Keep `main` an
+  minor or major (currently `release/3.6`). Keep `main` an
   ancestor of it by forward-merging
   `main` into it after every fix lands, never the reverse; when a patch
   release ships, rebuild the branch's `[Unreleased]` as only its own entries

@@ -1442,6 +1442,7 @@ mod tests {
                     cwd: None,
                     actor_user: owner
                         .map(|name| ai_memory_core::IdentityKey::User(name.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1462,6 +1463,7 @@ mod tests {
                             body: (*body).into(),
                             importance: 5,
                             file_path: None,
+                            trust_class: None,
                         },
                         &Sanitizer::builtin(),
                     ))

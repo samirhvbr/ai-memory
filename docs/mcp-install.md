@@ -744,10 +744,21 @@ dsh` refuses to write it):
         configPath: '<data-dir>/hooks/dsh/hooks.json'
 ```
 
-Install the bridge package into the profile first (`dsh plugin --profile
-<profile> add @deepseek-ai/dsh-hooks-claude-code`), then reload or restart
-the profile. Without `--apply`, `install-hooks --agent dsh` prints the same
-`hooks.json` and patch fragment for a manual merge.
+Install the bridge package together with its required `@deepseek-ai/dsh-hook-protocol`
+peer into the profile first (DSH profiles disable automatic peer installation,
+and npm's `latest` tag can trail the running DSH prerelease, so pin both
+packages to your installed DSH version or `@next`), for example:
+
+```bash
+dsh plugin --profile <profile> add \
+  @deepseek-ai/dsh-hooks-claude-code@<dsh-version> \
+  @deepseek-ai/dsh-hook-protocol@<dsh-version>
+```
+
+(If you also install `@deepseek-ai/dsh-mcp-client` manually into a profile, pin
+it to the same DSH version or `@next`.) Then reload or restart the profile.
+Without `--apply`, `install-hooks --agent dsh` prints the same `hooks.json` and
+patch fragment for a manual merge.
 
 Two bridge constraints shape DSH capture:
 
@@ -919,10 +930,12 @@ stdio shim. Requires Node.js installed on the same machine.
 ## Gemini CLI
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
-`ai-memory install-hooks --agent gemini-cli --apply`.
+`ai-memory install-hooks --agent gemini-cli --apply`. ✅ Managed workstreams
+supported via `ai-memory run gemini` (alias `gemini-cli`; see
+[`docs/managed-workstreams.md`](managed-workstreams.md)).
 
 **Config file:**
-- User: `~/.gemini/settings.json`
+- User: `~/.gemini/settings.json` (or `$GEMINI_CLI_HOME/.gemini/settings.json`)
 - Project: `.gemini/settings.json`
 
 Gemini CLI uses `httpUrl` (not `url`) for streamable-HTTP MCP
@@ -994,9 +1007,12 @@ install (every fresh `init`) writes a stdio `ai-memory mcp-bridge
 --no-session-id` entry instead of embedding the bearer, so Qwen is a static
 client: project-scoped calls still need `workspace` and `project`.
 
-The hook installer registers ten events: `SessionStart`, `UserPromptSubmit`,
+The hook installer registers eleven events: `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart` and `SubagentStop`. Definitions use an empty
+`StopFailure`, `SessionEnd`, `SubagentStart` and `SubagentStop`. `StopFailure`
+fires instead of `Stop` when an API error or loop detection ends the turn and
+runs the stop event; the turn end is stored as `stop failure: <error>`.
+Definitions use an empty
 `matcher`, which Qwen treats as match-all. Each command receives Qwen's
 Claude-shaped JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`,
 `tool_use_id`) and enforces capture exclusions over Qwen's Gemini-like
@@ -1061,6 +1077,56 @@ native transcript-store contract is documented.
 
 Sources: [Qoder hooks](https://docs.qoder.com/cli/hooks) and
 [Qoder MCP](https://docs.qoder.com/cli/mcp-reference).
+
+---
+
+## WorkBuddy
+
+**Status:** MCP and lifecycle hooks are supported. Managed workstreams and
+transcript backfill are not claimed.
+
+**Config file (MCP):** `~/.workbuddy/mcp.json`, servers under the root
+`mcpServers` map. **Config file (hooks):** `~/.workbuddy/settings.json`, under
+`hooks`. **Skills:** `~/.workbuddy/skills` (global) or `.workbuddy/skills`
+(project).
+
+```bash
+ai-memory install-mcp --client workbuddy --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent workbuddy --apply \
+    --server-url "https://memory.example" --auth-token "$TOKEN"
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+The MCP entry uses Claude Code's shape: `type: "http"`, `url`, and an
+`Authorization: Bearer …` header when an explicit token is given. When the
+install's token lives in `[auth].bearer_token_file`, `install-mcp` writes the
+session-less `mcp-bridge` stdio entry instead, so the token never enters
+`mcp.json`; the bridge forwards no session id, so pass explicit `workspace`
+and `project` on project-scoped calls.
+
+**Trust the new server before using it.** WorkBuddy does not activate a
+newly written MCP entry on its own: open its **custom connector** settings
+(自定义连接器) and approve the added `ai-memory` server. The entry is present
+in `mcp.json` either way, but its tools stay unavailable until that approval.
+
+The hook installer writes CodeBuddy's native commands (no script bundle) for
+six Claude Code-shaped events: `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`. Capture exclusions are
+enforced by the same closed parser that handles Claude Code, and
+`SessionStart` delivers a pending handoff through
+`hookSpecificOutput.additionalContext`.
+
+**WorkBuddy fires no `SessionEnd` event.** `Stop` marks the end of a turn, not
+of the session, so an idle session stays open until you close it:
+
+```bash
+ai-memory finalize-session --agent workbuddy
+```
+
+`ai-memory setup` detects WorkBuddy when `~/.workbuddy` exists, and
+`ai-memory uninstall` removes the hook entries. There is no `ai-memory run
+workbuddy` adapter and no native transcript backfill.
 
 ---
 
@@ -1413,7 +1479,8 @@ the supported path for uninstall isolation and hooks URL inference.
 
 ## Devin CLI
 
-Devin manages MCP servers in `~/.devin/config.json` under `mcpServers`:
+Devin manages user-level MCP servers in `~/.config/devin/mcp_config.json`
+(`%APPDATA%\devin\mcp_config.json` on Windows) under `mcpServers`:
 
 ```bash
 ai-memory install-mcp --client devin --apply \
@@ -1441,10 +1508,10 @@ ai-memory install-hooks --agent devin --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-By default this writes `~/.devin/hooks.v1.json`, whose root object is the
-event map. If you want the hook entries inside `~/.devin/config.json` instead,
-pass that path with `--config-file`; ai-memory then merges them under the
-`hooks` key.
+By default this merges the hook entries under the `hooks` key of
+`~/.config/devin/config.json` (`%APPDATA%\devin\config.json` on Windows). For
+project-level hooks in `.devin/hooks.v1.json` (whose root object is the flat
+event map), pass `--config-file .devin/hooks.v1.json`.
 
 Devin's supported lifecycle events are `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PostCompaction`, `Stop`, and `SessionEnd`.
@@ -1554,9 +1621,11 @@ ai-memory install-hooks --agent kimi-code --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-The installed entries cover 10 events (`SessionStart`, `SessionEnd`,
+The installed entries cover 12 events (`SessionStart`, `SessionEnd`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`
 (Kimi Code fires `PostToolUse` on successful calls only), `Stop`,
+`StopFailure` and `Interrupt` (fired in place of `Stop` when an error ends the
+turn or the user interrupts it, stored as failed or interrupted turn ends),
 `SubagentStart`, `SubagentStop`, and `PreCompact`) with a Kimi Code-specific
 script bundle /
 native `ai-memory hook --event … --agent kimi-code` commands (native is the
@@ -2050,7 +2119,10 @@ still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex and Antigravity `Stop` events are not session ends. Codex's hook install
+Codex and Antigravity `Stop` events are not session ends, and neither is the
+`Interrupt` Codex fires instead of `Stop` when the user interrupts the turn:
+the hook install wires it to the same stop hook and it is stored as an
+`interrupt` turn end. Codex's hook install
 registers native `SessionEnd` for CLI 0.145.0 and later; Antigravity still needs
 explicit finalization. `ai-memory finalize-session` defaults to Codex for older
 clients or a missed native end, while `--agent antigravity-cli` selects

@@ -18,9 +18,10 @@ standardized. The files are greppable, open in Obsidian, and import into
 anything OKF-aware. Nothing is locked in: the export is a validated copy of
 the files ai-memory already stores its memory in.
 
-Local wikilink labels containing brackets or backslashes remain ordinary
-Markdown links in an exported bundle. Reindexing the extracted concept files
-preserves their link targets.
+Local wikilinks become ordinary Markdown links in an exported bundle,
+including links that explicitly name the bundle's workspace and project.
+Labels with brackets or backslashes remain valid link text. Reindexing
+the extracted concept files preserves their link targets.
 
 Backup and OKF export downloads replace their output only after the whole
 response arrives and its first bytes match the gzip signature. An interrupted
@@ -64,6 +65,9 @@ Ordinary Markdown links use URL path encoding: `notes/my%20note.md` points
 to `notes/my note.md`. Import and the web UI decode that path once before
 resolving it. A literal percent sequence in a filename uses `%25` in a
 Markdown URL, while `[[wikilinks]]` continue to name literal page paths.
+Exported wikilink destinations also encode `&` as `%26`, so a filename such
+as `notes/a&copy;.md` keeps its literal spelling when a Markdown reader
+interprets character references.
 
 | OKF key | ai-memory source |
 |---|---|
@@ -174,7 +178,7 @@ so any later rewrite of an affected page (a restore, a hand edit, a
 
 ## Reconcile-delete safety net (opt-in, #929)
 
-The watcher's 30s reconcile pass only ever reindexes create/modify events by
+The watcher's 300s reconcile pass only ever reindexes create/modify events by
 default: a page whose file disappears from disk stays indexed until
 `ai-memory delete-page` removes it explicitly. `[maintenance]
 reconcile_tombstones_deleted_pages` (default `false`) opts into a background

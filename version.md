@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.11`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `fa0ec25d` (`main`, `v3.4.7`)
+**Current version:** `0.3.12`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `ccc7dc0db` (`main`, `v3.6.0`)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,17 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.12 - sync the fork with upstream v3.6.0
+
+Merged upstream `main` at `ccc7dc0db`, the `v3.6.0` release commit. The sync
+keeps the fork's history and uses the upstream `url` and `libz-sys` updates
+that supersede its backports. The source and dependency locks match the
+upstream release, so the fork publishes the same annotated `v3.6.0` tag.
+
+`mem.shvia.org` still runs `3.4.2`. The storage preflight found 22.25 GB free
+on `/srv`, below the 27.5 GB floor measured for V100 alone, including the
+cold backup and free-space guard. The target release reaches V115.
 
 ## 0.3.11 - the clients measured: Codex never captured, the MacBook went silent on 10/09
 

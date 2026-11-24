@@ -548,35 +548,6 @@ const fn default_open_handoffs_limit() -> usize {
     50
 }
 
-/// Query for `GET /admin/messages` (cross-project agent messaging, V64).
-#[derive(Debug, Deserialize)]
-struct ListMessagesQuery {
-    workspace: String,
-    project: String,
-    #[serde(rename = "box", default = "default_message_box")]
-    mailbox: String,
-    #[serde(default = "default_list_messages_limit")]
-    limit: usize,
-}
-
-fn default_message_box() -> String {
-    "inbox".into()
-}
-
-const fn default_list_messages_limit() -> usize {
-    50
-}
-
-/// Body cap for `POST /admin/messages/send` (V64). The body crosses a
-/// project-isolation boundary and is untrusted input on the receiving side;
-/// capped the same way handoff text fields are, after secret-scrubbing.
-const MESSAGE_BODY_MAX_CHARS: usize = 8000;
-
-/// Subject cap for `POST /admin/messages/send` (V64).
-const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
-/// Supporting evidence cap for cross-project messages (#1428).
-const MESSAGE_EVIDENCE_MAX_CHARS: usize = 1_000;
-
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
     workspace: String,
@@ -767,10 +738,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
         .route("/admin/handoffs/expire", post(handle_expire_handoffs))
-        .route("/admin/messages", get(handle_list_messages))
-        .route("/admin/messages/send", post(handle_send_message))
-        .route("/admin/messages/pop", post(handle_pop_message))
-        .route("/admin/messages/cancel", post(handle_cancel_messages))
+        .route("/admin/messages", get(crate::messages::list))
+        .route("/admin/messages/send", post(crate::messages::send))
+        .route("/admin/messages/pop", post(crate::messages::pop))
+        .route("/admin/messages/cancel", post(crate::messages::cancel))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -880,6 +851,17 @@ pub fn admin_router_with_sweep_tuning(
         }))
 }
 
+impl axum::extract::FromRef<Arc<AdminState>> for crate::messages::MessageState {
+    fn from_ref(state: &Arc<AdminState>) -> Self {
+        Self {
+            reader: state.reader.clone(),
+            writer: state.writer.clone(),
+            wiki: state.wiki.clone(),
+            trusted_proxy_identity: state.trusted_proxy_identity,
+        }
+    }
+}
+
 async fn require_root_for_multiuser_admin(
     State(state): State<Arc<AdminState>>,
     req: axum::http::Request<Body>,
@@ -979,46 +961,17 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
 }
 
 async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::fs::File> {
-    let wiki_dir = state.data_dir.join("wiki");
-    ai_memory_wiki::validate_wiki_tree(&wiki_dir)
-        .map_err(|error| anyhow::anyhow!("validating wiki tree: {error}"))?;
-    let staging = tempfile::tempdir()?;
-    let snapshot_path = staging.path().join("memory.sqlite");
-    info!(snapshot = %snapshot_path.display(), "snapshotting SQLite for backup");
-    state
-        .reader
-        .snapshot_to(snapshot_path.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("sqlite snapshot: {e}"))?;
-
-    let mut tar_file = tempfile::tempfile()?;
-    {
-        let encoder = GzEncoder::new(&mut tar_file, Compression::default());
-        let mut tar = tar::Builder::new(encoder);
-        tar.mode(tar::HeaderMode::Deterministic);
-        tar.follow_symlinks(false);
-
-        ai_memory_wiki::validate_wiki_tree(&wiki_dir)
-            .map_err(|error| anyhow::anyhow!("validating wiki tree before archive: {error}"))?;
-        if wiki_dir.is_dir() {
-            tar.append_dir_all("wiki", &wiki_dir)
-                .map_err(|e| anyhow::anyhow!("archiving wiki/: {e}"))?;
-        }
-
-        tar.append_path_with_name(&snapshot_path, "db/memory.sqlite")
-            .map_err(|e| anyhow::anyhow!("archiving db snapshot: {e}"))?;
-
-        let cfg = state.data_dir.join("config.toml");
-        if cfg.is_file() {
-            tar.append_path_with_name(&cfg, "config.toml")
-                .map_err(|e| anyhow::anyhow!("archiving config.toml: {e}"))?;
-        }
-
-        let encoder = tar.into_inner()?;
+    let mut snapshot = state.wiki.snapshot_archive(&state.reader).await?;
+    let tar_file = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut file = tempfile::tempfile()?;
+        let mut encoder = GzEncoder::new(&mut file, Compression::default());
+        std::io::copy(&mut snapshot, &mut encoder)?;
         encoder.finish()?;
-    }
-    tar_file.sync_data()?;
-    tar_file.rewind()?;
+        file.sync_data()?;
+        file.rewind()?;
+        Ok(file)
+    })
+    .await??;
     Ok(tokio::fs::File::from_std(tar_file))
 }
 
@@ -1043,11 +996,13 @@ async fn handle_export_okf(
     State(state): State<Arc<AdminState>>,
     Query(q): Query<ExportOkfQuery>,
 ) -> Response {
-    let ids = match lookup_ws_proj_no_create(&state, q.workspace.trim(), q.project.trim()).await {
+    let workspace = q.workspace.trim();
+    let project = q.project.trim();
+    let ids = match lookup_ws_proj_no_create(&state, workspace, project).await {
         Ok(ids) => ids,
         Err((status, body)) => return (status, body).into_response(),
     };
-    match build_okf_bundle_file(&state, ids.0, ids.1, q.project.trim()).await {
+    match build_okf_bundle_file(&state, ids.0, ids.1, (workspace, project)).await {
         Ok(file) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/gzip")
@@ -1074,7 +1029,7 @@ async fn build_okf_bundle_file(
     state: &AdminState,
     ws: ai_memory_core::WorkspaceId,
     proj: ai_memory_core::ProjectId,
-    project_name: &str,
+    scope: (&str, &str),
 ) -> anyhow::Result<tokio::fs::File> {
     state.wiki.validate_project_tree(ws, proj)?;
     let bundle_dir = state.wiki.project_root(ws, proj);
@@ -1184,7 +1139,7 @@ async fn build_okf_bundle_file(
         for (path, raw) in files {
             let rel = path.strip_prefix(&bundle_dir).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
-            let bytes = augment_page_for_export(&raw, &rel_str, project_name)?;
+            let bytes = augment_page_for_export(&raw, &rel_str, scope)?;
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
@@ -1207,7 +1162,7 @@ async fn build_okf_bundle_file(
 fn augment_page_for_export(
     raw: &str,
     rel_path: &str,
-    project_name: &str,
+    scope: (&str, &str),
 ) -> anyhow::Result<Vec<u8>> {
     let page_path = ai_memory_core::PagePath::new(rel_path.to_string())?;
     let mut md = ai_memory_wiki::parse(raw)?;
@@ -1255,7 +1210,7 @@ fn augment_page_for_export(
         map.insert("description".into(), serde_json::Value::String(description));
     }
 
-    md.body = ai_memory_wiki::rewrite_local_wikilinks(&md.body, &page_path, project_name);
+    md.body = ai_memory_wiki::rewrite_local_wikilinks(&md.body, &page_path, scope);
 
     Ok(ai_memory_wiki::emit(&md)?.into_bytes())
 }
@@ -2395,7 +2350,7 @@ async fn handle_read_page(
 // ---------------------------------------------------------------------
 
 /// Build a 500 response carrying the given message.
-fn internal_err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn internal_err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": msg.into() })),
@@ -2595,7 +2550,7 @@ fn with_manifest_warning(
     (status, Json(body))
 }
 
-fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
     let status = if err.is_bad_request() {
         StatusCode::BAD_REQUEST
     } else if err.is_forbidden() {
@@ -2611,7 +2566,7 @@ fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>)
     )
 }
 
-fn skip_webhooks_for_admin_request(
+pub(crate) fn skip_webhooks_for_admin_request(
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     headers: &HeaderMap,
 ) -> Vec<String> {
@@ -2691,6 +2646,9 @@ async fn handle_bootstrap(
         dry_run: req.dry_run,
         force: req.force,
         resume: req.resume,
+        // `[consolidation] output_language` rides on the server-configured
+        // review config; AppState holds no other consolidation settings.
+        output_language: state.auto_improve_review_config.output_language.clone(),
     };
 
     let bootstrap = Bootstrap {
@@ -2848,6 +2806,9 @@ async fn handle_auto_improve(
         max_input_tokens: req.max_input_tokens,
         max_proposals_per_run: req.max_proposals_per_run,
         include_raw_fallback: req.include_raw_fallback,
+        // Server-owned like the eval policy: the admin body cannot widen what
+        // the reviewer reads.
+        include_global_titles: state.auto_improve_review_config.include_global_titles,
         proposal_actor: req.proposal_actor.clone(),
         pending_path: req.pending_path.clone(),
         max_patchable_pages: req.max_patchable_pages,
@@ -2870,6 +2831,7 @@ async fn handle_auto_improve(
         max_rule_page_tokens: req.max_rule_page_tokens,
         max_procedure_page_tokens: req.max_procedure_page_tokens,
         eval: state.auto_improve_review_config.eval.clone(),
+        output_language: state.auto_improve_review_config.output_language.clone(),
     };
 
     let report =
@@ -3222,7 +3184,9 @@ fn auto_improve_error_response(
         AutoImproveError::Llm(_) => StatusCode::BAD_GATEWAY,
         AutoImproveError::Eval(_) => StatusCode::BAD_GATEWAY,
         AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
-        AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        AutoImproveError::Store(_) | AutoImproveError::Scope(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     };
     log_server_error(status, "auto-improve", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
@@ -3571,318 +3535,6 @@ async fn handle_expire_handoffs(
 /// (default) is mail addressed to it, `box=outbox` is mail it has sent and
 /// can still cancel. Oldest first, capped at `limit`. See
 /// `docs/agent-messaging.md`.
-async fn handle_list_messages(
-    State(state): State<Arc<AdminState>>,
-    Query(query): Query<ListMessagesQuery>,
-) -> impl IntoResponse {
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
-    {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
-    let mailbox = match query.mailbox.as_str() {
-        "inbox" => ai_memory_core::MessageBox::Inbox,
-        "outbox" => ai_memory_core::MessageBox::Outbox,
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("box must be \"inbox\" or \"outbox\", got {other:?}")
-                })),
-            );
-        }
-    };
-    let limit = query.limit.clamp(1, 200);
-    match state.reader.list_messages(ws, proj, mailbox, limit).await {
-        Ok(messages) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "messages": messages })),
-        ),
-        Err(e) => internal_err(e.to_string()),
-    }
-}
-
-/// `POST /admin/messages/send` request body (V64).
-#[derive(Debug, Deserialize)]
-struct SendMessageRequest {
-    from_workspace: String,
-    from_project: String,
-    to_workspace: String,
-    to_project: String,
-    #[serde(default)]
-    subject: Option<String>,
-    #[serde(default)]
-    nature: ai_memory_core::MessageNature,
-    #[serde(default)]
-    evidence: Option<String>,
-    body: String,
-}
-
-/// Map a message-store failure to a response. `InvalidState` is the
-/// full-inbox rejection (`ops::MAX_PENDING_INBOX_MESSAGES`) — a caller error,
-/// not a server fault, so it surfaces as 409 rather than 500 (mirrors
-/// [`map_user_store_err`]).
-fn map_message_store_err(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
-    match e {
-        StoreError::InvalidState(msg) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": msg })),
-        ),
-        other => internal_err(other.to_string()),
-    }
-}
-
-fn cap_message_chars(input: &str, max_chars: usize) -> String {
-    // Reuse the existing ellipsis and byte-safe cut at a character boundary.
-    let max_bytes = input
-        .char_indices()
-        .nth(max_chars)
-        .map_or(input.len(), |(end, _)| end);
-    ai_memory_core::truncate_utf8_bytes(input, max_bytes)
-}
-
-/// `POST /admin/messages/send` — drop a message into another project's
-/// inbox (V64). Both scopes are resolved with the no-create lookup: sending
-/// to a typo'd project must fail closed rather than silently creating it.
-///
-/// Security: `body` and `subject` are secret-scrubbed with the same
-/// [`ai_memory_core::Sanitizer`] the hook ingress uses before they are
-/// capped and stored — this endpoint is not a path around redaction.
-async fn handle_send_message(
-    State(state): State<Arc<AdminState>>,
-    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
-    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
-    headers: HeaderMap,
-    Json(req): Json<SendMessageRequest>,
-) -> impl IntoResponse {
-    let (from_ws, from_proj) =
-        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.from_project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
-    let (to_ws, to_proj) =
-        match lookup_ws_proj_no_create(&state, &req.to_workspace, &req.to_project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
-
-    let sanitizer = ai_memory_core::Sanitizer::builtin();
-    let body = cap_message_chars(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
-    let subject = req
-        .subject
-        .as_deref()
-        .map(|s| cap_message_chars(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS))
-        .filter(|s| !s.is_empty());
-    let evidence = req
-        .evidence
-        .as_deref()
-        .map(|value| cap_message_chars(&sanitizer.scrub(value), MESSAGE_EVIDENCE_MAX_CHARS))
-        .filter(|value| !value.trim().is_empty());
-    if req.nature == ai_memory_core::MessageNature::Measured && evidence.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "evidence_required: measured messages require non-empty evidence"
-            })),
-        );
-    }
-
-    let distinguishes = match state
-        .reader
-        .distinguishes_operators(state.trusted_proxy_identity)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => return internal_err(e.to_string()),
-    };
-    // Owner is the sender's storage key, same as `handoff_begin` — attribution
-    // only (never a read filter), and `None` when the actor is anonymous or
-    // the deployment doesn't tell its operators apart.
-    let from_owner_user = ai_memory_core::owner_stamp(
-        actor_ext
-            .as_ref()
-            .and_then(|axum::Extension(actor)| actor.identity_key())
-            .as_ref(),
-        distinguishes,
-    );
-
-    let message = ai_memory_core::NewAgentMessage {
-        from_workspace_id: from_ws,
-        from_project_id: from_proj,
-        from_agent: AgentKind::Other,
-        from_session_id: None,
-        from_owner_user,
-        to_workspace_id: to_ws,
-        to_project_id: to_proj,
-        to_agent: None,
-        subject,
-        body,
-        nature: req.nature,
-        evidence,
-    };
-
-    // Match MCP's crossing-point admission and post-commit observer ordering.
-    // CLI sends must not silently bypass a configured message_send subscriber.
-    let actor = actor_ext
-        .map(|axum::Extension(actor)| actor)
-        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-    let admission = match state
-        .wiki
-        .authorize_operation(
-            to_ws,
-            to_proj,
-            AdmissionOp::MessageSend,
-            actor,
-            skip_webhooks_for_admin_request(level_ext, &headers),
-        )
-        .await
-    {
-        Ok(ctx) => ctx,
-        // A refusal by policy, as on the MCP path — not a server fault.
-        Err(e) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": format!("message send refused by admission: {e}")
-                })),
-            );
-        }
-    };
-    match state.writer.insert_message(message).await {
-        Ok(id) => {
-            if let Some(ctx) = admission.as_ref() {
-                state.wiki.notify_operation_observers(ctx);
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "message_id": id.to_string() })),
-            )
-        }
-        Err(e) => map_message_store_err(e),
-    }
-}
-
-/// `POST /admin/messages/pop` request body (V64).
-#[derive(Debug, Deserialize)]
-struct PopMessageRequest {
-    #[serde(default)]
-    agent: Option<AgentKind>,
-    workspace: String,
-    project: String,
-    #[serde(default)]
-    message_id: Option<String>,
-}
-
-fn parse_optional_message_id(
-    raw: Option<&str>,
-) -> Result<Option<ai_memory_core::MessageId>, (StatusCode, Json<serde_json::Value>)> {
-    raw.map(str::trim)
-        .map(str::parse::<ai_memory_core::MessageId>)
-        .transpose()
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "message_id must be a full UUID" })),
-            )
-        })
-}
-
-/// `POST /admin/messages/pop` — claim exactly one pending message from this
-/// project's inbox (V64). With `message_id`, pops that one; otherwise the
-/// oldest pending. Returns `{"message": null}` when nothing matched.
-async fn handle_pop_message(
-    State(state): State<Arc<AdminState>>,
-    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
-    Json(req): Json<PopMessageRequest>,
-) -> impl IntoResponse {
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
-    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    let distinguishes = match state
-        .reader
-        .distinguishes_operators(state.trusted_proxy_identity)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => return internal_err(e.to_string()),
-    };
-    let claiming_user = ai_memory_core::owner_stamp(
-        actor_ext
-            .as_ref()
-            .and_then(|axum::Extension(actor)| actor.identity_key())
-            .as_ref(),
-        distinguishes,
-    );
-
-    let claim = ai_memory_core::MessageClaim {
-        workspace_id: ws,
-        project_id: proj,
-        claiming_agent: req
-            .agent
-            .or_else(|| {
-                actor_ext
-                    .as_ref()
-                    .and_then(|a| a.0.agent.as_deref())
-                    .map(AgentKind::from_wire)
-            })
-            .unwrap_or(AgentKind::Other),
-        claiming_session: None,
-        claiming_user,
-    };
-
-    match state.writer.pop_message(claim, specific_id).await {
-        Ok(Some(message)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "message": message,
-                "security_notice": ai_memory_core::UNTRUSTED_MESSAGE_NOTICE,
-            })),
-        ),
-        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "message": null }))),
-        Err(e) => internal_err(e.to_string()),
-    }
-}
-
-/// `POST /admin/messages/cancel` request body (V64).
-#[derive(Debug, Deserialize)]
-struct CancelMessagesRequest {
-    workspace: String,
-    project: String,
-    #[serde(default)]
-    message_id: Option<String>,
-}
-
-/// `POST /admin/messages/cancel` — retract still-pending outbox messages
-/// this project sent (V64). With `message_id`, cancels just that one;
-/// otherwise every pending message the project has sent.
-async fn handle_cancel_messages(
-    State(state): State<Arc<AdminState>>,
-    Json(req): Json<CancelMessagesRequest>,
-) -> impl IntoResponse {
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
-    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    match state.writer.cancel_messages(ws, proj, specific_id).await {
-        Ok(cancelled) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "cancelled": cancelled })),
-        ),
-        Err(e) => internal_err(e.to_string()),
-    }
-}
-
 async fn handle_pending_writes_list(
     State(state): State<Arc<AdminState>>,
     Query(query): Query<PendingWritesQuery>,
@@ -4427,6 +4079,7 @@ async fn handle_lint(
                 }),
             contradiction_band_min: state.contradiction_band_min,
             contradiction_band_max: state.contradiction_band_max,
+            keep_llm_findings: false,
         },
     )
     .await
@@ -4839,11 +4492,12 @@ async fn handle_restore_page(
         }
     };
 
-    if version_id.is_none() {
-        state
-            .wiki
-            .page_at_checkpoint(ws, proj, &path, &restore_source)
-            .await
+    let pinned_revision = if version_id.is_none() {
+        Some(async {
+            let rev = state.wiki.resolve_checkpoint_rev(&restore_source).await?;
+            state.wiki.page_at_checkpoint(ws, proj, &path, &rev).await?;
+            Ok::<_, WikiError>(rev)
+        }.await
             .map_err(|error| match error {
                 WikiError::GitOwner(_) => internal_err(error.to_string()),
                 _ => (
@@ -4852,8 +4506,10 @@ async fn handle_restore_page(
                         "error": format!("cannot read {} at {restore_source}: {error}", path.as_str())
                     })),
                 ),
-            })?;
-    }
+            })?)
+    } else {
+        None
+    };
 
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
@@ -4865,10 +4521,10 @@ async fn handle_restore_page(
         ),
     )?;
 
-    let page_id = if version_id.is_none() {
+    let page_id = if let Some(rev) = pinned_revision {
         state
             .wiki
-            .restore_page_from_checkpoint(ws, proj, path.clone(), &restore_source)
+            .restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
             .await
             .map_err(|error| match error {
                 WikiError::Store(StoreError::SessionPurged(_)) => (
@@ -8804,6 +8460,12 @@ async fn copy_purge_merge(
                 author_id: None,
                 actor: actor.clone(),
                 evidence: Vec::new(),
+                trust_class: state
+                    .reader
+                    .page_trust_class_by_path(src_ws, src_proj, &p.path_str)
+                    .await
+                    .ok()
+                    .flatten(),
             })
             .await
         {
@@ -9338,6 +9000,7 @@ async fn handle_write_page(
             author_id,
             actor,
             evidence: Vec::new(),
+            trust_class: Some(ai_memory_core::TrustClass::OperatorAuthored),
         })
         .await
         .map_err(|e| {
@@ -9912,31 +9575,73 @@ async fn handle_revoke_api_credential(
 /// Names, not ids: this is what an operator types. `level` is required by
 /// grant — never defaulted — and ignored by revoke, which takes away whatever
 /// is held.
+///
+/// The target is one project (`project`) or every project of the workspace
+/// (`all_projects: true`), and exactly one of the two must be said: a request
+/// that left `project` out by mistake must not quietly become a grant on the
+/// whole workspace.
 #[derive(Debug, Deserialize)]
 struct UserGrantRequest {
     workspace: String,
-    project: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    all_projects: bool,
     #[serde(default)]
     level: Option<String>,
 }
 
-/// Resolve a grant's user and project to the ids the table keys on.
+/// What a grant or revoke request points at.
+#[derive(Debug, Clone, Copy)]
+enum GrantTarget {
+    /// One project's grant (`project_grants`).
+    Project(ProjectId),
+    /// The workspace grant covering every project of it (`workspace_grants`).
+    Workspace(WorkspaceId),
+}
+
+/// Resolve a grant's user and target to the ids the tables key on.
 ///
-/// The project is looked up, never created: granting access to a project that
-/// does not exist yet would be a typo that silently succeeds and then grants
-/// nothing anyone can reach.
+/// The project or workspace is looked up, never created: granting access to
+/// one that does not exist yet would be a typo that silently succeeds and then
+/// grants nothing anyone can reach.
 async fn grant_target(
     state: &AdminState,
     username: &str,
     request: &UserGrantRequest,
-) -> Result<(ai_memory_core::UserId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(ai_memory_core::UserId, GrantTarget), (StatusCode, Json<serde_json::Value>)> {
+    let project = request
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|project| !project.is_empty());
+    if project.is_some() && request.all_projects {
+        return Err(validation_error(
+            "pass project for one project or all_projects for the whole workspace, not both".into(),
+        ));
+    }
+    if project.is_none() && !request.all_projects {
+        return Err(validation_error(
+            "project is required; pass all_projects: true to cover every project of the workspace"
+                .into(),
+        ));
+    }
     let user = lookup_user_by_username(state, username.trim()).await?;
-    let (_, project) =
-        lookup_ws_proj_no_create(state, request.workspace.trim(), request.project.trim()).await?;
-    Ok((user.id, project))
+    let target = match project {
+        Some(project) => {
+            let (_, project) =
+                lookup_ws_proj_no_create(state, request.workspace.trim(), project).await?;
+            GrantTarget::Project(project)
+        }
+        None => GrantTarget::Workspace(lookup_ws_no_create(state, request.workspace.trim()).await?),
+    };
+    Ok((user.id, target))
 }
 
-fn grants_json(grants: Vec<ai_memory_store::GrantListing>) -> Json<serde_json::Value> {
+fn grants_json(
+    grants: Vec<ai_memory_store::GrantListing>,
+    workspace_grants: Vec<ai_memory_store::WorkspaceGrantListing>,
+) -> Json<serde_json::Value> {
     let grants: Vec<_> = grants
         .into_iter()
         .map(|g| {
@@ -9948,11 +9653,23 @@ fn grants_json(grants: Vec<ai_memory_store::GrantListing>) -> Json<serde_json::V
             })
         })
         .collect();
-    Json(serde_json::json!({ "grants": grants }))
+    // A separate list, not rows with a null project: every existing reader of
+    // `grants` keeps the shape it parses.
+    let workspace_grants: Vec<_> = workspace_grants
+        .into_iter()
+        .map(|g| {
+            serde_json::json!({
+                "username": g.username,
+                "workspace": g.workspace,
+                "level": g.level.as_str(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "grants": grants, "workspace_grants": workspace_grants }))
 }
 
-/// `GET /admin/users/{username}/grants` — every project one user holds a
-/// grant on.
+/// `GET /admin/users/{username}/grants` — every project and every workspace
+/// one user holds a grant on.
 async fn handle_list_user_grants(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -9965,7 +9682,12 @@ async fn handle_list_user_grants(
         .list_grants(ai_memory_store::GrantFilter::User(user.id))
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    Ok((StatusCode::OK, grants_json(grants)))
+    let workspace_grants = state
+        .reader
+        .list_workspace_grants(ai_memory_store::WorkspaceGrantFilter::User(user.id))
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((StatusCode::OK, grants_json(grants, workspace_grants)))
 }
 
 /// Query of `GET /admin/projects/grants`: both names for one project, or
@@ -9977,19 +9699,29 @@ struct ProjectGrantsQuery {
 }
 
 /// `GET /admin/projects/grants[?workspace=&project=]` — who holds a grant on
-/// one project, or every grant on the server.
+/// one project, or every grant on the server. For one project,
+/// `workspace_grants` lists the grants on its workspace, which reach it too —
+/// except for a private `_profile.<user_id>` scope, which workspace grants
+/// never reach.
 async fn handle_list_project_grants(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
     Query(query): Query<ProjectGrantsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
-    let filter = match (query.workspace.as_deref(), query.project.as_deref()) {
-        (None, None) => ai_memory_store::GrantFilter::All,
+    let (filter, workspace_filter) = match (query.workspace.as_deref(), query.project.as_deref()) {
+        (None, None) => (
+            ai_memory_store::GrantFilter::All,
+            Some(ai_memory_store::WorkspaceGrantFilter::All),
+        ),
         (Some(workspace), Some(project)) => {
-            let (_, project) =
-                lookup_ws_proj_no_create(&state, workspace.trim(), project.trim()).await?;
-            ai_memory_store::GrantFilter::Project(project)
+            let trimmed_project = project.trim();
+            let (workspace, project_id) =
+                lookup_ws_proj_no_create(&state, workspace.trim(), trimmed_project).await?;
+            let ws_filter = (!trimmed_project
+                .starts_with(ai_memory_core::profile::USER_PROFILE_PROJECT_PREFIX))
+            .then_some(ai_memory_store::WorkspaceGrantFilter::Workspace(workspace));
+            (ai_memory_store::GrantFilter::Project(project_id), ws_filter)
         }
         _ => {
             return Err(validation_error(
@@ -10002,11 +9734,19 @@ async fn handle_list_project_grants(
         .list_grants(filter)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    Ok((StatusCode::OK, grants_json(grants)))
+    let workspace_grants = match workspace_filter {
+        Some(workspace_filter) => state
+            .reader
+            .list_workspace_grants(workspace_filter)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?,
+        None => Vec::new(),
+    };
+    Ok((StatusCode::OK, grants_json(grants, workspace_grants)))
 }
 
-/// `POST /admin/users/{username}/grant` — give a user a level on a project, or
-/// change the level they hold.
+/// `POST /admin/users/{username}/grant` — give a user a level on a project or
+/// on every project of a workspace, or change the level they hold.
 ///
 /// Returns what actually happened, so "already had that" is not reported as a
 /// change.
@@ -10029,17 +9769,23 @@ async fn handle_user_grant(
             ai_memory_store::GrantLevel::from_db(raw.trim())
                 .ok_or_else(|| validation_error(format!("unknown level {raw:?}: read or write")))
         })?;
-    let (user, project) = grant_target(&state, &username, &request).await?;
-    let outcome = state
-        .writer
-        .grant_memory(
-            user,
-            project,
-            grant_level,
-            operator.map(|axum::Extension(id)| id),
-        )
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
+    let (user, target) = grant_target(&state, &username, &request).await?;
+    let operator = operator.map(|axum::Extension(id)| id);
+    let outcome = match target {
+        GrantTarget::Project(project) => {
+            state
+                .writer
+                .grant_memory(user, project, grant_level, operator)
+                .await
+        }
+        GrantTarget::Workspace(workspace) => {
+            state
+                .writer
+                .grant_workspace(user, workspace, grant_level, operator)
+                .await
+        }
+    }
+    .map_err(|e| internal_err(e.to_string()))?;
     let (changed, previous) = match outcome {
         ai_memory_store::GrantOutcome::Granted => (true, None),
         ai_memory_store::GrantOutcome::LevelChanged { from } => (true, Some(from.as_str())),
@@ -10050,7 +9796,8 @@ async fn handle_user_grant(
         Json(serde_json::json!({
             "username": username.trim(),
             "workspace": request.workspace.trim(),
-            "project": request.project.trim(),
+            "project": request.project.as_deref().map(str::trim),
+            "all_projects": request.all_projects,
             "level": grant_level.as_str(),
             "changed": changed,
             "previous": previous,
@@ -10059,7 +9806,8 @@ async fn handle_user_grant(
 }
 
 /// `POST /admin/users/{username}/revoke` — take away whatever a user holds on
-/// a project.
+/// a project, or their grant on a whole workspace. Revoking the workspace
+/// grant leaves the user's project grants inside it in force.
 async fn handle_user_revoke(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -10068,18 +9816,25 @@ async fn handle_user_revoke(
     Json(request): Json<UserGrantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
-    let (user, project) = grant_target(&state, &username, &request).await?;
-    let revoked = state
-        .writer
-        .revoke_memory(user, project, operator.map(|axum::Extension(id)| id))
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
+    let (user, target) = grant_target(&state, &username, &request).await?;
+    let operator = operator.map(|axum::Extension(id)| id);
+    let revoked = match target {
+        GrantTarget::Project(project) => state.writer.revoke_memory(user, project, operator).await,
+        GrantTarget::Workspace(workspace) => {
+            state
+                .writer
+                .revoke_workspace(user, workspace, operator)
+                .await
+        }
+    }
+    .map_err(|e| internal_err(e.to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "username": username.trim(),
             "workspace": request.workspace.trim(),
-            "project": request.project.trim(),
+            "project": request.project.as_deref().map(str::trim),
+            "all_projects": request.all_projects,
             "revoked": revoked,
         })),
     ))
@@ -10339,6 +10094,8 @@ mod tests {
             },
             events: vec![AdmissionOp::MessageSend],
             blocking: reject,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -10454,7 +10211,7 @@ mod tests {
         assert_eq!(stored.subject.as_deref(), Some(subject.as_str()));
         assert_eq!(stored.evidence.as_deref(), Some(evidence.as_str()));
 
-        let max = "𝐀".repeat(MESSAGE_EVIDENCE_MAX_CHARS);
+        let max = "𝐀".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS);
         let stored_max = h.send("body", "subject", &max).await;
         assert_eq!(stored_max.evidence.as_deref(), Some(max.as_str()));
     }
@@ -10462,9 +10219,9 @@ mod tests {
     #[tokio::test]
     async fn admin_message_character_caps_keep_ascii_and_clip_oversized_text() {
         let h = MessageTextHarness::new().await;
-        let body = "x".repeat(MESSAGE_BODY_MAX_CHARS);
-        let subject = "s".repeat(MESSAGE_SUBJECT_MAX_CHARS);
-        let evidence = "e".repeat(MESSAGE_EVIDENCE_MAX_CHARS);
+        let body = "x".repeat(crate::messages::MESSAGE_BODY_MAX_CHARS);
+        let subject = "s".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS);
+        let evidence = "e".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS);
         let stored = h.send(&body, &subject, &evidence).await;
         assert_eq!(stored.body, body);
         assert_eq!(stored.subject.as_deref(), Some(subject.as_str()));
@@ -10472,19 +10229,28 @@ mod tests {
 
         let over_body = format!("{body}tail");
         let over_evidence = format!("{evidence}tail");
-        let over_subject = "界".repeat(MESSAGE_SUBJECT_MAX_CHARS + 1);
+        let over_subject = "界".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS + 1);
         let clipped = h.send(&over_body, &over_subject, &over_evidence).await;
         assert_eq!(
             clipped.body,
-            format!("{}…", "x".repeat(MESSAGE_BODY_MAX_CHARS - 3))
+            format!(
+                "{}…",
+                "x".repeat(crate::messages::MESSAGE_BODY_MAX_CHARS - 3)
+            )
         );
         assert_eq!(
             clipped.evidence,
-            Some(format!("{}…", "e".repeat(MESSAGE_EVIDENCE_MAX_CHARS - 3)))
+            Some(format!(
+                "{}…",
+                "e".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS - 3)
+            ))
         );
         assert_eq!(
             clipped.subject,
-            Some(format!("{}…", "界".repeat(MESSAGE_SUBJECT_MAX_CHARS - 1)))
+            Some(format!(
+                "{}…",
+                "界".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS - 1)
+            ))
         );
     }
 
@@ -10492,9 +10258,18 @@ mod tests {
     async fn admin_message_character_caps_scrub_before_truncating() {
         let h = MessageTextHarness::new().await;
         let fake_key = format!("sk-{}", "A".repeat(48));
-        let body = format!("{} {fake_key}", "x".repeat(MESSAGE_BODY_MAX_CHARS - 10));
-        let subject = format!("{} {fake_key}", "s".repeat(MESSAGE_SUBJECT_MAX_CHARS - 10));
-        let evidence = format!("{} {fake_key}", "e".repeat(MESSAGE_EVIDENCE_MAX_CHARS - 10));
+        let body = format!(
+            "{} {fake_key}",
+            "x".repeat(crate::messages::MESSAGE_BODY_MAX_CHARS - 10)
+        );
+        let subject = format!(
+            "{} {fake_key}",
+            "s".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS - 10)
+        );
+        let evidence = format!(
+            "{} {fake_key}",
+            "e".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS - 10)
+        );
         let stored = h.send(&body, &subject, &evidence).await;
         for text in [
             &stored.body,
@@ -10538,6 +10313,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_message_send_webhook_ctx_names_the_message() {
+        let (_tmp, _store, router, _ws, _recipient, mut rx, release, server) =
+            message_send_fixture(false).await;
+        let response = router.oneshot(message_send_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let (payload, _) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = &payload["ctx"];
+        assert_eq!(
+            ctx["message_id"], sent["message_id"],
+            "the id the send returned"
+        );
+        assert_eq!(ctx["from_workspace"], "default");
+        assert_eq!(ctx["from_project"], "sender");
+        assert!(ctx["to_agent"].is_null(), "admin sends shared mail: {ctx}");
+        assert!(
+            !payload.to_string().contains("Synthetic result"),
+            "observer must not copy message text"
+        );
+        release.notify_one();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn admin_message_send_reject_leaves_inbox_empty() {
         let (_tmp, store, router, ws, recipient, mut rx, _release, server) =
             message_send_fixture(true).await;
@@ -10545,6 +10350,53 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let (_, committed_count) = rx.recv().await.unwrap();
         assert_eq!(committed_count, 0);
+        assert!(
+            store
+                .reader
+                .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    /// `/messages*` opened mail to database users; `/admin/messages*` must not
+    /// follow, because every `/admin/*` route is root-only in multi-user mode.
+    #[tokio::test]
+    async fn admin_message_routes_stay_root_only_for_a_database_user() {
+        let (_tmp, store, router, ws, recipient, _rx, _release, server) =
+            message_send_fixture(false).await;
+        store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        for (method, uri) in [
+            ("GET", "/admin/messages?workspace=default&project=recipient"),
+            ("POST", "/admin/messages/send"),
+            ("POST", "/admin/messages/pop"),
+            ("POST", "/admin/messages/cancel"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .extension(ai_memory_core::AuthLevel::User)
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
         assert!(
             store
                 .reader
@@ -11061,6 +10913,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -11076,6 +10929,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: None,
                     actor_user: Some(IdentityKey::User(owner.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -11299,6 +11153,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -11315,6 +11170,7 @@ mod tests {
                     agent_kind: AgentKind::Codex,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: Some(IdentityKey::User(user.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -11512,6 +11368,7 @@ mod tests {
                     agent_kind,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -12059,7 +11916,7 @@ mod tests {
     #[tokio::test]
     async fn export_okf_rewrites_local_wikilinks_to_relative_markdown_links() {
         let (tmp, router) = read_page_test_router();
-        post_write_page(&router, "default", "scratch", "notes/seed.md", "seed").await;
+        post_write_page(&router, "workshop", "scratch", "notes/seed.md", "seed").await;
         let proj_dir = scratch_project_dir(tmp.path());
         std::fs::create_dir_all(proj_dir.join("concepts")).unwrap();
         std::fs::create_dir_all(proj_dir.join("decisions")).unwrap();
@@ -12070,7 +11927,11 @@ mod tests {
         .unwrap();
         std::fs::write(
             proj_dir.join("concepts/a.md"),
-            "---\ntype: Concept\n---\n\nSee [[decisions/b.md]] and [[other-project:x.md]].\n",
+            concat!(
+                "---\ntype: Concept\n---\n\n",
+                "See [[decisions/b.md]] and [[workshop/scratch:decisions/b#details|details]].\n",
+                "Also [[other-project:x.md]] and [[default/scratch:decisions/b.md]].\n",
+            ),
         )
         .unwrap();
 
@@ -12079,7 +11940,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .uri("/admin/export-okf?workspace=workshop&project=scratch")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -12103,6 +11964,16 @@ mod tests {
         assert!(
             parsed.body.contains("[decisions/b.md](../decisions/b.md)"),
             "{}",
+            parsed.body
+        );
+        assert!(
+            parsed.body.contains("[details](../decisions/b.md#details)"),
+            "same-bundle qualified wikilink must be portable: {}",
+            parsed.body
+        );
+        assert!(
+            parsed.body.contains("[[default/scratch:decisions/b.md]]"),
+            "cross-workspace wikilink must ship untouched: {}",
             parsed.body
         );
         assert!(
@@ -13064,6 +12935,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -13079,6 +12951,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13097,6 +12970,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13223,6 +13097,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -13238,6 +13113,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13256,6 +13132,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13366,6 +13243,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -13381,6 +13259,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13399,6 +13278,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13487,6 +13367,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -13502,6 +13383,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13520,6 +13402,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13606,6 +13489,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13624,6 +13508,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13763,6 +13648,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13781,6 +13667,7 @@ mod tests {
                     body: "durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -14724,6 +14611,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14837,6 +14726,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14943,6 +14834,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -15055,6 +14948,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -17215,6 +17110,143 @@ mod tests {
         )
         .await;
         assert_eq!(json["revoked"], false, "revoking twice reports honestly");
+    }
+
+    /// A workspace grant over HTTP, as `ai-memory user grant --all-projects`
+    /// drives it. The target is said, never inferred: a body with no
+    /// `project` is refused instead of widening to the whole workspace.
+    #[tokio::test]
+    async fn a_workspace_grant_is_explicit_listed_apart_and_revoked_by_itself() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_human_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        write_fixture_page(&router, "acme", "api", "notes/a.md").await;
+        let grant = |body: serde_json::Value| {
+            let router = router.clone();
+            async move {
+                admin_call(
+                    &router,
+                    "POST",
+                    "/admin/users/alice/grant",
+                    "root-token",
+                    Some(body),
+                )
+                .await
+            }
+        };
+
+        // The violation this guards: no `project` and no `all_projects` must
+        // not become a workspace grant, and nothing is written by the refusal.
+        let (status, _) = grant(serde_json::json!({"workspace": "acme", "level": "write"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = grant(serde_json::json!({
+            "workspace": "acme", "project": "  ", "level": "write",
+        }))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an empty project is not all projects"
+        );
+        let (status, _) = grant(serde_json::json!({
+            "workspace": "acme", "project": "api", "all_projects": true, "level": "write",
+        }))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "one project and all of them"
+        );
+        let (_, listing) =
+            admin_call(&router, "GET", "/admin/projects/grants", "root-token", None).await;
+        assert_eq!(listing["grants"], serde_json::json!([]));
+        assert_eq!(listing["workspace_grants"], serde_json::json!([]));
+
+        // A typo in the workspace is a 404 and does not create it.
+        for _ in 0..2 {
+            let (status, _) = grant(serde_json::json!({
+                "workspace": "acmee", "all_projects": true, "level": "read",
+            }))
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        // A level is still required. (`only_root_may_touch_grants` covers the
+        // caller: the root check runs before the body is read.)
+        let (status, _) =
+            grant(serde_json::json!({"workspace": "acme", "all_projects": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The legitimate request.
+        let (status, json) = grant(serde_json::json!({
+            "workspace": "acme", "all_projects": true, "level": "read",
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["changed"], true);
+        assert_eq!(json["all_projects"], true);
+        assert!(json["project"].is_null());
+        let (_, json) = grant(serde_json::json!({
+            "workspace": "acme", "all_projects": true, "level": "write",
+        }))
+        .await;
+        assert_eq!(json["previous"], "read");
+
+        // Listed apart from the project grants, from every angle, so the
+        // `grants` array keeps the shape its readers parse.
+        let expected = serde_json::json!([{
+            "username": "alice", "workspace": "acme", "level": "write",
+        }]);
+        for uri in [
+            "/admin/projects/grants",
+            "/admin/users/alice/grants",
+            "/admin/projects/grants?workspace=acme&project=api",
+        ] {
+            let (status, json) = admin_call(&router, "GET", uri, "root-token", None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(json["grants"], serde_json::json!([]), "{uri}");
+            assert_eq!(json["workspace_grants"], expected, "{uri}");
+        }
+        // A project of another workspace does not list it.
+        write_fixture_page(&router, "default", "client-work", "notes/a.md").await;
+        let (_, json) = admin_call(
+            &router,
+            "GET",
+            "/admin/projects/grants?workspace=default&project=client-work",
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(json["workspace_grants"], serde_json::json!([]));
+
+        // Revoking one project's grant does not touch the workspace grant;
+        // revoking the workspace grant does, once.
+        let revoke = |body: serde_json::Value| {
+            let router = router.clone();
+            async move {
+                admin_call(
+                    &router,
+                    "POST",
+                    "/admin/users/alice/revoke",
+                    "root-token",
+                    Some(body),
+                )
+                .await
+                .1
+            }
+        };
+        let json = revoke(serde_json::json!({"workspace": "acme", "project": "api"})).await;
+        assert_eq!(json["revoked"], false);
+        let (_, listing) =
+            admin_call(&router, "GET", "/admin/projects/grants", "root-token", None).await;
+        assert_eq!(listing["workspace_grants"], expected);
+        let json = revoke(serde_json::json!({"workspace": "acme", "all_projects": true})).await;
+        assert_eq!(json["revoked"], true);
+        let json = revoke(serde_json::json!({"workspace": "acme", "all_projects": true})).await;
+        assert_eq!(json["revoked"], false);
     }
 
     async fn write_fixture_page(router: &Router, workspace: &str, project: &str, path: &str) {

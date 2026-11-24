@@ -25,7 +25,9 @@ use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
-use crate::commands::path_util::{claude_config_dir, home_dir, strip_windows_verbatim_prefix};
+use crate::commands::path_util::{
+    claude_config_dir, devin_user_config_dir_in, home_dir, strip_windows_verbatim_prefix,
+};
 use crate::commands::render_shared::{
     bearer_header_value, hook_embedded_exe_path, mask_secret, shell_quote, yaml_single_quote,
 };
@@ -227,6 +229,7 @@ fn preview_snippet(mut args: InstallMcpArgs) -> Result<String> {
         McpClient::GeminiCli => render_gemini_cli(&args)?,
         McpClient::QwenCode => render_qwen_code(&args)?,
         McpClient::Qoder => render_json_mcp_fragment(&args)?,
+        McpClient::WorkBuddy => render_json_mcp_fragment(&args)?,
         McpClient::Openclaw => render_openclaw(&args)?,
         McpClient::Pi => render_pi(&args)?,
         McpClient::Omp => render_omp(&args)?,
@@ -555,9 +558,11 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
             "args": bridge,
             "timeout": GEMINI_MCP_TIMEOUT_MS,
         }),
-        McpClient::Cursor | McpClient::VsCodeCopilot | McpClient::Swival | McpClient::Zero => {
-            typed("stdio")
-        }
+        McpClient::Cursor
+        | McpClient::VsCodeCopilot
+        | McpClient::Swival
+        | McpClient::Zero
+        | McpClient::WorkBuddy => typed("stdio"),
         McpClient::Freebuff => {
             let env = args
                 .auth_token
@@ -748,6 +753,9 @@ pub(crate) fn mcp_config_path_with(
     };
     Ok(match client {
         McpClient::ClaudeCode => claude_code_config_path_in(env("CLAUDE_CONFIG_DIR"))?,
+        // WorkBuddy keeps MCP servers in a dedicated mcp.json beside its
+        // settings.json, under the root `mcpServers` map.
+        McpClient::WorkBuddy => home()?.join(".workbuddy").join("mcp.json"),
         McpClient::Codex => codex_config_path_in(env("CODEX_HOME"))?,
         // Project scope is `.grok/config.toml` under cwd/repo; pass
         // --config-file for that case rather than inventing a second default.
@@ -801,7 +809,7 @@ pub(crate) fn mcp_config_path_with(
                 )
             }
         }
-        McpClient::GeminiCli => home()?.join(".gemini").join("settings.json"),
+        McpClient::GeminiCli => gemini_home_in(env("GEMINI_CLI_HOME"))?.join("settings.json"),
         McpClient::QwenCode => home()?.join(".qwen").join("settings.json"),
         McpClient::Qoder => home()?.join(".qoder").join("settings.json"),
         McpClient::Openclaw => home()?.join(".openclaw").join("config.json"),
@@ -829,7 +837,11 @@ pub(crate) fn mcp_config_path_with(
         // (workspace scopes like .zcode/config.json exist, but user scope
         // is the install default for every other client too).
         McpClient::Zcode => home()?.join(".zcode").join("cli").join("config.json"),
-        McpClient::Devin => home()?.join(".devin").join("config.json"),
+        McpClient::Devin => {
+            devin_user_config_dir_in(env("APPDATA"), home().ok().as_deref(), cfg!(windows))
+                .context("could not locate $HOME for ~/.config/devin/mcp_config.json")?
+                .join("mcp_config.json")
+        }
         // Kimi Code keeps its data dir at $KIMI_CODE_HOME when set,
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
         // that root.
@@ -1036,7 +1048,7 @@ fn codex_config_path_in(env_override: Option<std::ffi::OsString>) -> Result<Path
 /// Kimi Code's data dir: `$KIMI_CODE_HOME` when set and not blank, else
 /// `~/.kimi-code`. The env value comes in as a parameter so tests can
 /// exercise both branches without mutating process env.
-fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+pub(crate) fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
     if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
         return Ok(dir);
     }
@@ -1055,6 +1067,20 @@ fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
     Ok(home_dir()
         .context("could not locate $HOME for Kiro configuration")?
         .join(".kiro"))
+}
+
+/// Google Gemini CLI's configuration directory: `$GEMINI_CLI_HOME/.gemini` when
+/// `GEMINI_CLI_HOME` is set and not blank, otherwise `~/.gemini`. Gemini CLI's
+/// `Storage.getGlobalGeminiDir()` replaces `os.homedir()` with
+/// `GEMINI_CLI_HOME` before appending `.gemini`, so both `settings.json` and
+/// `tmp/` live under this directory.
+pub(crate) fn gemini_home_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join(".gemini"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.gemini/settings.json")?
+        .join(".gemini"))
 }
 
 /// GitHub Copilot CLI's configuration directory: `$COPILOT_HOME` when set and
@@ -1306,6 +1332,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::GeminiCli
         | McpClient::QwenCode
         | McpClient::Qoder
+        | McpClient::WorkBuddy
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
@@ -1811,8 +1838,8 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let server_url = flavored.as_str();
     let mut entry = serde_json::Map::new();
     match args.client {
-        McpClient::ClaudeCode => {
-            if args.session_aware {
+        McpClient::ClaudeCode | McpClient::WorkBuddy => {
+            if args.client == McpClient::ClaudeCode && args.session_aware {
                 entry.insert("type".into(), json!("stdio"));
                 entry.insert("command".into(), json!(bridge_command()));
                 let mut argv = vec![
@@ -2882,7 +2909,7 @@ fn render_antigravity_cli(args: &InstallMcpArgs) -> Result<String> {
 
 fn render_devin(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# Devin CLI — merge into ~/.devin/config.json:\n\
+        "# Devin CLI — merge into ~/.config/devin/mcp_config.json:\n\
          #\n\
          # Devin uses `mcpServers` with HTTP transport and optional Bearer auth.\n\
          {snippet}\n",
@@ -4770,6 +4797,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::WorkBuddy => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -4814,6 +4842,7 @@ mod tests {
             McpClient::GeminiCli,
             McpClient::QwenCode,
             McpClient::Qoder,
+            McpClient::WorkBuddy,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4864,6 +4893,7 @@ mod tests {
             McpClient::GeminiCli,
             McpClient::QwenCode,
             McpClient::Qoder,
+            McpClient::WorkBuddy,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4917,6 +4947,34 @@ mod tests {
         assert!(entry.get("url").is_none());
     }
 
+    /// WorkBuddy reads MCP servers from `~/.workbuddy/mcp.json` under the
+    /// root `mcpServers` map, in Claude Code's HTTP shape (`type: "http"`,
+    /// `url`, `headers`). A token from a file instead routes it to the
+    /// session-less stdio bridge.
+    #[test]
+    fn workbuddy_writes_a_claude_shaped_http_entry_at_its_own_path() {
+        let mut args = args_with_token(McpClient::WorkBuddy);
+        // `build_json_mcp_entry` takes the endpoint as given; the `/mcp`
+        // suffix is added by `effective_mcp_server_url` in `run`.
+        args.server_url = Some("http://memory:49374/mcp".into());
+        let entry = build_json_mcp_entry(&args).unwrap();
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://memory:49374/mcp");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert!(matches!(
+            json_mcp_location(McpClient::WorkBuddy),
+            Some(JsonMcpLocation::RootMcpServers)
+        ));
+        assert!(
+            mcp_config_path(McpClient::WorkBuddy)
+                .unwrap()
+                .ends_with(".workbuddy/mcp.json")
+        );
+    }
+
     fn render_for_test(client: McpClient) -> String {
         let args = args_for(client);
         match args.client {
@@ -4932,6 +4990,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::WorkBuddy => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -6391,6 +6450,32 @@ mod tests {
             panic!("expected install-mcp command for devin");
         };
         assert!(matches!(mcp_args.client, crate::cli::McpClient::Devin));
+    }
+
+    #[test]
+    fn devin_default_mcp_config_path_and_render_use_config_dir() {
+        let path = mcp_config_path_with(McpClient::Devin, &|_| None).unwrap();
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("mcp_config.json")
+        );
+        #[cfg(not(windows))]
+        {
+            let parent = path.parent().unwrap();
+            assert_eq!(parent.file_name().and_then(|s| s.to_str()), Some("devin"));
+            assert_eq!(
+                parent
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .and_then(|s| s.to_str()),
+                Some(".config")
+            );
+        }
+
+        let rendered = render_devin(&args_with_token(McpClient::Devin)).unwrap();
+        assert!(rendered.contains("~/.config/devin/mcp_config.json"));
+        assert!(!rendered.contains("~/.devin/config.json"));
     }
 
     #[test]

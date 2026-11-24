@@ -440,6 +440,12 @@ ai_memory_managed_qs() {
     if [ -n "${AI_MEMORY_RUN_ID:-}" ]; then
         printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
     fi
+    # How a launcher started this session (#2180): forwarded only for the
+    # recognised `automation` token, so the server can stamp the session and
+    # the profile harvester can skip its prompts.
+    if [ "$(printf '%s' "${AI_MEMORY_SESSION_ORIGIN:-}" | tr -d '[:space:]')" = "automation" ]; then
+        printf '&session_origin=automation'
+    fi
     case "$(printf '%s' "${AI_MEMORY_AUTO_HANDOFF:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
         0|false|no|off) printf '&auto_handoff=0' ;;
     esac
@@ -876,8 +882,10 @@ ai_memory_marker_qs() {
         pcon=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" contribute)")
         pcons=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" consume)")
         # The delivery key is independent in [handoff] and [recovery].
-        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag_outside_section "$marker" recovery deliver_on_session_start)")" = 0 ] && hoff=0
-        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_section_flag "$marker" recovery deliver_on_session_start)")" = 0 ] && roff=0
+        _hoff_raw=$(ai_memory_parse_toml_flag_outside_section "$marker" recovery deliver_on_session_start)
+        [ -n "$_hoff_raw" ] && hoff=$(ai_memory_profile_flag "$_hoff_raw")
+        _roff_raw=$(ai_memory_parse_toml_section_flag "$marker" recovery deliver_on_session_start)
+        [ -n "$_roff_raw" ] && roff=$(ai_memory_profile_flag "$_roff_raw")
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
@@ -923,8 +931,8 @@ ai_memory_marker_qs() {
     [ -n "$dg" ] && qs="${qs}&default_global=$(ai_memory_url_encode "$dg")"
     [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
     [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
-    [ -n "$hoff" ] && qs="${qs}&handoff=0"
-    [ -n "$roff" ] && qs="${qs}&recovery=0"
+    [ -n "$hoff" ] && qs="${qs}&handoff=$hoff"
+    [ -n "$roff" ] && qs="${qs}&recovery=$roff"
     qs="${qs}$(ai_memory_managed_qs)"
     printf '%s' "$qs"
 }

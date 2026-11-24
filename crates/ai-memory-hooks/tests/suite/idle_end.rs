@@ -70,7 +70,10 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         session_consolidation_notify: None,
         profile_notify: None,
         capture_assistant_enabled: false,
+        assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
         claim_handoff_on_session_start: true,
+        deliver_handoff_on_session_start: true,
+        deliver_recovery_on_session_start: true,
         create_handoff_on_session_end: true,
         subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
         ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
@@ -81,6 +84,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         )),
         ingest_gates: IngestGates::default(),
         session_agents: SessionAgents::default(),
+        project_briefs: ai_memory_hooks::ProjectBriefs::default(),
         cwd_probes: CwdProbes::default(),
         per_user_slots: false,
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),
@@ -123,6 +127,7 @@ async fn begin(
             cwd: Some(CWD.into()),
             actor_user,
             occurred_at: Some(at),
+            origin: None,
         })
         .await
         .unwrap();
@@ -168,6 +173,7 @@ async fn observe_titled(
                 importance: 5,
                 occurred_at: Some(at),
                 file_path: None,
+                trust_class: None,
             },
             &state.sanitizer,
         ))
@@ -771,6 +777,7 @@ async fn idle_tick_keeps_a_session_page_written_by_the_agent() {
         author_id: None,
         actor: ActorContext::default(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -970,6 +977,7 @@ async fn idle_tick_keeps_the_agents_page_for_a_crossed_session() {
         author_id: None,
         actor: ActorContext::default(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();

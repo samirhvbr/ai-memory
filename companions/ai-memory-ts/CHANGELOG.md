@@ -10,14 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pages.patch` accepts `global: true` (sent as `scope: "global"`) to patch a
+  page in the reserved global scope, matching `pages.read`. (#2362)
+- `messages.list` accepts `afterId` (sent as `after_id`) to page the pending
+  queue with the last id from the previous page. (#2295)
 - `observations` documents the server's new `session_id: "current"`: the
   server resolves it only for a request carrying the caller's hook session
   id, which this client does not send, so SDK callers pass the id. (#1983)
 - `pages.write`, `pages.writeBatch` and `pages.update` accept `sourceFiles`
   (sent as `source_files`), the repository files a page describes with the
   commit it was checked against; `pages.update` carries it over. (#1957)
+- `messages.send` and `handoffs.begin` return `truncated` and
+  `truncatedFields` when the server cut any of the sent text to its size caps:
+  `originalChars` / `storedChars` per field, plus `originalItems` /
+  `storedItems` for handoff lists. Both stay `undefined` when nothing was cut.
+  (#2411)
 
 ### Fixed
+
+- Waited for the active MCP handshake during a capability refresh so a
+  superseded response cannot send a call without a stateful session ID. (#2047)
 
 - `pages.update` preserves profile stack filters and enforcement metadata on
   a body edit. `pages.write` and `pages.update` accept `appliesTo` and

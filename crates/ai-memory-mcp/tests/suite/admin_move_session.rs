@@ -151,6 +151,7 @@ async fn seed_session(
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(cwd.into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -170,6 +171,7 @@ async fn seed_session(
                     body: "do the thing".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -226,6 +228,7 @@ async fn seed_session(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -514,6 +517,7 @@ async fn move_session_page_collision_returns_409_and_leaves_source_intact() {
             expires_at: None,
             entities: vec![],
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -586,6 +590,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
                 body: "one more".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -648,6 +653,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -765,6 +771,7 @@ async fn move_session_batch_stops_at_first_error_and_reports_progress() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1006,6 +1013,7 @@ async fn scatter_observations(
                     body: "landed in the wrong bucket".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -1114,6 +1122,7 @@ async fn move_session_rehome_of_open_session_needs_no_force() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/dst".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1166,6 +1175,7 @@ async fn rooted_in_dst_with_stray_page(
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/dst".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1185,6 +1195,7 @@ async fn rooted_in_dst_with_stray_page(
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

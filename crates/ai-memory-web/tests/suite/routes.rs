@@ -94,6 +94,7 @@ fn new_page(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -116,6 +117,7 @@ fn wiki_req(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -241,6 +243,7 @@ async fn dashboard_metric_links_sort_filter_and_reject_unknown_views() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -782,6 +785,63 @@ async fn search_body_with_pages(n: usize) -> String {
     search_body_with_pages_at(n, "/search?q=capnoticeterm").await
 }
 
+/// With no search term the page lists the most recently updated pages instead
+/// of an empty prompt: the project's own when one is selected, every readable
+/// project's otherwise. A project with no pages keeps the plain prompt.
+#[tokio::test]
+async fn web_search_without_a_term_lists_recent_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let with_pages = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "empty", None)
+        .await
+        .unwrap();
+    for (project, path, title) in [
+        (with_pages, "a.md", "Scratch Recent Page"),
+        (other, "b.md", "Other Recent Page"),
+    ] {
+        store
+            .writer
+            .upsert_page(new_page(ws, project, path, title, "body"))
+            .await
+            .unwrap();
+    }
+    let web = router(store.reader.clone(), wiki.clone());
+
+    let (status, all) = get_text(&web, "/search", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(all.contains("Scratch Recent Page"), "{all}");
+    assert!(all.contains("Other Recent Page"), "{all}");
+    assert!(all.contains("most recently updated pages"), "{all}");
+
+    let (_, scoped) = get_text(&web, "/search?scope=default/scratch", None).await;
+    assert!(scoped.contains("Scratch Recent Page"), "{scoped}");
+    assert!(
+        !scoped.contains("Other Recent Page"),
+        "a project search lists only its own pages: {scoped}"
+    );
+
+    let (status, empty) = get_text(&web, "/search?scope=default/empty", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(empty.contains("Enter a search term above."), "{empty}");
+    assert!(!empty.contains("most recently updated pages"), "{empty}");
+}
+
 async fn search_body_with_pages_at(n: usize, uri: &str) -> String {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -1272,6 +1332,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1294,6 +1355,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1956,6 +2018,7 @@ async fn seed_session(
             agent_kind: AgentKind::OpenCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1975,6 +2038,7 @@ async fn seed_session(
                     body: (*body).to_owned(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &ai_memory_core::Sanitizer::builtin(),
             ))
@@ -3531,6 +3595,7 @@ async fn viewer_filtered_api_reads_are_never_served_from_cache() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3736,6 +3801,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3909,6 +3975,7 @@ async fn api_page_handler_etag_differs_per_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3925,6 +3992,7 @@ async fn api_page_handler_etag_differs_per_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -4302,6 +4370,7 @@ async fn project_view_shows_agent_attribution() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4311,6 +4380,7 @@ async fn project_view_shows_agent_attribution() {
             evidence: vec![PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: session_id.to_string(),
+                observations: Default::default(),
             }],
             ..new_page(
                 ws,
@@ -4374,6 +4444,7 @@ async fn project_view_shows_session_token_usage() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4446,6 +4517,7 @@ async fn project_view_ranks_live_token_responses_and_flags_large_usage() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4526,6 +4598,7 @@ async fn project_view_session_without_usage_shows_dash_not_zero() {
             agent_kind: AgentKind::OpenCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -5242,6 +5315,26 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         }
         let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if content_type.is_some_and(|value| value.starts_with("text/html")) {
+            assert_eq!(
+                resp.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "{viewer:?} must not reuse another viewer's HTML at {uri}"
+            );
+            assert_eq!(content_type, Some("text/html; charset=utf-8"));
+            assert_eq!(
+                resp.headers()
+                    .get(header::VARY)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Accept-Language, Cookie")
+            );
+        }
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5573,6 +5666,55 @@ async fn api_recent_incremental_paginates_over_120_pages_and_binds_cursor() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn api_recent_incremental_continues_after_a_long_nested_path() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let directory = "section".repeat(16) + "/";
+    let long_path = format!("docs/{}first.md", directory.repeat(20));
+    assert!(long_path.len() > 2048);
+    // Seed via the writer so the cursor regression does not depend on the
+    // host filesystem supporting this total path length.
+    for path in [long_path.as_str(), "other.md"] {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, path, "Page", "Body"))
+            .await
+            .unwrap();
+    }
+
+    let app = api_router(store.reader.clone(), wiki);
+    let base = "/workspaces/default/projects/scratch/recent";
+    let (status, body) = get_body(
+        &app,
+        &format!("{base}?updated_since=2000-01-01T00:00:00Z&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first: Value = serde_json::from_str(&body).unwrap();
+    let pages = first["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["path"], long_path);
+    let cursor = first["next_cursor"].as_str().unwrap();
+
+    let (status, body) = get_body(&app, &format!("{base}?cursor={cursor}&limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let last: Value = serde_json::from_str(&body).unwrap();
+    let pages = last["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["path"], "other.md");
+    assert_eq!(last["next_cursor"], Value::Null);
 }
 
 #[tokio::test]
@@ -6690,7 +6832,7 @@ async fn page_outline_links_to_the_ids_on_the_headings() {
         html.matches(r#"lg:hidden">"#).count(),
         "{html}"
     );
-    assert!(html.contains(r#"lg:block text-xs"#) && html.contains(">On this page</h2>"));
+    assert!(html.contains(r#"hidden lg:block""#) && html.contains(">On this page</h2>"));
     for id in ["intro", "intro-1", "intro-2"] {
         assert!(html.contains(&format!(r#" id="{id}">"#)), "{id}: {html}");
         // Anchored on the page URL, since `#id` alone resolves against <base>.
@@ -7199,4 +7341,128 @@ async fn search_alias_links_require_a_grant_and_refuse_ambiguous_names() {
     .await;
     assert_eq!(status, StatusCode::OK, "{html}");
     assert!(html.contains("notes/alias.md"), "{html}");
+}
+
+/// A `/web` page is rendered per request: the session cookie, the viewer's
+/// grants, the project's access mode and the memory itself decide what it
+/// shows. Every page therefore refuses browser caching, the same promise
+/// `/api/v1` makes. Static assets are the deliberate exception.
+#[tokio::test]
+async fn web_pages_refuse_browser_caching() {
+    use ai_memory_web::{WebMountSpec, split_web_routers};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "concepts/retrieval.md",
+        "# Retrieval\n\nA stored page.",
+    ))
+    .await
+    .unwrap();
+    let split = split_web_routers(
+        true,
+        store.reader.clone(),
+        wiki,
+        WebMountSpec {
+            enable_api: false,
+            web_ui_dir: None,
+            cors_origins: &[],
+            web_slug: "",
+            base_href: "/",
+            base_path: "",
+            trusted_proxy_identity: false,
+            recall: ai_memory_web::Recall::default(),
+            runtime: None,
+            health: None,
+        },
+    )
+    .unwrap();
+    let app = split.protected.merge(split.public);
+
+    for uri in [
+        "/",
+        "/w/default/scratch",
+        "/w/default/scratch/p/concepts/retrieval.md",
+        "/w/default/scratch/h/concepts/retrieval.md",
+        "/search?q=retrieval",
+        "/inbox",
+        "/graph",
+        "/w/default/scratch/graph",
+        // The not-found page renders the same chrome, so it carries the same
+        // header.
+        "/w/default/scratch/p/no/such/page.md",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let expected_status = if uri.ends_with("/p/no/such/page.md") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(resp.status(), expected_status, "{uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "{uri}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|value| value.to_str().ok()),
+            Some("Accept-Language, Cookie"),
+            "{uri}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "{uri} must refuse browser caching (status {})",
+            resp.status()
+        );
+    }
+
+    // Control: an asset carries no identity, so it keeps its own caching and
+    // must not be dragged under the page rule.
+    let asset = app
+        .oneshot(
+            Request::builder()
+                .uri("/static/tailwind.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(
+        asset
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        None,
+        "a static asset keeps its own caching"
+    );
 }

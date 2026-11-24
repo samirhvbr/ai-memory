@@ -41,6 +41,7 @@ fn backdated(started_at_us: i64, actor_user: Option<String>) -> NewSession {
         agent_kind: AgentKind::Codex,
         cwd: Some("/repo".into()),
         actor_user,
+        origin: None,
     }
 }
 
@@ -96,6 +97,7 @@ fn observation(
         importance: 5,
         occurred_at: Some(at_us),
         file_path: None,
+        trust_class: None,
     }
 }
 
@@ -171,6 +173,7 @@ async fn session_page(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -202,6 +205,7 @@ async fn session_page_body(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()

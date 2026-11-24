@@ -21,7 +21,7 @@ use crate::localization::diagnostic;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
-    HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+    HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR, WORKBUDDY_SKILL_DIR,
 };
 use ai_memory_core::{MARKER_END, find_managed_block};
 use anyhow::{Context, Result};
@@ -271,16 +271,17 @@ fn build_plan(
                 install_hooks::grok_hooks_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
-            // Devin's default hooks.v1.json is flat: the file itself is the
-            // event map. Its config.json alternative stores the same entries
-            // under the usual hooks key.
-            (
-                install_hooks::devin_hooks_path()?,
-                HookConfigShape::FlatHookFile,
-            ),
+            // Devin's user-level hooks live in `<devin_user_config_dir>/config.json`
+            // under the `"hooks"` key; a standalone `hooks.v1.json` is flat (the
+            // file itself is the event map). Legacy `~/.devin/{hooks.v1.json,config.json}`
+            // are swept below so pre-#2379 installs are removed too.
             (
                 install_hooks::devin_config_path()?,
                 HookConfigShape::NestedHooksKey,
+            ),
+            (
+                install_hooks::devin_hooks_path()?,
+                HookConfigShape::FlatHookFile,
             ),
             // Droid's hooks.json is the event map itself, like Devin's
             // hooks.v1.json.
@@ -299,6 +300,10 @@ fn build_plan(
                 HookConfigShape::NestedHooksKey,
             ),
             (
+                install_hooks::workbuddy_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
                 install_hooks::ibm_bob_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
@@ -311,6 +316,28 @@ fn build_plan(
                 HookConfigShape::NestedHooksKey,
             ),
         ]);
+        if let Some(home) = home.as_deref() {
+            // Sweep legacy `~/.devin/{hooks.v1.json,config.json}` written by
+            // versions before #2379 moved user-level Devin config to
+            // `~/.config/devin/` (`%APPDATA%\devin\` on Windows).
+            for (legacy_path, shape) in [
+                (
+                    home.join(".devin").join("hooks.v1.json"),
+                    HookConfigShape::FlatHookFile,
+                ),
+                (
+                    home.join(".devin").join("config.json"),
+                    HookConfigShape::NestedHooksKey,
+                ),
+            ] {
+                if !hook_files
+                    .iter()
+                    .any(|(existing, _)| existing == &legacy_path)
+                {
+                    hook_files.push((legacy_path, shape));
+                }
+            }
+        }
         for (path, shape) in hook_files {
             if !path.exists() {
                 continue;
@@ -509,6 +536,7 @@ fn build_plan(
             IbmBob,
             QwenCode,
             Qoder,
+            WorkBuddy,
             CopilotCli,
             Droid,
             Swival,
@@ -537,6 +565,21 @@ fn build_plan(
                 omp_dirs.iter().map(|dir| dir.join("mcp.json")).collect()
             } else if matches!(client, Muse) {
                 vec![install_hooks::muse_settings_path(env)?]
+            } else if matches!(client, Devin) {
+                // Sweep `<devin_user_config_dir>/mcp_config.json` plus legacy
+                // `~/.devin/config.json` from pre-#2379 installs.
+                let mut paths = Vec::with_capacity(2);
+                if let Ok(path) = install_mcp::mcp_config_path_with(Devin, &|name| env.var_os(name))
+                {
+                    paths.push(path);
+                }
+                if let Some(home) = home.as_deref() {
+                    let legacy = home.join(".devin").join("config.json");
+                    if !paths.contains(&legacy) {
+                        paths.push(legacy);
+                    }
+                }
+                paths
             } else {
                 let Ok(path) = install_mcp::mcp_config_path_with(client, &|name| env.var_os(name))
                 else {
@@ -660,16 +703,22 @@ pub(super) fn skill_roots(
     claude_config_dir: Option<&Path>,
     hermes_home: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(16);
+    let mut roots = Vec::with_capacity(18);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(WORKBUDDY_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
+        push_unique_skill_root(
+            &mut roots,
+            home.join(".config").join("devin").join(SKILLS_DIR),
+        );
+        // Also sweep legacy `~/.devin/skills` from pre-#2379 installs.
         push_unique_skill_root(&mut roots, home.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
         let grok_root = grok_home
             .map(Path::to_path_buf)
@@ -680,6 +729,7 @@ pub(super) fn skill_roots(
             .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
         push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
+        push_unique_skill_root(&mut roots, home.join(WORKBUDDY_SKILL_DIR).join(SKILLS_DIR));
         for root in super::install_skills::antigravity_global_skill_roots(home) {
             push_unique_skill_root(&mut roots, root);
         }
@@ -868,6 +918,16 @@ fn remove_dir_if_empty(i18n: &ai_memory_core::i18n::Localizer, path: &Path) -> R
     Ok(())
 }
 
+/// Whether this uninstall may remove the credentials the installed hooks
+/// authenticate with.
+///
+/// `--only mcp`, `--only skills` and `--only instructions` leave the hook
+/// bundles in place, so their tokens have to survive the run; only a full
+/// uninstall, or one that removes the hooks themselves, may clear them.
+fn clears_hook_credentials(only: Option<crate::cli::UninstallOnly>) -> bool {
+    only.is_none() || only == Some(crate::cli::UninstallOnly::Hooks)
+}
+
 /// Run the `uninstall` subcommand.
 ///
 /// # Errors
@@ -910,6 +970,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     }
     let remove_service = matches!(&service, Some((_, user_service::Removal::Removed(_))));
     let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
+    let clears_credentials = clears_hook_credentials(args.only);
     if hooks_removed {
         // Only the current checkout's project file is reachable from here.
         println!(
@@ -991,7 +1052,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     // otherwise succeeded.
     let bridge_keeps_key = args.only == Some(crate::cli::UninstallOnly::Hooks)
         && install_mcp::bridge_entry_remains(name.as_deref().unwrap_or("ai-memory"));
-    if hooks_removed
+    if clears_credentials
         && !bridge_keeps_key
         && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir)
     {
@@ -1007,11 +1068,28 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
-    // reasoning applies; the registry of URLs stays. The root bearer the
-    // server itself reads (`[auth].bearer_token_file`) is not a hook's and
-    // stays with the server's config.
-    if let Err(error) =
-        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+    // reasoning applies: `--only mcp` and `--only skills` leave the hooks
+    // installed, and clearing these would leave them unable to authenticate.
+    // The registry of URLs stays. The root bearer the server itself reads
+    // (`[auth].bearer_token_file`) is not a hook's and stays with the server's
+    // config.
+    // An environment override skips resolving that file during config load,
+    // but the next server start without the override still needs it.
+    let root_token_file = config
+        .auth
+        .token_file_path()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            config
+                .auth
+                .bearer_token_file
+                .as_ref()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| config.data_dir.join(path))
+        });
+    if clears_credentials
+        && let Err(error) =
+            crate::server_profiles::clear_tokens(&config.data_dir, root_token_file.as_deref())
     {
         eprintln!(
             "{}",
@@ -1811,6 +1889,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::GeminiCli
         | McpClient::QwenCode
         | McpClient::Qoder
+        | McpClient::WorkBuddy
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode
@@ -2089,6 +2168,27 @@ mod tests {
     #[cfg(unix)]
     use std::time::Duration;
 
+    /// A partial uninstall keeps the hook bundles, so it must keep the
+    /// credentials they read. The server-profile token sweep once ran
+    /// unconditionally, which left `--only mcp` and `--only skills` installs
+    /// with hooks that could no longer authenticate.
+    #[test]
+    fn only_a_full_or_hooks_only_uninstall_clears_hook_credentials() {
+        use crate::cli::UninstallOnly;
+        assert!(clears_hook_credentials(None));
+        assert!(clears_hook_credentials(Some(UninstallOnly::Hooks)));
+        for kept in [
+            UninstallOnly::Mcp,
+            UninstallOnly::Skills,
+            UninstallOnly::Instructions,
+        ] {
+            assert!(
+                !clears_hook_credentials(Some(kept)),
+                "{kept:?} leaves the hooks installed and their tokens in place"
+            );
+        }
+    }
+
     /// Answers `systemctl`/`launchctl` from a script and records each call.
     struct ServiceRunner {
         calls: std::cell::RefCell<Vec<String>>,
@@ -2358,6 +2458,58 @@ mod tests {
         );
     }
 
+    /// `install-mcp --client workbuddy` writes `~/.workbuddy/mcp.json`; that
+    /// file is only visited when `WorkBuddy` is in the MCP client loop.
+    #[test]
+    fn mcp_plan_strips_workbuddy_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let mcp_path = home.path().join(".workbuddy").join("mcp.json");
+        std::fs::create_dir_all(mcp_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mcp_path,
+            r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"url":"http://x"}}}"#,
+        )
+        .unwrap();
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "HOME",
+            home.path().to_str().unwrap(),
+        )]);
+        let args = UninstallArgs {
+            apply: false,
+            purge_data: false,
+            only: Some(crate::cli::UninstallOnly::Mcp),
+            mcp_name: None,
+            mcp_url: crate::config::DEFAULT_MCP_URL.to_string(),
+            yes: false,
+            profile: None,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let plan = build_plan(
+            &ai_memory_core::i18n::Localizer::default(),
+            &args,
+            data.path(),
+            &env,
+        )
+        .unwrap();
+        assert!(
+            plan.iter().any(|change| matches!(
+                change,
+                PlannedChange::Rewrite { path, removed, .. }
+                    if *path == mcp_path && removed.iter().any(|name| name == "ai-memory")
+            )),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|change| match change {
+                PlannedChange::Rewrite { path, removed, .. } if *path == mcp_path => {
+                    !removed.iter().any(|name| name == "other")
+                }
+                _ => true,
+            }),
+            "{plan:?}"
+        );
+    }
+
     /// Each installed plugin is removed through its own harness CLI, and one
     /// failure does not stop the next.
     #[test]
@@ -2407,11 +2559,16 @@ mod tests {
         );
 
         let without = skill_roots(cwd, Some(home), None, None, None, None, None);
+        assert!(
+            without.contains(&home.join(".config").join("devin").join(SKILLS_DIR)),
+            "{without:?}"
+        );
         assert_eq!(
             without.len(),
-            14,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot/hermes × \
-             project+global, plus Antigravity's two global roots)"
+            17,
+            "no phantom root when APPDATA is unset \
+             (claude/agents/devin/grok/copilot/hermes/workbuddy × \
+             project+global, legacy ~/.devin/skills, plus Antigravity's two global roots)"
         );
         assert!(
             without.contains(&cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR)),
@@ -2621,6 +2778,29 @@ mod tests {
             .filter(|root| *root == Path::new("/home/alice/.hermes/skills"))
             .count();
         assert_eq!(home_hermes_count, 1);
+    }
+
+    /// `install-skills --agent workbuddy` writes `.workbuddy/skills` in the
+    /// project and `~/.workbuddy/skills` globally; uninstall must sweep both.
+    #[test]
+    fn skill_roots_sweep_workbuddy_project_and_home_roots() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/repo/.workbuddy/skills")),
+            "{roots:?}"
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/home/alice/.workbuddy/skills")),
+            "{roots:?}"
+        );
     }
 
     #[test]

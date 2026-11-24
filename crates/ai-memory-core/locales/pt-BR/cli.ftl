@@ -356,6 +356,7 @@ cli-doctor-codex-skips-of-the-plugin-s-hooks-untrusted-or-modified-open-codex-ru
 cli-doctor-the-server-at-did-not-answer-hook-events-are-being-spooled-locally = ⚠ O servidor em { $value0 } não respondeu. Os eventos dos hooks estão sendo armazenados localmente no spool.{ "\u000A" }
 cli-doctor-the-hook-spool-is-full-events-oldest-newly-captured-events-are-dropped-until = ⚠ O spool de hooks está cheio ({ $value0 } eventos, mais antigo { $value1 }): novos eventos capturados são descartados até que haja espaço.{ "\u000A" }
 cli-doctor-hook-spool-event-s-waiting-for-the-server-oldest = { "  " }spool de hooks: { $value0 } evento(s) aguardando o servidor (mais antigo { $value1 }).{ "\u000A" }
+cli-doctor-shared-data-dir = ⚠ { $path } é gravável por outras contas (modo { $mode }): outra conta local pode substituir o spool de hooks sob ele e ler o token que as entradas carregam.{ "\u000A" }
 cli-doctor-codex-skips-ai-memory-hook-s-codex-runs-a-hook-only-after-you-trust-it-and-a = ⚠ O Codex ignora { $value0 } hook(s) ai-memory: { $value1 }. O Codex executa hooks apenas após a confirmação de confiança, exigida novamente quando o comando muda. Abra o Codex, execute /hooks e marque-os como confiáveis; até lá, as sessões do Codex não serão capturadas.{ "\u000A" }
 cli-doctor-project-coordinate-requested-current = { "  " }coordenada do projeto: { $value0 } (solicitada { $value1 }, atual { $value2 })
 cli-doctor-collision-reason = { "    " }colisão: { $value0 }
@@ -376,6 +377,7 @@ cli-grant-who-previous-on-project = { $value0 }: { $value1 } -> { $value2 } em {
 cli-grant-who-now-holds-on-project = { $value0 } agora tem { $value1 } em { $value2 }.
 cli-grant-no-longer-holds-anything-on-project = { $value0 } não tem mais permissões em { $value1 }.
 cli-grant-held-nothing-on-project-nothing-changed = { $value0 } não tinha permissões em { $value1 }; nada alterado.
+cli-grant-every-project-of-workspace = todos os projetos de { $value0 }
 cli-install-instructions-would-write-into = # Gravaria em: { $value0 }{ "\u000A" }
 cli-install-instructions-getting-cwd-for-install-instructions-target = obtendo CWD para o destino de install-instructions
 cli-install-instructions-note-neither-claude-md-nor-agents-md-exists-in-creating-claude-md-if-you-use = nota: nem CLAUDE.md nem AGENTS.md existem em { $value0 }; criando CLAUDE.md. Se você usa Codex / OpenCode / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Kiro CLI, execute novamente com `--target AGENTS.md`.

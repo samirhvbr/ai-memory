@@ -33,6 +33,7 @@ fn hook_session(id: SessionId, ws: WorkspaceId, proj: ProjectId) -> NewSession {
         agent_kind: AgentKind::Codex,
         cwd: Some("/repo/app".into()),
         actor_user: None,
+        origin: None,
     }
 }
 
@@ -49,6 +50,7 @@ fn observation(session: &NewSession, kind: ObservationKind, body: &str) -> NewOb
         body: body.into(),
         importance: 5,
         file_path: None,
+        trust_class: None,
     }
 }
 
@@ -342,6 +344,7 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str, entities: &[&s
         expires_at: None,
         entities: entities.iter().map(|name| (*name).to_owned()).collect(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 

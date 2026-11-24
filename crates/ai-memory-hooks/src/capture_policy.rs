@@ -354,6 +354,7 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::CopilotCli
         | AgentKind::Muse
         | AgentKind::CodeBuddy
+        | AgentKind::WorkBuddy
         | AgentKind::IbmBob
         | AgentKind::Dsh
         | AgentKind::QwenCode
@@ -460,6 +461,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Droid
                             | AgentKind::Muse
                             | AgentKind::CodeBuddy
+                            | AgentKind::WorkBuddy
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
                             | AgentKind::GeminiCli
@@ -1410,6 +1412,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // (#1299), so `[capture] ignore_paths` classifies them as Claude's.
         | AgentKind::Muse
         | AgentKind::CodeBuddy
+        // WorkBuddy takes CodeBuddy's Claude Code-shaped tool contract.
+        | AgentKind::WorkBuddy
         | AgentKind::IbmBob
         // DSH's Claude Code hooks bridge forwards the same `tool_name` /
         // `tool_input` pair, so its file and shell calls read the ignore
@@ -2749,10 +2753,11 @@ fn command_base(workdir: Option<&str>, cwd: &str) -> String {
 }
 
 /// The single-path fields of the file and search/list tool schemas.
-const DIRECT_PATH_KEYS: [&str; 7] = [
+const DIRECT_PATH_KEYS: [&str; 8] = [
     "file_path",
     "filePath",
     "path",
+    "Path",
     "absolute_path",
     "AbsolutePath",
     "notebook_path",
@@ -5323,6 +5328,7 @@ mod tests {
             AgentKind::Droid,
             AgentKind::Muse,
             AgentKind::CodeBuddy,
+            AgentKind::WorkBuddy,
             AgentKind::QwenCode,
             AgentKind::Qoder,
             AgentKind::KimiCode,
@@ -5524,6 +5530,71 @@ mod tests {
             );
             assert_eq!(
                 disposition(AgentKind::CodeBuddy, &call(name, control)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: control"
+            );
+        }
+    }
+
+    /// WorkBuddy takes CodeBuddy's Claude Code-shaped payload, so an ignored
+    /// path in a `Read`, `Write`, `Edit` or `Bash` call drops. Under
+    /// `AgentKind::Other` the same calls are not recognized and keep, so the
+    /// test fails if the WorkBuddy `extract` arm is removed.
+    #[test]
+    fn workbuddy_tool_calls_honor_capture_exclusions() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let call = |name: &str, input: Value| {
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "workbuddy-session",
+                "cwd": "/repo",
+                "tool_name": name,
+                "tool_input": input,
+                "tool_use_id": "toolu_1",
+            })
+        };
+        let disposition =
+            |agent: AgentKind, raw: &Value| policy.inspect(agent, raw, "/repo").protocol().clone();
+        for (name, input, control) in [
+            (
+                "Read",
+                json!({"file_path": "secret/a"}),
+                json!({"file_path": "src/lib.rs"}),
+            ),
+            (
+                "Write",
+                json!({"file_path": "/repo/secret/a", "content": "x"}),
+                json!({"file_path": "/repo/src/lib.rs", "content": "x"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path": "secret/a", "old_string": "a", "new_string": "b"}),
+                json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            (
+                "Bash",
+                json!({"command": "cat secret/a"}),
+                json!({"command": "cat src/lib.rs"}),
+            ),
+        ] {
+            assert_eq!(
+                disposition(AgentKind::WorkBuddy, &call(name, input.clone())).disposition(),
+                CaptureDisposition::Drop,
+                "{name}"
+            );
+            assert_eq!(
+                disposition(AgentKind::Other, &call(name, input)).disposition(),
+                CaptureDisposition::Keep,
+                "{name}: without the WorkBuddy mapping the call is not recognized"
+            );
+            assert_eq!(
+                disposition(AgentKind::WorkBuddy, &call(name, control)).disposition(),
                 CaptureDisposition::Keep,
                 "{name}: control"
             );
@@ -7063,6 +7134,58 @@ mod tests {
             json!({"toolCall": {"name": "view_file", "args": {"TargetFile": "src/main.rs"}}});
         let decision = policy.inspect(AgentKind::AntigravityCli, &kept, "/repo");
         assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+
+        // Antigravity CLI 1.5.x file tools pass the file path in `args.Path`.
+        for tool in ["read_file", "write_file", "edit_file"] {
+            let ignored = json!({
+                "toolCall": {
+                    "name": tool,
+                    "args": {"Path": "secret/keys.txt"}
+                }
+            });
+            let decision = policy.inspect(AgentKind::AntigravityCli, &ignored, "/repo");
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+            assert_eq!(
+                decision.protocol().extraction_state(),
+                ExtractionState::Extracted
+            );
+            assert_eq!(decision.protocol().path_count(), 1);
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "tool: {tool}"
+            );
+
+            let kept = json!({
+                "toolCall": {
+                    "name": tool,
+                    "args": {"Path": "src/main.rs"}
+                }
+            });
+            let decision = policy.inspect(AgentKind::AntigravityCli, &kept, "/repo");
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+            assert_eq!(
+                decision.protocol().extraction_state(),
+                ExtractionState::Extracted
+            );
+            assert_eq!(decision.protocol().path_count(), 1);
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Keep,
+                "tool: {tool}"
+            );
+        }
+
+        // Security invariant: call_mcp_tool must still fail closed to Unknown.
+        let mcp = json!({
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {"ServerName": "ai-memory", "ToolName": "memory_query"}
+            }
+        });
+        let decision = policy.inspect(AgentKind::AntigravityCli, &mcp, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
         assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
     }
     #[test]

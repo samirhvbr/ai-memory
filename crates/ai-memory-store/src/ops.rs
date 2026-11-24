@@ -9,8 +9,8 @@ use std::collections::{BTreeSet, HashSet};
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
     MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage, NewSession, NewSessionUsage,
-    ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageId, PagePath, ProjectId,
-    SessionId, WorkspaceId,
+    ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageEvidenceKind, PageId, PagePath,
+    ProjectId, SessionId, SourceObservations, TrustClass, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -1480,6 +1480,46 @@ struct ExistingPageVersion {
     title: String,
     tier: String,
     pinned: i64,
+    trust_class: TrustClass,
+}
+
+/// Convert the SQL rank (`0 = tool_result`, `1 = model_generated`,
+/// `2 = operator_authored`) back to [`TrustClass`].
+pub(crate) const fn trust_class_from_rank(rank: i64) -> TrustClass {
+    match rank {
+        0 => TrustClass::ToolResult,
+        1 => TrustClass::ModelGenerated,
+        _ => TrustClass::OperatorAuthored,
+    }
+}
+
+/// Parse a stored `trust_class` column string, defaulting to
+/// [`TrustClass::ModelGenerated`] only if unrecognized (CHECK constraint
+/// prevents unknown values in migrated databases).
+pub(crate) fn parse_trust_class_str(raw: &str) -> TrustClass {
+    raw.parse::<TrustClass>()
+        .unwrap_or(TrustClass::ModelGenerated)
+}
+
+#[cfg(test)]
+fn has_trust_class_column(conn: &Connection, table: &str) -> bool {
+    let sql = match table {
+        "pages" => "SELECT 1 FROM pragma_table_info('pages') WHERE name = 'trust_class' LIMIT 1",
+        "observations" => {
+            "SELECT 1 FROM pragma_table_info('observations') WHERE name = 'trust_class' LIMIT 1"
+        }
+        _ => return false,
+    };
+    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+#[cfg(not(test))]
+const fn has_trust_class_column(_conn: &Connection, _table: &str) -> bool {
+    true
 }
 
 /// Normalise a page path into FTS-friendly search text, indexing BOTH forms
@@ -1729,6 +1769,53 @@ pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBack
 /// the whole indexed prefix, so the pass slowed down as it went: quadratic in
 /// the row count, hours of startup on a store with 1.6 million observations
 /// (#1652).
+fn has_backfill_watermarks_table(conn: &Connection) -> StoreResult<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backfill_watermarks')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+fn load_backfill_watermark(conn: &Connection, name: &str) -> StoreResult<Option<i64>> {
+    if !has_backfill_watermarks_table(conn)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT max_rowid FROM backfill_watermarks WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn save_backfill_watermark_if_advanced(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    prev: Option<i64>,
+) -> StoreResult<()> {
+    if !has_backfill_watermarks_table(conn)? {
+        return Ok(());
+    }
+    let max_rowid: Option<i64> =
+        conn.query_row(&format!("SELECT MAX(rowid) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+    if let Some(max_r) = max_rowid
+        && prev.is_none_or(|p| max_r > p)
+    {
+        conn.execute(
+            "INSERT INTO backfill_watermarks (name, max_rowid) VALUES (?1, ?2) \
+             ON CONFLICT (name) DO UPDATE SET max_rowid = excluded.max_rowid",
+            params![name, max_r],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn backfill_cjk_indexes_in_batches(
     conn: &mut Connection,
     batch: i64,
@@ -1738,8 +1825,14 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
     let batch = batch.max(1);
     let mut summary = CjkBackfillSummary::default();
 
-    let mut from = i64::MIN;
-    loop {
+    let pages_watermark = load_backfill_watermark(conn, "cjk_pages")?;
+    let mut from = match pages_watermark {
+        Some(w) if w == i64::MAX => i64::MAX,
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
+    let mut pages_done = pages_watermark == Some(i64::MAX);
+    while !pages_done {
         let tx = conn.transaction()?;
         let rows: Vec<PageRow> = {
             let mut stmt = tx.prepare(
@@ -1755,19 +1848,31 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
         };
         if rows.is_empty() {
             tx.commit()?;
-            break;
+            pages_done = true;
+            continue;
         }
         for (rowid, title, body, path_search) in &rows {
             index_page_cjk(&tx, *rowid, title, body, path_search)?;
-            from = rowid.saturating_add(1);
+            if *rowid == i64::MAX {
+                pages_done = true;
+            } else {
+                from = rowid + 1;
+            }
         }
         summary.pages += rows.len() as u64;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
+    save_backfill_watermark_if_advanced(conn, "pages", "cjk_pages", pages_watermark)?;
 
-    from = i64::MIN;
-    loop {
+    let obs_watermark = load_backfill_watermark(conn, "cjk_observations")?;
+    from = match obs_watermark {
+        Some(w) if w == i64::MAX => i64::MAX,
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
+    let mut obs_done = obs_watermark == Some(i64::MAX);
+    while !obs_done {
         let tx = conn.transaction()?;
         let rows: Vec<ObservationRow> = {
             let mut stmt = tx.prepare(
@@ -1783,16 +1888,22 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
         };
         if rows.is_empty() {
             tx.commit()?;
-            break;
+            obs_done = true;
+            continue;
         }
         for (rowid, title, body) in &rows {
             index_observation_cjk(&tx, *rowid, title, body)?;
-            from = rowid.saturating_add(1);
+            if *rowid == i64::MAX {
+                obs_done = true;
+            } else {
+                from = rowid + 1;
+            }
         }
         summary.observations += rows.len() as u64;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
+    save_backfill_watermark_if_advanced(conn, "observations", "cjk_observations", obs_watermark)?;
     Ok(summary)
 }
 
@@ -1881,6 +1992,12 @@ pub struct EntityBackfillSummary {
 /// `ON CONFLICT DO NOTHING`). Superseded versions are left untouched.
 pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfillSummary> {
     type CandidateRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, i64);
+    let watermark = load_backfill_watermark(conn, "entity_pages")?;
+    let from = match watermark {
+        Some(w) if w == i64::MAX => return Ok(EntityBackfillSummary::default()),
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
     let tx = conn.transaction()?;
     let mut summary = EntityBackfillSummary::default();
     {
@@ -1888,12 +2005,13 @@ pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfil
             let mut stmt = tx.prepare(
                 "SELECT p.id, p.workspace_id, p.project_id, p.frontmatter_json, p.created_at \
                  FROM pages p \
-                 WHERE p.is_latest = 1 \
+                 WHERE p.rowid >= ?1 \
+                   AND p.is_latest = 1 \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM entity_page_links l WHERE l.page_id = p.id \
                    )",
             )?;
-            stmt.query_map([], |row| {
+            stmt.query_map(params![from], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -1937,6 +2055,7 @@ pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfil
         }
     }
     tx.commit()?;
+    save_backfill_watermark_if_advanced(conn, "pages", "entity_pages", watermark)?;
     Ok(summary)
 }
 
@@ -1990,14 +2109,22 @@ pub fn backfill_page_windows_in_batches(
     let batch = batch.max(1);
     let mut summary = PageWindowBackfillSummary::default();
 
+    let watermark = load_backfill_watermark(conn, "page_windows")?;
+    let from = match watermark {
+        Some(w) if w == i64::MAX => return Ok(summary),
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
+
     // Cheap up-front cursor size. On an already-migrated store this is 0 and
     // the loop below exits on its first empty batch without any write.
     let remaining: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pages WHERE valid_from IS NULL",
-        [],
+        "SELECT COUNT(*) FROM pages WHERE rowid >= ?1 AND valid_from IS NULL",
+        params![from],
         |row| row.get(0),
     )?;
     if remaining == 0 {
+        save_backfill_watermark_if_advanced(conn, "pages", "page_windows", watermark)?;
         return Ok(summary);
     }
     tracing::info!(
@@ -2104,8 +2231,32 @@ pub(crate) fn upsert_page_in_tx(
         .and_then(serde_json::Value::as_bool)
         .and_then(|flag| flag.then_some(now));
 
-    let existing: Option<ExistingPageVersion> = tx
-        .query_row(
+    let has_trust_class = has_trust_class_column(tx, "pages");
+    let existing: Option<ExistingPageVersion> = if has_trust_class {
+        tx.query_row(
+            "SELECT id, body_sha256, frontmatter_json, title, tier, pinned, trust_class FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| {
+                let trust_str: String = row.get(6)?;
+                Ok(ExistingPageVersion {
+                    id: row.get(0)?,
+                    body_sha256: row.get(1)?,
+                    frontmatter_json: row.get(2)?,
+                    title: row.get(3)?,
+                    tier: row.get(4)?,
+                    pinned: row.get(5)?,
+                    trust_class: parse_trust_class_str(&trust_str),
+                })
+            },
+        )
+        .optional()?
+    } else {
+        tx.query_row(
             "SELECT id, body_sha256, frontmatter_json, title, tier, pinned FROM pages \
              WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
             params![
@@ -2121,10 +2272,12 @@ pub(crate) fn upsert_page_in_tx(
                     title: row.get(3)?,
                     tier: row.get(4)?,
                     pinned: row.get(5)?,
+                    trust_class: TrustClass::ModelGenerated,
                 })
             },
         )
-        .optional()?;
+        .optional()?
+    };
 
     if let Some(existing) = existing {
         let existing_fm: serde_json::Value =
@@ -2141,11 +2294,27 @@ pub(crate) fn upsert_page_in_tx(
             // reconsolidation from a different session still cites the
             // page it reaffirmed (P2, docs/design-hindsight-borrowings.md
             // §3) — record the evidence against the still-current id.
-            insert_evidence_in_tx(tx, &unchanged_id, &page.evidence, now)?;
+            insert_evidence_in_tx(tx, &unchanged_id, page, now)?;
+            if has_trust_class
+                && let Some(sources_trust) = page_sources_trust_class_in_tx(tx, &unchanged_id)?
+            {
+                let folded = TrustClass::least_trusted(existing.trust_class, sources_trust);
+                if folded != existing.trust_class {
+                    tx.execute(
+                        "UPDATE pages SET trust_class = ?1 WHERE id = ?2",
+                        params![folded.as_str(), unchanged_id.as_bytes()],
+                    )?;
+                }
+            }
             return Ok(unchanged_id);
         }
         let frontmatter_str = stamped_frontmatter(conformed, now)?;
         let new_id = PageId::new();
+        // Citationless rewrites (`page.trust_class == None` and no
+        // `page_sources`) inherit the superseded version's trust class so a
+        // patch or automated rewrite cannot launder `tool_result` into
+        // `operator_authored` (#2164).
+        let initial_trust = page.trust_class.unwrap_or(existing.trust_class);
         // The page-grain ingestion window closes in the same statement,
         // same instant (issue #656, docs/design-page-ingestion-windows.md).
         tx.execute(
@@ -2159,31 +2328,60 @@ pub(crate) fn upsert_page_in_tx(
              WHERE page_id = ?1 AND superseded_at IS NULL",
             params![&existing.id, now],
         )?;
-        tx.execute(
-            "INSERT INTO pages \
-             (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-              frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at, valid_from, compacted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
-            params![
-                new_id.as_bytes(),
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
-                page.path.as_str(),
-                path_search,
-                page.title,
-                tier_str,
-                page.body,
-                body_sha256.as_slice(),
-                frontmatter_str,
-                &existing.id,
-                i64::from(page.pinned),
-                page.author_id.map(|id| id.as_bytes().to_vec()),
-                now,
-                page.expires_at.map(|ts| ts.as_microsecond()),
-                compacted_at,
-            ],
-        )?;
+        if has_trust_class {
+            tx.execute(
+                "INSERT INTO pages \
+                 (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+                  frontmatter_json, is_latest, supersedes, pinned, author_id, \
+                  created_at, updated_at, expires_at, valid_from, compacted_at, trust_class) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16, ?17)",
+                params![
+                    new_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                    page.path.as_str(),
+                    path_search,
+                    page.title,
+                    tier_str,
+                    page.body,
+                    body_sha256.as_slice(),
+                    frontmatter_str,
+                    &existing.id,
+                    i64::from(page.pinned),
+                    page.author_id.map(|id| id.as_bytes().to_vec()),
+                    now,
+                    page.expires_at.map(|ts| ts.as_microsecond()),
+                    compacted_at,
+                    initial_trust.as_str(),
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO pages \
+                 (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+                  frontmatter_json, is_latest, supersedes, pinned, author_id, \
+                  created_at, updated_at, expires_at, valid_from, compacted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
+                params![
+                    new_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                    page.path.as_str(),
+                    path_search,
+                    page.title,
+                    tier_str,
+                    page.body,
+                    body_sha256.as_slice(),
+                    frontmatter_str,
+                    &existing.id,
+                    i64::from(page.pinned),
+                    page.author_id.map(|id| id.as_bytes().to_vec()),
+                    now,
+                    page.expires_at.map(|ts| ts.as_microsecond()),
+                    compacted_at,
+                ],
+            )?;
+        }
         index_page_cjk(
             tx,
             tx.last_insert_rowid(),
@@ -2194,7 +2392,20 @@ pub(crate) fn upsert_page_in_tx(
         replace_links_in_tx(tx, &new_id, page)?;
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
-        insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
+        insert_evidence_in_tx(tx, &new_id, page, now)?;
+        if has_trust_class && let Some(sources_trust) = page_sources_trust_class_in_tx(tx, &new_id)?
+        {
+            let final_trust = match page.trust_class {
+                Some(explicit) => TrustClass::least_trusted(sources_trust, explicit),
+                None => sources_trust,
+            };
+            if final_trust != initial_trust {
+                tx.execute(
+                    "UPDATE pages SET trust_class = ?1 WHERE id = ?2",
+                    params![final_trust.as_str(), new_id.as_bytes()],
+                )?;
+            }
+        }
         audit(
             tx,
             "supersede_page",
@@ -2242,6 +2453,23 @@ pub(crate) fn upsert_page_in_tx(
     // inventing a new one. `valid_to` is left as the tombstone wrote it
     // (the instant the page actually went missing), not bumped to `now`.
     let tombstone = most_recent_tombstone_at_path(tx, page)?;
+    let tombstone_trust = if has_trust_class {
+        tombstone
+            .as_ref()
+            .and_then(|tombstone_id| {
+                tx.query_row(
+                    "SELECT trust_class FROM pages WHERE id = ?1",
+                    params![tombstone_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .map(|raw| parse_trust_class_str(&raw))
+    } else {
+        None
+    };
     if let Some(tombstone_id) = &tombstone {
         tx.execute(
             "UPDATE pages SET superseded_at = NULL WHERE id = ?1",
@@ -2250,31 +2478,63 @@ pub(crate) fn upsert_page_in_tx(
     }
     let frontmatter_str = stamped_frontmatter(conformed, now)?;
     let new_id = PageId::new();
-    tx.execute(
-        "INSERT INTO pages \
-         (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, supersedes, pinned, author_id, created_at, updated_at, \
-          expires_at, valid_from, compacted_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
-        params![
-            new_id.as_bytes(),
-            page.workspace_id.as_bytes(),
-            page.project_id.as_bytes(),
-            page.path.as_str(),
-            path_search,
-            page.title,
-            tier_str,
-            page.body,
-            body_sha256.as_slice(),
-            frontmatter_str,
-            tombstone,
-            i64::from(page.pinned),
-            page.author_id.map(|id| id.as_bytes().to_vec()),
-            now,
-            page.expires_at.map(|ts| ts.as_microsecond()),
-            compacted_at,
-        ],
-    )?;
+    let initial_trust = page
+        .trust_class
+        .unwrap_or_else(|| tombstone_trust.unwrap_or(TrustClass::ModelGenerated));
+    if has_trust_class {
+        tx.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, supersedes, pinned, author_id, created_at, updated_at, \
+              expires_at, valid_from, compacted_at, trust_class) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16, ?17)",
+            params![
+                new_id.as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+                path_search,
+                page.title,
+                tier_str,
+                page.body,
+                body_sha256.as_slice(),
+                frontmatter_str,
+                tombstone,
+                i64::from(page.pinned),
+                page.author_id.map(|id| id.as_bytes().to_vec()),
+                now,
+                page.expires_at.map(|ts| ts.as_microsecond()),
+                compacted_at,
+                initial_trust.as_str(),
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, supersedes, pinned, author_id, created_at, updated_at, \
+              expires_at, valid_from, compacted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
+            params![
+                new_id.as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+                path_search,
+                page.title,
+                tier_str,
+                page.body,
+                body_sha256.as_slice(),
+                frontmatter_str,
+                tombstone,
+                i64::from(page.pinned),
+                page.author_id.map(|id| id.as_bytes().to_vec()),
+                now,
+                page.expires_at.map(|ts| ts.as_microsecond()),
+                compacted_at,
+            ],
+        )?;
+    }
     index_page_cjk(
         tx,
         tx.last_insert_rowid(),
@@ -2285,7 +2545,19 @@ pub(crate) fn upsert_page_in_tx(
     replace_links_in_tx(tx, &new_id, page)?;
     attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
-    insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
+    insert_evidence_in_tx(tx, &new_id, page, now)?;
+    if has_trust_class && let Some(sources_trust) = page_sources_trust_class_in_tx(tx, &new_id)? {
+        let final_trust = match page.trust_class {
+            Some(explicit) => TrustClass::least_trusted(sources_trust, explicit),
+            None => sources_trust,
+        };
+        if final_trust != initial_trust {
+            tx.execute(
+                "UPDATE pages SET trust_class = ?1 WHERE id = ?2",
+                params![final_trust.as_str(), new_id.as_bytes()],
+            )?;
+        }
+    }
     audit(
         tx,
         if tombstone.is_some() {
@@ -2457,17 +2729,105 @@ fn replace_links_in_tx(
 fn insert_evidence_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page_id: &PageId,
-    evidence: &[PageEvidence],
+    page: &NewPage,
     now: i64,
 ) -> StoreResult<()> {
-    for e in evidence {
+    for e in &page.evidence {
         tx.execute(
             "INSERT OR IGNORE INTO page_evidence (page_id, source_kind, source_id, created_at) \
              VALUES (?1, ?2, ?3, ?4)",
             params![page_id.as_bytes(), e.kind.as_str(), e.source_id, now],
         )?;
+        insert_page_sources_in_tx(tx, page_id, page, e, now)?;
     }
     Ok(())
+}
+
+/// Record which observations a session citation says the page was compiled
+/// from (`page_sources`, V112, #2164), in the page-upsert transaction.
+///
+/// The rows take the page's own coordinate, and an observation is recorded
+/// only when it belongs to the cited session inside that same workspace and
+/// project. A listed id that is unknown, belongs to another session or sits
+/// in another project is skipped: a write can never make a page name an
+/// observation its project does not hold. `INSERT OR IGNORE` on the
+/// `(page_id, observation_id)` key makes a repeated compile of an unchanged
+/// version add only the sources it had not named yet.
+fn insert_page_sources_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+    page: &NewPage,
+    evidence: &PageEvidence,
+    now: i64,
+) -> StoreResult<()> {
+    if evidence.kind != PageEvidenceKind::Session {
+        return Ok(());
+    }
+    // `source_id` is opaque to `page_evidence`; here it has to be the session
+    // the observations belong to, so anything else records no source.
+    let Ok(session_id) = evidence.source_id.parse::<SessionId>() else {
+        return Ok(());
+    };
+    match &evidence.observations {
+        SourceObservations::Unrecorded => {}
+        SourceObservations::Listed(observation_ids) => {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO page_sources \
+                     (workspace_id, project_id, page_id, observation_id, created_at) \
+                 SELECT o.workspace_id, o.project_id, ?1, o.id, ?2 FROM observations o \
+                 WHERE o.id = ?3 AND o.session_id = ?4 \
+                   AND o.workspace_id = ?5 AND o.project_id = ?6",
+            )?;
+            for observation_id in observation_ids {
+                stmt.execute(params![
+                    page_id.as_bytes(),
+                    now,
+                    observation_id.as_bytes(),
+                    session_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                ])?;
+            }
+        }
+        SourceObservations::WholeSession => {
+            tx.execute(
+                "INSERT OR IGNORE INTO page_sources \
+                     (workspace_id, project_id, page_id, observation_id, created_at) \
+                 SELECT o.workspace_id, o.project_id, ?1, o.id, ?2 FROM observations o \
+                 WHERE o.session_id = ?3 AND o.workspace_id = ?4 AND o.project_id = ?5",
+                params![
+                    page_id.as_bytes(),
+                    now,
+                    session_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Least-trusted `observations.trust_class` among the `page_sources` rows
+/// recorded for `page_id` in this transaction, or `None` when `page_id` has
+/// no `page_sources` rows whose observation is still present (#2164).
+fn page_sources_trust_class_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+) -> StoreResult<Option<TrustClass>> {
+    let rank: Option<i64> = tx.query_row(
+        "SELECT MIN(CASE o.trust_class \
+             WHEN 'tool_result' THEN 0 \
+             WHEN 'model_generated' THEN 1 \
+             ELSE 2 \
+         END) \
+         FROM page_sources ps \
+         JOIN observations o ON o.id = ps.observation_id \
+         WHERE ps.page_id = ?1",
+        params![page_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    Ok(rank.map(trust_class_from_rank))
 }
 
 /// Workspace recorded on a scoped link. A project-only `[[_global:path]]`
@@ -2765,6 +3125,10 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
         .cwd
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    // `begin_session` creates interactive and system sessions (MCP `begin`,
+    // backfill, maintenance), which never carry a launcher origin, so this path
+    // leaves `sessions.origin` at its NULL default (#2180). The hook ingest path
+    // (`admit_hook_session_event`) is the only writer of a non-NULL origin.
     conn.execute(
         "INSERT INTO sessions \
          (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
@@ -3538,6 +3902,7 @@ pub fn admit_hook_session_event(
     owner_filter: &OwnerFilter,
     ingest_key: Option<&str>,
     moved_from_cwd: Option<&str>,
+    display_name: Option<&ai_memory_core::SessionDisplayName>,
 ) -> StoreResult<HookSessionAdmission> {
     if obs.session_id != session.id
         || obs.workspace_id != session.workspace_id
@@ -3558,14 +3923,15 @@ pub fn admit_hook_session_event(
         Option<i64>,
         u64,
         Option<String>,
+        Option<String>,
     );
     let existing: Option<Row> = tx.query_row(
-        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count, cwd FROM sessions WHERE id = ?1",
+        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count, cwd, origin FROM sessions WHERE id = ?1",
         params![session.id.as_bytes()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
     ).optional()?;
     let (owner, ended_at, ended_count, stored_cwd, scope) = match existing {
-        Some((ws, project, agent, owner, ended_at, ended_count, cwd)) => {
+        Some((ws, project, agent, owner, ended_at, ended_count, cwd, stored_origin)) => {
             // Corrupt owners fail closed, including for Any recovery. Owner
             // and agent identify WHO the session belongs to, so a mismatch
             // there is a genuine UUID collision and is terminal. The owner is
@@ -3611,6 +3977,20 @@ pub fn admit_hook_session_event(
                 tx.commit()?;
                 return Ok(HookSessionAdmission::InvalidScopedEnd);
             }
+            // A session row can be created by the handoff-accept path before
+            // this automation-tagged capture event arrives (#2180). Stamp the
+            // origin the first time an automation event meets a row that has
+            // none, so the profile harvester's origin filter is reliable no
+            // matter which path created the row. The `origin IS NULL` guard
+            // bounds this to one effective write per session.
+            if let Some(origin) = session.origin
+                && stored_origin.is_none()
+            {
+                tx.execute(
+                    "UPDATE sessions SET origin = ?2 WHERE id = ?1 AND origin IS NULL",
+                    params![session.id.as_bytes(), origin.as_str()],
+                )?;
+            }
             let scope = if session_end {
                 (
                     WorkspaceId::from_slice(&ws)?,
@@ -3642,8 +4022,8 @@ pub fn admit_hook_session_event(
             // back to it when absent (live capture).
             let started_at = session.occurred_at.unwrap_or(now);
             tx.execute(
-                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref()],
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref(), session.origin.map(|o| o.as_str())],
             )?;
             (
                 session.actor_user.clone(),
@@ -3763,6 +4143,24 @@ pub fn admit_hook_session_event(
                 session.project_id.as_bytes(),
                 target.to_string_lossy(),
                 session.id.as_bytes()
+            ],
+        )?;
+    }
+    if let Some(label) = display_name
+        && matches!(ingest, IngestObservationOutcome::Inserted(_))
+    {
+        // An observation can follow cwd into another project. Only the owning
+        // scope may rename this row, even when a foreign observation is valid.
+        tx.execute(
+            "UPDATE sessions SET display_name = ?1, display_name_updated_ns = ?2 \
+             WHERE id = ?3 AND workspace_id = ?4 AND project_id = ?5 \
+             AND (display_name_updated_ns IS NULL OR display_name_updated_ns < ?2)",
+            params![
+                label.name,
+                label.updated_ns,
+                session.id.as_bytes(),
+                session.workspace_id.as_bytes(),
+                session.project_id.as_bytes()
             ],
         )?;
     }
@@ -4255,26 +4653,51 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
         }
         _ => (None, None),
     };
-    let result = conn.execute(
-        "INSERT INTO observations \
-         (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
-          importance, created_at, file_path) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            id.as_bytes(),
-            obs.session_id.as_bytes(),
-            obs.workspace_id.as_bytes(),
-            obs.project_id.as_bytes(),
-            kind,
-            extension,
-            source_event,
-            obs.title,
-            obs.body,
-            importance,
-            now,
-            obs.file_path,
-        ],
-    );
+    let trust_class = obs.effective_trust_class().as_str();
+    let result = if has_trust_class_column(conn, "observations") {
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
+              importance, created_at, file_path, trust_class) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                id.as_bytes(),
+                obs.session_id.as_bytes(),
+                obs.workspace_id.as_bytes(),
+                obs.project_id.as_bytes(),
+                kind,
+                extension,
+                source_event,
+                obs.title,
+                obs.body,
+                importance,
+                now,
+                obs.file_path,
+                trust_class,
+            ],
+        )
+    } else {
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
+              importance, created_at, file_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id.as_bytes(),
+                obs.session_id.as_bytes(),
+                obs.workspace_id.as_bytes(),
+                obs.project_id.as_bytes(),
+                kind,
+                extension,
+                source_event,
+                obs.title,
+                obs.body,
+                importance,
+                now,
+                obs.file_path,
+            ],
+        )
+    };
     // Historical migration tests stop before V99 and exercise this helper
     // against that frozen schema, as with `finish_cjk_index_write`. A real
     // Store migrates first, so a missing column stays a fatal error in every
@@ -7908,6 +8331,16 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![session_id.to_string()],
     )?;
 
+    // Opt-in retrieval history (#2038) this session recorded. Scoped to this
+    // project because the row is keyed by `(workspace, project, session)` and a
+    // session recorded its retrievals only in the project it queried; the
+    // per-hit rows cascade from the `retrieval_history` delete.
+    tx.execute(
+        "DELETE FROM retrieval_history \
+          WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -8741,6 +9174,12 @@ pub fn move_project_workspace(
         "UPDATE pages SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )? as u64;
+    // `page_sources` repeats its page's coordinate (V112), so it follows the
+    // page; left behind, the old workspace's deletion would cascade it away.
+    tx.execute(
+        "UPDATE page_sources SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )?;
     let sessions_moved = tx.execute(
         "UPDATE sessions SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
@@ -8793,8 +9232,9 @@ pub fn move_project_workspace(
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
     // The remaining tables that carry the workspace beside the project id.
-    // Left behind, an entity or a feedback row stops matching reads keyed on
-    // the new workspace, and a purge tombstone stops matching the moved
+    // Left behind, an entity, feedback, or retrieval-history row stops
+    // matching reads keyed on the new workspace (and would cascade on source
+    // workspace deletion), and a purge tombstone stops matching the moved
     // project's session ids, so a purged session could be recreated.
     for table in [
         "entities",
@@ -8804,6 +9244,7 @@ pub fn move_project_workspace(
         "profile_entry_ledger",
         "profile_harvest_marks",
         "query_page_signals",
+        "retrieval_history",
     ] {
         tx.execute(
             &format!(
@@ -9075,8 +9516,10 @@ pub fn merge_project(
         "auto_improve_scheduler_claims",
         "session_consolidation_jobs",
         "page_feedback",
+        "page_sources",
         "purged_sessions",
         "query_page_signals",
+        "retrieval_history",
     ] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
@@ -9244,7 +9687,29 @@ pub fn merge_project(
                 params![dst, page.path.as_str()],
                 |row| row.get(0),
             )?;
-            let merged_id = upsert_page_in_tx(&tx, merged, now)?;
+            // The merged body carries the source head's text after the
+            // target's, so it must not inherit the target head's trust class
+            // alone: it takes the less trusted of the two heads (#2164).
+            let mut merged = merged.clone();
+            if has_trust_class_column(&tx, "pages") {
+                let rank: Option<i64> = tx.query_row(
+                    "SELECT MIN(CASE trust_class \
+                         WHEN 'tool_result' THEN 0 \
+                         WHEN 'model_generated' THEN 1 \
+                         ELSE 2 \
+                     END) \
+                     FROM pages WHERE id IN (?1, ?2)",
+                    params![
+                        page.source_page_id.as_bytes(),
+                        page.target_page_id.as_ref().map(PageId::as_bytes),
+                    ],
+                    |row| row.get(0),
+                )?;
+                let heads = rank.map(trust_class_from_rank);
+                merged.trust_class =
+                    TrustClass::least_trusted_of(heads.into_iter().chain(merged.trust_class));
+            }
+            let merged_id = upsert_page_in_tx(&tx, &merged, now)?;
             tx.execute(
                 "UPDATE pages SET created_at = ?2 WHERE id = ?1",
                 params![merged_id.as_bytes(), created_at],
@@ -9594,6 +10059,7 @@ pub fn move_session(
     summary.consolidation_jobs = restamp("session_consolidation_jobs", "session_id")?;
     summary.auto_improve_runs = restamp("auto_improve_runs", "session_id")?;
     summary.auto_improve_claims = restamp("auto_improve_scheduler_claims", "session_id")?;
+    restamp("retrieval_history", "session_id")?;
 
     // Profile evidence harvested from this session's prompts, keyed by
     // `session:<id>`. Re-stamped so later convergence attributes the
@@ -9664,6 +10130,23 @@ pub fn move_session(
                 if taken.is_some() || candidate_latest > 1 {
                     return Err(StoreError::PagePathTaken { path: page_path });
                 }
+                // The moved versions' `page_sources` rows repeat the page
+                // coordinate (V112); re-stamp them first, while the pages
+                // can still be found under the scope they are leaving.
+                tx.execute(
+                    &format!(
+                        "UPDATE page_sources SET workspace_id = ?4, project_id = ?5 \
+                         WHERE page_id IN ( \
+                             SELECT id FROM pages WHERE {page_scope_sql} AND path = ?3)"
+                    ),
+                    params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
+                        &to_ws[..],
+                        &to_proj[..],
+                    ],
+                )?;
                 summary.page_versions_moved = tx.execute(
                     &format!(
                         "UPDATE pages SET workspace_id = ?4, project_id = ?5 \
@@ -10157,6 +10640,7 @@ pub(crate) mod tests {
                 agent_kind: kind,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             };
             begin_session(&mut conn, &session).unwrap_or_else(|e| {
                 panic!(
@@ -10456,6 +10940,7 @@ pub(crate) mod tests {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: owner.map(str::to_owned),
+            origin: None,
         }
     }
 
@@ -10472,6 +10957,7 @@ pub(crate) mod tests {
             body: "observation".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         }
     }
 
@@ -10764,6 +11250,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &stray).unwrap();
 
@@ -10872,6 +11359,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -11209,6 +11697,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &collateral_obs).unwrap();
 
@@ -12165,6 +12654,7 @@ pub(crate) mod tests {
                     &owner,
                     None,
                     None,
+                    None,
                 )
                 .unwrap(),
             )
@@ -12977,6 +13467,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -13188,6 +13679,7 @@ pub(crate) mod tests {
                 &OwnerFilter::Any,
                 None,
                 None,
+                None,
             )
         };
         let (_tmp, mut conn, ws, proj) = fresh_db();
@@ -13296,6 +13788,7 @@ pub(crate) mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -13816,6 +14309,52 @@ pub(crate) mod tests {
             large < small * 3,
             "doubling the rows must not triple the work: {small} steps for 100, {large} for 200"
         );
+    }
+
+    #[test]
+    fn cjk_and_entity_backfill_watermarks_skip_already_scanned_rows() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut conn = unindexed_cjk_fixture(200);
+        conn.execute_batch(
+            "CREATE TABLE backfill_watermarks (
+                name TEXT PRIMARY KEY,
+                max_rowid INTEGER NOT NULL
+            ) WITHOUT ROWID;",
+        )
+        .unwrap();
+
+        let first = backfill_cjk_indexes_in_batches(&mut conn, 50).unwrap();
+        assert_eq!((first.pages, first.observations), (200, 200));
+
+        let visits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&visits);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+
+        let second = backfill_cjk_indexes_in_batches(&mut conn, 50).unwrap();
+        assert_eq!(second, CjkBackfillSummary::default());
+        let idle_steps = visits.load(Ordering::Relaxed);
+        assert!(
+            idle_steps < 1000,
+            "second CJK backfill with watermark must be O(1), took {idle_steps} VM steps"
+        );
+
+        // Inserting a new row above the watermark must still be indexed.
+        conn.progress_handler(1, None::<fn() -> bool>).unwrap();
+        conn.execute(
+            "INSERT INTO observations (rowid, title, body) VALUES (201, 'new', '支付新词')",
+            [],
+        )
+        .unwrap();
+        let third = backfill_cjk_indexes_in_batches(&mut conn, 50).unwrap();
+        assert_eq!((third.pages, third.observations), (0, 1));
     }
 
     /// A checkpoint a reader holds back must not fail the operation it follows:
@@ -14448,6 +14987,7 @@ pub(crate) mod tests {
         p.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-a".into(),
+            observations: Default::default(),
         }];
         let id = upsert_page(&mut conn, &p).unwrap();
         assert_eq!(evidence_count(&conn, &id), 1);
@@ -14455,6 +14995,7 @@ pub(crate) mod tests {
         p.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-b".into(),
+            observations: Default::default(),
         }];
         let id2 = upsert_page(&mut conn, &p).unwrap();
         assert_eq!(id2, id, "unchanged content must not create a new version");
@@ -14482,6 +15023,7 @@ pub(crate) mod tests {
         p2.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-a".into(),
+            observations: Default::default(),
         }];
         let id2 = upsert_page(&mut conn, &p2).unwrap();
         assert_ne!(id2, id1, "changed body supersedes to a new version");
@@ -14502,6 +15044,7 @@ pub(crate) mod tests {
         p.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-a".into(),
+            observations: Default::default(),
         }];
         let id = upsert_page(&mut conn, &p).unwrap();
         assert_eq!(evidence_count(&conn, &id), 1);
@@ -14989,6 +15532,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15089,6 +15633,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15126,6 +15671,7 @@ pub(crate) mod tests {
                 body: "README.md".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -15171,6 +15717,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15188,6 +15735,7 @@ pub(crate) mod tests {
                 body: String::new(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -15219,6 +15767,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15236,6 +15785,7 @@ pub(crate) mod tests {
                 body: "do the thing".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -15281,6 +15831,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 },
             )
             .unwrap();
@@ -15298,6 +15849,7 @@ pub(crate) mod tests {
                     body: "b".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -15331,6 +15883,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15537,6 +16090,7 @@ pub(crate) mod tests {
                     agent_kind,
                     cwd: Some(std::path::PathBuf::from(r"C:\GIT\ai-memory")),
                     actor_user: None,
+                    origin: None,
                 },
             )
             .unwrap();
@@ -15568,6 +16122,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15612,6 +16167,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15643,6 +16199,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15673,6 +16230,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15707,6 +16265,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15738,6 +16297,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15756,6 +16316,7 @@ pub(crate) mod tests {
                 body: "observation".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -15784,6 +16345,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15802,6 +16364,7 @@ pub(crate) mod tests {
                 body: "observation".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -16568,6 +17131,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -16585,6 +17149,7 @@ pub(crate) mod tests {
                 body: "b".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -16617,6 +17182,7 @@ pub(crate) mod tests {
                 lease_owner: "test".into(),
             },
             None,
+            false,
             false,
         )
         .unwrap();
@@ -17336,6 +17902,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo/src".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -17354,6 +17921,7 @@ pub(crate) mod tests {
                     body: "zebra token body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -17907,6 +18475,7 @@ pub(crate) mod tests {
                     body: "zebra token body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -18523,6 +19092,7 @@ pub(crate) mod tests {
                     body: "body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -18605,6 +19175,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -18673,6 +19244,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -18886,6 +19458,7 @@ pub(crate) mod tests {
                     body: "body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -18979,6 +19552,7 @@ pub(crate) mod tests {
                     body: "existing observation survives table rebuild".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -19475,6 +20049,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 },
             )
             .is_err(),
@@ -19492,6 +20067,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -19510,6 +20086,7 @@ pub(crate) mod tests {
             body: "b".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         assert!(
             insert_observation(&mut conn, &mismatched_obs).is_err(),
@@ -19925,6 +20502,7 @@ pub(crate) mod tests {
                 lease_owner: "test".to_string(),
             },
             None,
+            false,
             false,
         )
         .expect("opening a managed run should succeed")
@@ -20432,6 +21010,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User(bob.into()),
                 Some("fresh-key"),
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20450,6 +21029,7 @@ pub(crate) mod tests {
                 &bob_event,
                 &OwnerFilter::User(alice.into()),
                 Some("fresh-key"),
+                None,
                 None,
             )
             .unwrap(),
@@ -20484,6 +21064,7 @@ pub(crate) mod tests {
                 &moved,
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -20588,7 +21169,15 @@ pub(crate) mod tests {
             let owner = OwnerFilter::User(owner.into());
             assert!(
                 matches!(
-                    admit_hook_session_event(&mut conn, &moved, &start, &owner, key, Some(from)),
+                    admit_hook_session_event(
+                        &mut conn,
+                        &moved,
+                        &start,
+                        &owner,
+                        key,
+                        Some(from),
+                        None
+                    ),
                     Ok(HookSessionAdmission::Observation {
                         ingest: IngestObservationOutcome::Inserted(_),
                         ..
@@ -20616,6 +21205,66 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn session_display_name_resets_only_on_a_scope_transfer() {
+        let (_tmp, mut conn, ws, source) = fresh_db();
+        let target = get_or_create_project(&mut conn, &ws, "beta", None).unwrap();
+        let id = SessionId::new();
+        let event = |conn: &mut Connection, project, cwd: &str, from, key: &str, name| {
+            let mut session = hook_session(id, ws, project, Some("user:alice"));
+            session.agent_kind = AgentKind::OpenCode;
+            session.cwd = Some(cwd.into());
+            let mut start = hook_observation(&session);
+            start.kind = ObservationKind::SessionStart;
+            admit_hook_session_event(
+                conn,
+                &session,
+                &start,
+                &OwnerFilter::User("user:alice".into()),
+                Some(key),
+                from,
+                name,
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT display_name, display_name_updated_ns FROM sessions WHERE id = ?1",
+                [id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let a = ai_memory_core::SessionDisplayName {
+            name: "Source only".into(),
+            updated_ns: 20,
+        };
+        let b = ai_memory_core::SessionDisplayName {
+            name: "Target only".into(),
+            updated_ns: 10,
+        };
+        event(&mut conn, source, "/alpha", None, "start", Some(&a));
+        assert_eq!(
+            event(&mut conn, source, "/nested", Some("/alpha"), "within", None),
+            (Some(a.name.clone()), Some(20))
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", Some("/nested"), "move", None),
+            (None, None)
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", None, "rename", Some(&b)),
+            (Some(b.name.clone()), Some(10))
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", Some("/nested"), "move", None),
+            (Some(b.name.clone()), Some(10))
+        );
+    }
+
     // Identity still wins over a move: a foreign operator's move is refused
     // before anything is written, and a completed move replayed after the
     // session moved back never rebinds it to the stale target.
@@ -20639,7 +21288,8 @@ pub(crate) mod tests {
                 &start,
                 &OwnerFilter::User("user:bob".into()),
                 Some("move"),
-                Some("/repo/alpha")
+                Some("/repo/alpha"),
+                None
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20656,6 +21306,7 @@ pub(crate) mod tests {
             &owner,
             Some("move"),
             Some("/repo/alpha"),
+            None,
         )
         .unwrap();
         complete_observation_ingest(&mut conn, &target, "move").unwrap();
@@ -20668,6 +21319,7 @@ pub(crate) mod tests {
             &owner,
             Some("return"),
             Some("/repo/beta"),
+            None,
         )
         .unwrap();
         complete_observation_ingest(&mut conn, &proj, "return").unwrap();
@@ -20678,7 +21330,8 @@ pub(crate) mod tests {
                 &start,
                 &owner,
                 Some("move"),
-                Some("/repo/alpha")
+                Some("/repo/alpha"),
+                None
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -20719,6 +21372,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:bob".into()),
                 None,
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20732,6 +21386,7 @@ pub(crate) mod tests {
                 &other_agent,
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             ),
@@ -20765,6 +21420,7 @@ pub(crate) mod tests {
                 &moved,
                 &end,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -20888,7 +21544,7 @@ pub(crate) mod tests {
             let end = session_end_observation(&drifted);
 
             let result =
-                admit_hook_session_event(&mut conn, &drifted, &end, owner, Some("end"), None);
+                admit_hook_session_event(&mut conn, &drifted, &end, owner, Some("end"), None, None);
             let ended: Option<i64> = conn
                 .query_row(
                     "SELECT ended_at FROM sessions WHERE id = ?1",
@@ -20955,7 +21611,7 @@ pub(crate) mod tests {
         drifted.agent_kind = AgentKind::ClaudeCode;
         let end = session_end_observation(&drifted);
         assert!(matches!(
-            admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None),
+            admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None, None),
             Err(StoreError::SessionAgentMismatch {
                 bound: AgentKind::OpenCode
             })
@@ -20983,6 +21639,7 @@ pub(crate) mod tests {
                     &hook_observation(&session),
                     &OwnerFilter::User(owner.into()),
                     Some(key),
+                    None,
                     None,
                 )
             })
@@ -21021,6 +21678,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("tuple-key"),
                 None,
+                None,
             ),
             Err(StoreError::InvalidState(_))
         ));
@@ -21045,6 +21703,7 @@ pub(crate) mod tests {
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
                 Some("agent-key"),
+                None,
                 None,
             ),
             Err(StoreError::SessionAgentMismatch {
@@ -21073,6 +21732,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:bob".into()),
                 Some("denied-owner"),
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -21087,6 +21747,7 @@ pub(crate) mod tests {
             &shared,
             &hook_observation(&shared),
             &OwnerFilter::User("user:alice".into()),
+            None,
             None,
             None,
         )
@@ -21108,6 +21769,7 @@ pub(crate) mod tests {
                 &hook_observation(&shared),
                 &OwnerFilter::User("user:bob".into()),
                 Some("shared-bob"),
+                None,
                 None,
             )
             .unwrap(),
@@ -21142,6 +21804,7 @@ pub(crate) mod tests {
                 &session_end_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
+                None,
                 None,
             )
             .unwrap();
@@ -21182,6 +21845,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
                 None,
+                None,
             )
             .unwrap();
             match admission {
@@ -21211,6 +21875,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("missing-end"),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::InvalidMissingEnd
@@ -21239,6 +21904,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("ordinary-complete"),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -21258,6 +21924,7 @@ pub(crate) mod tests {
                 &session,
                 &hook_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -21309,6 +21976,7 @@ pub(crate) mod tests {
                 &receiver,
                 &lifecycle_observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
