@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.12`
+**Current version:** `0.3.13`
 **Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `ccc7dc0db` (`main`, `v3.6.0`)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
@@ -30,6 +30,14 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.13 - record the production v3.6.0 upgrade
+
+Expanded `/srv` by about 250 GiB and reserved 78 GiB as free LVM extents.
+Upgraded `mem.shvia.org` from 3.4.2 (V99) to the digest-pinned 3.6.0 image
+(V115) using a verified cold backup. The cutover completed in 2 h 28 min 54 s
+through acceptance. The original V99 store and verified archive remain
+available for rollback. [Server runbook](docs/mem-shvia-org.md)
 
 ## 0.3.12 - sync the fork with upstream v3.6.0
 

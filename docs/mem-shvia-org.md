@@ -1,12 +1,10 @@
 # mem.shvia.org — the memory server
 
-> **Status:** `ACTIVE` · Production runs the **upstream's published Docker image**,
-> not a build of this fork (the fork carries no code of its own). Since
-> 05/11/2026 21:50 UTC that image is **`3.4.2`** (schema 99). Before that it was
-> `3.3.1` (02/11), `3.2.8` (27/10) and `2.6.6` (13/10). The fork's code is upstream
-> `main` at `v3.4.7` (version `0.3.10`), so the server is one release behind, **on purpose**:
-> `3.4.4` needs about 27 GB of free disk (23 for the migration, 4 for the script's
-> watchdog floor) and `/srv` has 24 (see the rehearsal of 09/11/2026).
+> **Status:** `ACTIVE` · Production runs the published `3.6.0` Docker image
+> on schema V115. The service and panel checks passed on 25 November 2026 at
+> 04:07 UTC. The release uses the upstream tag at `ccc7dc0db`.
+> [Upstream release](https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0) ·
+> [Fork release](https://github.com/samirhvbr/ai-memory/releases/tag/v3.6.0)
 
 | | |
 |---|---|
@@ -14,13 +12,53 @@
 | Access | `ssh samir@100.64.100.125`, then `sudo` |
 | Public address | `https://mem.shvia.org`, an Apache vhost on the same machine proxying to `http://127.0.0.1:49374/` |
 | Deploy | `docker compose` in `/srv/ai-memory`. `docker-compose.yml` holds the bearer token (mode 600); `./data` is bind-mounted at `/data` |
-| Image | `akitaonrails/ai-memory:3.4.2`, **pinned on purpose**: an upgrade migrates the database one way |
-| Data | `data/db/memory.sqlite` is about 46.4 GB (43.2 GiB): 867 latest pages (61,323 versions) and 887,171 observations on 05/11/2026. It grew by about 100 MB between 27/10 and 02/11, and by 596 MB on 05/11 (the full-text index tables grew by only 4 MB, so it was not the tokenizer, and the cause was not found). The wiki is about 0.6 GB. `/srv` has about 24 GB free, and the volume group has no free extents |
+| Image | `akitaonrails/ai-memory:3.6.0`, pinned to `sha256:201c99fe331cccef2c32d9684140919b64ce60a353c650267aacdb355b324a43` |
+| Data | The V115 SQLite database is 55.34 GB. `/srv` is 344.5 GiB with about 227 GB free after the cutover. `vgsys00` has 78 GiB of unallocated space. |
 
 **Not** `shvia-site` (`100.64.100.242`, the app server), and **not** `170.233.231.20`
 (the public IP, which appears in `AI_MEMORY_ALLOWED_HOSTS` and was once read as the
 address). `deploy/ai-memory-servidor.md` in shvia-web still names `shvia-site` and
 `2.0.0`.
+
+## Storage expansion and the 3.6.0 rehearsal, 24–25 November 2026
+
+Hyper-V added a 328 GiB virtual disk to `blue3site`. The new physical volume
+joined `vgsys00`. The existing XFS filesystem at `/srv` grew by about 250 GiB
+to 344.5 GiB while the service stayed online. The volume group has **78 GiB of
+unallocated extents** for future use. LVM metadata was saved under `/root`
+before the change.
+
+A brief stop of about ten seconds produced a reflink copy of the checkpointed
+V99 store. The old service resumed while a verified compressed archive of
+that copy was restored to a separate directory. The digest-pinned 3.6.0 image
+migrated the restored database, starting at 46.43 GB, through V115 with no
+published ports. The database and WAL peaked at about 69.78 GB together. The
+migrations reached HTTP health in about 2 h 35 min. The SQLite `quick_check`,
+record counts, authenticated search and MCP, and the deployed
+`ai-memory-web` schema probe passed on the migrated copy.
+
+## Production cutover, 25 November 2026 UTC
+
+- The 3.4.2 container stopped at 01:38:43 UTC. A new checkpointed V99 archive
+  was verified and restored into an isolated directory. The archive preserves
+  the Compose configuration and has a verified SHA-256 sidecar. The original
+  V99 data directory was retained for rollback.
+- The restored copy started migrations at 01:43:03 UTC. The database and WAL
+  peaked at 69.78 GB together. The session, observation, latest-page, and
+  handoff counts matched the pre-migration store. The Compose service exposed
+  3.6.0 after the isolated V115 checks passed.
+- The new container started at 04:06:42 UTC. Checks through loopback and Apache
+  passed for health, authentication, workspace listing, search, and MCP. The
+  `ai-memory-web` schema probe also passed. The public health endpoint returned
+  HTTP 200 from the workstation. The cutover took 2 h 28 min 54 s through
+  acceptance.
+- The verified archive `backup-3.4.2-20261125T013844Z-pre-v3.6.0.tar.zst`, its
+  checksum, the earlier Compose file, and the original `rollback-v99-data`
+  directory are in the root-only 3.6.0 upgrade directory under `/srv/ai-memory`.
+  Before reverting, preserve the V115 data and reconcile writes accepted after
+  the switch. Restore the V99 data and earlier Compose file before starting
+  3.4.2. Rehearsal containers and uncompressed rehearsal copies were removed
+  after the production checks.
 
 ## The machine, measured on 02/11/2026
 
