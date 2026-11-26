@@ -1,10 +1,10 @@
 # mem.shvia.org — the memory server
 
-> **Status:** `ACTIVE` · Production runs the published `3.6.0` Docker image
-> on schema V115. The service and panel checks passed on 25 November 2026 at
-> 04:07 UTC. The release uses the upstream tag at `ccc7dc0db`.
-> [Upstream release](https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0) ·
-> [Fork release](https://github.com/samirhvbr/ai-memory/releases/tag/v3.6.0)
+> **Status:** `ACTIVE` · Production runs the published `3.6.1` Docker image
+> on schema V115. The service and panel checks passed on 26 November 2026 at
+> 12:04 UTC. The release uses the upstream tag at `78370da51`.
+> [Upstream release](https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1) ·
+> [Fork release](https://github.com/samirhvbr/ai-memory/releases/tag/v3.6.1)
 
 | | |
 |---|---|
@@ -12,13 +12,31 @@
 | Access | `ssh samir@100.64.100.125`, then `sudo` |
 | Public address | `https://mem.shvia.org`, an Apache vhost on the same machine proxying to `http://127.0.0.1:49374/` |
 | Deploy | `docker compose` in `/srv/ai-memory`. `docker-compose.yml` holds the bearer token (mode 600); `./data` is bind-mounted at `/data` |
-| Image | `akitaonrails/ai-memory:3.6.0`, pinned to `sha256:201c99fe331cccef2c32d9684140919b64ce60a353c650267aacdb355b324a43` |
-| Data | The V115 SQLite database is 55.34 GB. `/srv` is 344.5 GiB with about 227 GB free after the cutover. `vgsys00` has 78 GiB of unallocated space. |
+| Image | `akitaonrails/ai-memory:3.6.1`, pinned to `sha256:f9b788646841c5f15dd9c1c27d4b04f68ef02dab3cacc4e8baf9b60939491443` |
+| Data | The V115 SQLite database is about 55.4 GB. `/srv` is 344.5 GiB with about 225.8 GB free after the cutover. `vgsys00` has 78 GiB of unallocated space. |
 
 **Not** `shvia-site` (`100.64.100.242`, the app server), and **not** `170.233.231.20`
 (the public IP, which appears in `AI_MEMORY_ALLOWED_HOSTS` and was once read as the
 address). `deploy/ai-memory-servidor.md` in shvia-web still names `shvia-site` and
 `2.0.0`.
+
+## Production patch upgrade, 26 November 2026 UTC
+
+- The 3.6.0 service stopped at 11:58:28 UTC. The cold archive of the
+  checkpointed V115 store and Compose configuration passed a full read and
+  SHA-256 verification before Compose switched to 3.6.1. The archive
+  `backup-3.6.0-20261126T115828Z-pre-v3.6.1.tar.zst`, its checksum, and the
+  original Compose file are in the root-only 3.6.1 upgrade directory under
+  `/srv/ai-memory`.
+- All 115 SQL migrations match 3.6.0. The new image started on the same V115
+  data directory. Checks passed for health, authentication, workspace listing,
+  search and MCP through loopback and Apache, plus the deployed
+  `ai-memory-web` schema probe and the public HTTPS health endpoint. The
+  container reached healthy in 4 minutes, and all checks completed in
+  5 minutes and 36 seconds from the stop.
+- For an image rollback, restore the saved 3.6.0 Compose configuration and
+  recreate the service with the cached, digest-pinned 3.6.0 image over the
+  current V115 data. The cold archive is available for data recovery.
 
 ## Storage expansion and the 3.6.0 rehearsal, 24–25 November 2026
 

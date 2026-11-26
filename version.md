@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-memory
 
-**Current version:** `0.3.13`
-**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `ccc7dc0db` (`main`, `v3.6.0`)
+**Current version:** `0.3.14`
+**Upstream:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) @ `78370da51` (`v3.6.1`)
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -30,6 +30,14 @@ Where the memory server runs and which upstream release it is on: [`docs/mem-shv
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.14 - sync the fork and server with upstream v3.6.1
+
+Merged the upstream `v3.6.1` release commit. The fork preserves its history
+and mirrors the original tag and release assets. Upgraded `mem.shvia.org`
+to the official digest-pinned 3.6.1 image after verifying a new cold backup.
+All 115 migration files match v3.6.0, so production kept the V115 database.
+[Server runbook](docs/mem-shvia-org.md)
 
 ## 0.3.13 - record the production v3.6.0 upgrade
 

@@ -11,6 +11,85 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.6.1] - 2026-11-24
+
+### Fixed
+
+- Recorded project access-mode changes in `audit_log` with the workspace,
+  project, operator and previous/new modes. The change and audit row commit
+  together, so an audit failure leaves access unchanged; repeated modes do
+  not add audit rows. (#2446)
+
+- Hook titles skipped leading blank lines, so pasted prompts no longer fell
+  back to `user-prompt`. Claude Code `<agent-message>` subagent hand-backs
+  stayed in session history but no longer became page titles, listed prompts,
+  or harvested user preferences (#2450).
+
+- `ai-memory serve` starts again when `embedding_model` names a model the
+  local embedder cannot run, such as `text-embedding-3-small` left behind
+  after the `embedding_provider` line was removed. 3.6.0 refused to start with
+  "unknown local embedding model"; with no provider set, the default local
+  embedder now keeps its default model, as releases before 3.6.0 did, and logs
+  a warning naming the ignored setting. An explicit `embedding_provider =
+  "local"` still refuses an unknown model. (#2454)
+
+- `ai-memory upgrade` no longer moves the hooks of Codex, Copilot CLI,
+  Cursor, Gemini CLI, Kimi Code and the other native-hook agents to the local
+  server. Installed with `install-hooks --server-url <remote> --auth-token
+  <token>` and refreshed with no `server_url` configured, their commands were
+  re-rendered with `http://127.0.0.1:49374`, and after `ai-memory init` the
+  local root bearer replaced the stored hook token. The refresh now keeps the
+  endpoint every installed hook shares and the hook credential stored for it,
+  as it already did for Claude Code, in each command form the installer
+  writes, including the PowerShell form those agents get on Windows. A
+  configured `server_url` or `AI_MEMORY_SERVER_URL` still wins. (#2455)
+
+- Fixed `backup-agents` and `restore-agents` to honor `GEMINI_CLI_HOME`
+  for Gemini CLI's global settings and skills. (#2459)
+
+- Fixed duplicate-title lint to compare the indexed titles shown in the page
+  list, including titles derived from a Markdown heading or filename. (#2447)
+
+- Stabilized duplicate-title ordering in lint reports to avoid redundant
+  report revisions and keep the briefing's warning-page list consistent. (#2461)
+
+- Kept Gemini CLI utility commands such as `--debug mcp list` in passthrough
+  mode so `ai-memory run gemini` leaves their arguments intact. (#2435)
+
+- XLSX import kept a cell under its header when an earlier blank cell was
+  omitted from the worksheet, for a gap of up to 32 columns. A wider jump
+  still uses one separator, so a sparse sheet is not expanded into the empty
+  rectangle. (#2458)
+
+- A repeated delivery of an ordinary hook whose ingest key had already
+  completed is acknowledged before its body is scrubbed again. A
+  multi-megabyte tool result no longer has to be reprocessed on every spool
+  retry. Recovery keys and `SessionEnd` still take the full path: a recovery
+  mismatch stays a collision, and an ended session can still repair its wiki
+  commit. (#2452)
+
+- Hook spool drain and large `PostToolUse` sanitization: `post_batch` and
+  `post_hook` now classify post-connect request/response timeouts
+  (`err.is_timeout() && !err.is_connect()`, backed by a 2 s `connect_timeout`
+  on `build_client`) as `Failed` instead of `Unreachable` so a slow or poison
+  head entry charges `attempts` and drops at `MAX_ATTEMPTS` instead of stalling
+  subsequent spooled events forever, while connection-refused, DNS, and connect
+  timeout outages stay `Unreachable` with zero attempt charge; server-side
+  `durable_body` now scrubs a UTF-8-safe `cap + 64 KiB` overlap window before
+  truncating to the per-event cap so multi-MiB `tool_response` payloads finish
+  in milliseconds while preserving `#1114` straddling-secret and PEM private-key
+  redaction. (#2452)
+
+### Security
+
+- Enforce the reserved-scope write gate (`default/_global` and
+  `<workspace>/_profile`) and private-profile isolation (`_profile.<user_id>`)
+  for non-root trusted-proxy callers (`AuthLevel::User` without a database
+  `AuthorizedViewer`) across MCP tools, `/messages/*`, and hook/workstream
+  routes (`GHSA-v4vw-rf7v-cxgf`). Non-root proxied users can still read shared
+  scopes and write ordinary projects, while root-matched proxy identities and
+  the static root bearer retain full access.
+
 ## [3.6.0] - 2026-11-23
 
 ### Added
@@ -6328,7 +6407,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.6.1...HEAD
+[3.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.1
 [3.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.6.0
 [3.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.2
 [3.5.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.1
